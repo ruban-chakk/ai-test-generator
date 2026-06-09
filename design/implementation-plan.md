@@ -96,10 +96,10 @@ See `design/development-phases.md` for a detailed enterprise-grade roadmap.
 - Audit logging for generation and review events
 
 ### Phase 2: Review and governance
-- Approval and rejection actions across requirement, scenario, and test case levels
-- Versioning, history, and audit trails for approved test cases
-- Feedback capture, tracking, and enterprise reporting
-- Data validation and guardrails to minimize hallucination
+- Completed: Approval and rejection actions across requirement, scenario, and test case levels
+- Completed: Versioning, history, and audit trails for approved test cases
+- Completed: Feedback capture, tracking, and enterprise reporting surfaces
+- Completed: Data validation and guardrails to minimize hallucination
 
 ### Phase 3: Feedback and adaptation
 - Feedback-driven revision pipeline

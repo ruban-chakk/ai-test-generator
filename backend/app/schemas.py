@@ -26,10 +26,98 @@ class TestCaseSummary(BaseModel):
     status: str
     version: int
     approved_at: Optional[datetime] = None
+    locked: bool = False
+    repository_status: str = "draft"
+    repository_synced_at: Optional[datetime] = None
     steps: Optional[List[TestCaseStep]] = None
 
     class Config:
         orm_mode = True
+
+
+class ApprovalAction(BaseModel):
+    approved_by: Optional[str] = 'system'
+    notes: Optional[str] = None
+
+
+class FeedbackCreate(BaseModel):
+    target_level: str
+    target_id: uuid.UUID
+    source: str
+    feedback_type: str
+    comment: str
+    created_by: str
+
+
+class FeedbackSummary(FeedbackCreate):
+    id: uuid.UUID
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class ApprovalRecordSummary(BaseModel):
+    id: uuid.UUID
+    target_level: str
+    target_id: uuid.UUID
+    approved_by: str
+    approved_at: datetime
+    version: int
+    status: str
+    notes: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+
+class AuditLogSummary(BaseModel):
+    id: uuid.UUID
+    entity_type: str
+    entity_id: Optional[uuid.UUID] = None
+    action: str
+    actor: str
+    details: Optional[dict] = None
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class TestCaseVersionSummary(BaseModel):
+    id: uuid.UUID
+    test_case_id: uuid.UUID
+    requirement_id: uuid.UUID
+    scenario_id: uuid.UUID
+    version: int
+    title: str
+    description: str
+    prerequisite: Optional[str] = None
+    priority: Optional[str] = None
+    severity: Optional[str] = None
+    category: Optional[str] = None
+    type: Optional[str] = None
+    status: str
+    approved_by: str
+    approved_at: datetime
+    notes: Optional[str] = None
+    steps_snapshot: List[dict]
+
+    class Config:
+        orm_mode = True
+
+
+class ValidationIssue(BaseModel):
+    field: str
+    message: str
+    severity: str = "error"
+
+
+class ValidationResult(BaseModel):
+    valid: bool
+    target_level: str
+    target_id: uuid.UUID
+    issues: List[ValidationIssue]
 
 
 class TestScenarioSummary(BaseModel):

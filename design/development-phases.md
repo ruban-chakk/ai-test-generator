@@ -16,11 +16,11 @@
 - Store generated drafts in the database with status and audit metadata.
 
 ## Phase 2: Review, approval, and governance
-- Add approval/rejection actions at requirement, scenario, and test case levels.
-- Build UI controls for approve/reject, version status, and audit history.
-- Persist approved test cases, index them into Pinecone, and lock approved versions.
-- Add versioning for approved test cases and store approval records.
-- Create the test case repository persistence workflow and change control process.
+- Completed: Approval/rejection actions at requirement, scenario, and test case levels.
+- Completed: UI controls for approve/reject, version status, guardrail validation, and audit history.
+- Completed: Approved test cases are locked, assigned repository metadata, and prepared for vector indexing with stable vector IDs.
+- Completed: Approved test case version snapshots and approval records are stored for traceability.
+- Completed: Test case repository persistence workflow and change control guardrails are in place.
 
 ## Phase 3: Feedback, quality, and traceability
 - Add a feedback modal for requirement/scenario/test case comments.

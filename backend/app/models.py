@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    Boolean,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
@@ -71,6 +72,9 @@ class TestCase(Base):
     status = Column(String, nullable=False, default="draft")
     version = Column(Integer, nullable=False, default=1)
     approved_at = Column(DateTime, nullable=True)
+    locked = Column(Boolean, nullable=False, default=False)
+    repository_status = Column(String, nullable=False, default="draft")
+    repository_synced_at = Column(DateTime, nullable=True)
     vector_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -78,6 +82,7 @@ class TestCase(Base):
     scenario = relationship("TestScenario", back_populates="test_cases")
     requirement = relationship("Requirement", back_populates="test_cases")
     steps = relationship("TestCaseStep", back_populates="test_case", cascade="all, delete")
+    versions = relationship("TestCaseVersion", back_populates="test_case", cascade="all, delete")
 
 
 class TestCaseStep(Base):
@@ -92,6 +97,30 @@ class TestCaseStep(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     test_case = relationship("TestCase", back_populates="steps")
+
+
+class TestCaseVersion(Base):
+    __tablename__ = "test_case_versions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="CASCADE"), nullable=False)
+    requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
+    scenario_id = Column(UUID(as_uuid=True), ForeignKey("test_scenarios.id", ondelete="CASCADE"), nullable=False)
+    version = Column(Integer, nullable=False)
+    title = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    prerequisite = Column(Text, nullable=True)
+    priority = Column(String, nullable=True)
+    severity = Column(String, nullable=True)
+    category = Column(String, nullable=True)
+    type = Column(String, nullable=True)
+    status = Column(String, nullable=False)
+    approved_by = Column(String, nullable=False)
+    approved_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    notes = Column(Text, nullable=True)
+    steps_snapshot = Column(JSON, nullable=False, default=list)
+
+    test_case = relationship("TestCase", back_populates="versions")
 
 
 class Feedback(Base):

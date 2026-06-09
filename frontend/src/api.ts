@@ -28,6 +28,9 @@ export type TestCaseSummary = {
   status: string;
   version: number;
   approved_at?: string;
+  locked: boolean;
+  repository_status: string;
+  repository_synced_at?: string;
   steps?: TestCaseStep[];
 };
 
@@ -94,12 +97,99 @@ export type TestCaseStepCreatePayload = {
   expected_result: string;
 };
 
+export type ApprovalActionPayload = {
+  approved_by?: string;
+  notes?: string;
+};
+
+export type FeedbackCreatePayload = {
+  target_level: string;
+  target_id: string;
+  source: string;
+  feedback_type: string;
+  comment: string;
+  created_by: string;
+};
+
+export type FeedbackSummary = FeedbackCreatePayload & {
+  id: string;
+  created_at: string;
+};
+
+export type ApprovalRecordSummary = {
+  id: string;
+  target_level: string;
+  target_id: string;
+  approved_by: string;
+  approved_at: string;
+  version: number;
+  status: string;
+  notes?: string;
+};
+
+export type TestCaseVersionSummary = {
+  id: string;
+  test_case_id: string;
+  requirement_id: string;
+  scenario_id: string;
+  version: number;
+  title: string;
+  description: string;
+  prerequisite?: string;
+  priority?: string;
+  severity?: string;
+  category?: string;
+  type?: string;
+  status: string;
+  approved_by: string;
+  approved_at: string;
+  notes?: string;
+  steps_snapshot: Record<string, unknown>[];
+};
+
+export type AuditLogSummary = {
+  id: string;
+  entity_type: string;
+  entity_id?: string;
+  action: string;
+  actor: string;
+  details?: Record<string, unknown>;
+  created_at: string;
+};
+
+export type ValidationIssue = {
+  field: string;
+  message: string;
+  severity: string;
+};
+
+export type ValidationResult = {
+  valid: boolean;
+  target_level: string;
+  target_id: string;
+  issues: ValidationIssue[];
+};
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000/api/v1';
 
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(errorText || response.statusText);
+    try {
+      const parsed = JSON.parse(errorText);
+      if (typeof parsed.detail === 'string') {
+        throw new Error(parsed.detail);
+      }
+      if (parsed.detail?.message) {
+        throw new Error(parsed.detail.message);
+      }
+      throw new Error(JSON.stringify(parsed.detail ?? parsed));
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'SyntaxError') {
+        throw err;
+      }
+      throw new Error(errorText || response.statusText);
+    }
   }
   return response.json();
 }
@@ -194,4 +284,167 @@ export async function appendTestCaseStep(
     body: JSON.stringify(payload),
   });
   return handleResponse<TestCaseStep>(response);
+}
+
+export async function approveRequirement(
+  requirementId: string,
+  payload: ApprovalActionPayload,
+): Promise<RequirementDetail> {
+  const response = await fetch(`${API_BASE_URL}/requirements/${requirementId}/approve`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<RequirementDetail>(response);
+}
+
+export async function rejectRequirement(
+  requirementId: string,
+  payload: ApprovalActionPayload,
+): Promise<RequirementDetail> {
+  const response = await fetch(`${API_BASE_URL}/requirements/${requirementId}/reject`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<RequirementDetail>(response);
+}
+
+export async function approveScenario(
+  scenarioId: string,
+  payload: ApprovalActionPayload,
+): Promise<TestScenarioSummary> {
+  const response = await fetch(`${API_BASE_URL}/scenarios/${scenarioId}/approve`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<TestScenarioSummary>(response);
+}
+
+export async function rejectScenario(
+  scenarioId: string,
+  payload: ApprovalActionPayload,
+): Promise<TestScenarioSummary> {
+  const response = await fetch(`${API_BASE_URL}/scenarios/${scenarioId}/reject`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<TestScenarioSummary>(response);
+}
+
+export async function approveTestCase(
+  testCaseId: string,
+  payload: ApprovalActionPayload,
+): Promise<TestCaseSummary> {
+  const response = await fetch(`${API_BASE_URL}/test_cases/${testCaseId}/approve`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<TestCaseSummary>(response);
+}
+
+export async function rejectTestCase(
+  testCaseId: string,
+  payload: ApprovalActionPayload,
+): Promise<TestCaseSummary> {
+  const response = await fetch(`${API_BASE_URL}/test_cases/${testCaseId}/reject`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<TestCaseSummary>(response);
+}
+
+export async function createFeedback(
+  payload: FeedbackCreatePayload,
+): Promise<FeedbackSummary> {
+  const response = await fetch(`${API_BASE_URL}/feedback`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<FeedbackSummary>(response);
+}
+
+export async function getFeedback(
+  targetLevel?: string,
+  targetId?: string,
+): Promise<FeedbackSummary[]> {
+  const params = new URLSearchParams();
+  if (targetLevel) params.set('target_level', targetLevel);
+  if (targetId) params.set('target_id', targetId);
+  const url = `${API_BASE_URL}/feedback${params.toString() ? `?${params.toString()}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<FeedbackSummary[]>(response);
+}
+
+export async function getApprovals(
+  targetLevel?: string,
+  targetId?: string,
+): Promise<ApprovalRecordSummary[]> {
+  const params = new URLSearchParams();
+  if (targetLevel) params.set('target_level', targetLevel);
+  if (targetId) params.set('target_id', targetId);
+  const url = `${API_BASE_URL}/approvals${params.toString() ? `?${params.toString()}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<ApprovalRecordSummary[]>(response);
+}
+
+export async function getAudit(
+  entityType?: string,
+  entityId?: string,
+): Promise<AuditLogSummary[]> {
+  const params = new URLSearchParams();
+  if (entityType) params.set('entity_type', entityType);
+  if (entityId) params.set('entity_id', entityId);
+  const url = `${API_BASE_URL}/audit${params.toString() ? `?${params.toString()}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<AuditLogSummary[]>(response);
+}
+
+export async function getTestCaseVersions(testCaseId: string): Promise<TestCaseVersionSummary[]> {
+  const response = await fetch(`${API_BASE_URL}/test_cases/${testCaseId}/versions`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<TestCaseVersionSummary[]>(response);
+}
+
+export async function validateTarget(targetLevel: string, targetId: string): Promise<ValidationResult> {
+  const response = await fetch(`${API_BASE_URL}/validate/${targetLevel}/${targetId}`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<ValidationResult>(response);
 }

@@ -53,14 +53,22 @@ CREATE TABLE IF NOT EXISTS test_cases (
   status varchar NOT NULL DEFAULT 'draft',
   version integer NOT NULL DEFAULT 1,
   approved_at timestamptz,
+  locked boolean NOT NULL DEFAULT false,
+  repository_status varchar NOT NULL DEFAULT 'draft',
+  repository_synced_at timestamptz,
   vector_id varchar,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS locked boolean NOT NULL DEFAULT false;
+ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS repository_status varchar NOT NULL DEFAULT 'draft';
+ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS repository_synced_at timestamptz;
+
 CREATE INDEX IF NOT EXISTS idx_test_cases_scenario_id ON test_cases(scenario_id);
 CREATE INDEX IF NOT EXISTS idx_test_cases_requirement_id ON test_cases(requirement_id);
 CREATE INDEX IF NOT EXISTS idx_test_cases_status ON test_cases(status);
+CREATE INDEX IF NOT EXISTS idx_test_cases_repository_status ON test_cases(repository_status);
 CREATE INDEX IF NOT EXISTS idx_test_cases_title_trgm ON test_cases USING gin (title gin_trgm_ops);
 
 CREATE TABLE IF NOT EXISTS test_case_steps (
@@ -75,6 +83,28 @@ CREATE TABLE IF NOT EXISTS test_case_steps (
 
 CREATE INDEX IF NOT EXISTS idx_steps_test_case_id ON test_case_steps(test_case_id);
 CREATE INDEX IF NOT EXISTS idx_steps_test_case_step_number ON test_case_steps(test_case_id, step_number);
+
+CREATE TABLE IF NOT EXISTS test_case_versions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  test_case_id uuid NOT NULL REFERENCES test_cases(id) ON DELETE CASCADE,
+  requirement_id uuid NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+  scenario_id uuid NOT NULL REFERENCES test_scenarios(id) ON DELETE CASCADE,
+  version integer NOT NULL,
+  title text NOT NULL,
+  description text NOT NULL,
+  prerequisite text,
+  priority varchar,
+  severity varchar,
+  category varchar,
+  type varchar,
+  status varchar NOT NULL,
+  approved_by varchar NOT NULL,
+  approved_at timestamptz NOT NULL DEFAULT now(),
+  notes text,
+  steps_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_case_versions_case ON test_case_versions(test_case_id, version);
 
 CREATE TABLE IF NOT EXISTS feedback (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
