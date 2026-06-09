@@ -4,7 +4,8 @@ sqlalchemy[asyncio]>=2.0
 asyncpg
 alembic
 python-dotenv
-pydantic
+pydantic<2
+pydantic-core<2
 pinecone-client
 httpx
 python-multipart

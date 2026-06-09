@@ -1,4 +1,5 @@
-import type { RequirementSummary } from '../pages/RequirementDashboard';
+import { Link } from 'react-router-dom';
+import type { RequirementSummary } from '../api';
 
 interface Props {
   requirement: RequirementSummary;
@@ -16,8 +17,10 @@ export default function RequirementCard({ requirement }: Props) {
       </div>
       <p className="meta">{requirement.external_id}</p>
       <div className="card-footer">
-        <span>Updated {new Date(requirement.updated_at).toLocaleDateString()}</span>
-        <button className="secondary-button">Open</button>
+        <span>Updated {requirement.updated_at ? new Date(requirement.updated_at).toLocaleDateString() : '—'}</span>
+        <Link to={`/requirements/${requirement.id}`} className="secondary-button">
+          Open
+        </Link>
       </div>
     </article>
   );

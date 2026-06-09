@@ -31,5 +31,19 @@ services:
       interval: 10s
       retries: 5
 
+  backend:
+    build:
+      context: ./backend
+    container_name: ai-testgen-backend
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - PINECONE_API_KEY=${PINECONE_API_KEY}
+      - PINECONE_ENV=${PINECONE_ENV}
+    ports:
+      - '8000:8000'
+    depends_on:
+      - postgres
+    restart: on-failure
+
 volumes:
   postgres_data:

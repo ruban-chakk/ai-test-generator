@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 from sqlalchemy import (
@@ -18,13 +19,13 @@ Base = declarative_base()
 class Requirement(Base):
     __tablename__ = "requirements"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     external_id = Column(String, index=True)
     title = Column(Text, nullable=False)
     description = Column(Text, nullable=False)
     source = Column(String, nullable=False)
     status = Column(String, nullable=False, default="draft")
-    metadata = Column(JSON, nullable=True)
+    metadata_json = Column("metadata", JSON, key="metadata_json", nullable=True)
     vector_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -36,7 +37,7 @@ class Requirement(Base):
 class TestScenario(Base):
     __tablename__ = "test_scenarios"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
     title = Column(Text, nullable=False)
     description = Column(Text, nullable=False)
@@ -57,7 +58,7 @@ class TestScenario(Base):
 class TestCase(Base):
     __tablename__ = "test_cases"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scenario_id = Column(UUID(as_uuid=True), ForeignKey("test_scenarios.id", ondelete="CASCADE"), nullable=False)
     requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
     title = Column(Text, nullable=False)
@@ -82,7 +83,7 @@ class TestCase(Base):
 class TestCaseStep(Base):
     __tablename__ = "test_case_steps"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="CASCADE"), nullable=False)
     step_number = Column(Integer, nullable=False)
     action = Column(Text, nullable=False)
@@ -96,7 +97,7 @@ class TestCaseStep(Base):
 class Feedback(Base):
     __tablename__ = "feedback"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     target_level = Column(String, nullable=False)
     target_id = Column(UUID(as_uuid=True), nullable=False)
     source = Column(String, nullable=False)
@@ -110,7 +111,7 @@ class Feedback(Base):
 class ApprovalRecord(Base):
     __tablename__ = "approval_records"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     target_level = Column(String, nullable=False)
     target_id = Column(UUID(as_uuid=True), nullable=False)
     approved_by = Column(String, nullable=False)
@@ -123,7 +124,7 @@ class ApprovalRecord(Base):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     username = Column(String, nullable=False, unique=True)
     email = Column(String, nullable=False, unique=True)
     role = Column(String, nullable=False)
@@ -134,7 +135,7 @@ class User(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
-    id = Column(UUID(as_uuid=True), primary_key=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     entity_type = Column(String, nullable=False)
     entity_id = Column(UUID(as_uuid=True), nullable=True)
     action = Column(String, nullable=False)
