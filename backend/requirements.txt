@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncpg
+alembic
+python-dotenv
+pydantic
+pinecone-client
+httpx
+python-multipart

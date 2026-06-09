@@ -1,0 +1,24 @@
+[project]
+name = "ai_test_generator_backend"
+version = "0.1.0"
+description = "FastAPI backend for enterprise AI test case generation"
+authors = ["AI Test Generator Team <team@example.com>"]
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg",
+  "alembic",
+  "python-dotenv",
+  "pydantic",
+  "pinecone-client",
+  "httpx",
+  "python-multipart"
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

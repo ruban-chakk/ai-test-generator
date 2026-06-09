@@ -1,0 +1,35 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: ai-testgen-postgres
+    environment:
+      POSTGRES_USER: ai_test_gen
+      POSTGRES_PASSWORD: ai_test_gen_pass
+      POSTGRES_DB: ai_test_gen
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_test_gen"]
+      interval: 10s
+      retries: 5
+
+  pinecone:
+    image: pinecone/pinecone:latest
+    container_name: ai-testgen-pinecone
+    environment:
+      PINECONE_API_KEY: ${PINECONE_API_KEY}
+      PINECONE_ENV: ${PINECONE_ENV}
+    ports:
+      - '8260:8260'
+      - '443:443'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8260/health || exit 1"]
+      interval: 10s
+      retries: 5
+
+volumes:
+  postgres_data:
