@@ -114,12 +114,52 @@ CREATE TABLE IF NOT EXISTS feedback (
   feedback_type varchar NOT NULL,
   comment text NOT NULL,
   created_by varchar NOT NULL,
+  status varchar NOT NULL DEFAULT 'open',
+  resolved_at timestamptz,
+  resolution_notes text,
   vector_id varchar,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS status varchar NOT NULL DEFAULT 'open';
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS resolved_at timestamptz;
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS resolution_notes text;
+
 CREATE INDEX IF NOT EXISTS idx_feedback_target ON feedback(target_level, target_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_created_by ON feedback(created_by);
+CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
+
+CREATE TABLE IF NOT EXISTS revision_records (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  feedback_id uuid REFERENCES feedback(id) ON DELETE SET NULL,
+  target_level varchar NOT NULL,
+  target_id uuid NOT NULL,
+  action varchar NOT NULL,
+  status varchar NOT NULL DEFAULT 'completed',
+  created_by varchar NOT NULL,
+  notes text,
+  source_snapshot jsonb,
+  result_snapshot jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_revision_records_target ON revision_records(target_level, target_id);
+CREATE INDEX IF NOT EXISTS idx_revision_records_feedback_id ON revision_records(feedback_id);
+
+CREATE TABLE IF NOT EXISTS quality_evaluations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  target_level varchar NOT NULL,
+  target_id uuid NOT NULL,
+  score integer NOT NULL,
+  status varchar NOT NULL,
+  metrics jsonb NOT NULL DEFAULT '{}'::jsonb,
+  issues jsonb NOT NULL DEFAULT '[]'::jsonb,
+  evaluated_by varchar NOT NULL DEFAULT 'system',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_evaluations_target ON quality_evaluations(target_level, target_id);
+CREATE INDEX IF NOT EXISTS idx_quality_evaluations_status ON quality_evaluations(status);
 
 CREATE TABLE IF NOT EXISTS approval_records (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

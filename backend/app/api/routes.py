@@ -11,7 +11,9 @@ from app.models import (
     ApprovalRecord,
     AuditLog,
     Feedback,
+    QualityEvaluation,
     Requirement,
+    RevisionRecord,
     TestCase,
     TestCaseStep as TestCaseStepModel,
     TestCaseVersion,
@@ -22,9 +24,12 @@ from app.schemas import (
     ApprovalRecordSummary,
     AuditLogSummary,
     FeedbackCreate,
+    FeedbackRevisionRequest,
     FeedbackSummary,
+    QualityEvaluationSummary,
     RequirementCreate,
     RequirementDetail,
+    RevisionRecordSummary,
     TestCaseCreate,
     TestCaseStep,
     TestCaseStepCreate,
@@ -39,6 +44,7 @@ from app.schemas import (
 api_router = APIRouter()
 
 TARGET_LEVELS = {"requirement", "scenario", "test_case"}
+FEEDBACK_TYPES = {"revise", "generate_new", "deprecate", "accept", "reject"}
 
 
 def _actor(payload: ApprovalAction) -> str:
@@ -85,6 +91,75 @@ def _validate_test_case_content(test_case: TestCase) -> list[ValidationIssue]:
             )
 
     return issues
+
+
+def _quality_from_issues(issues: list[ValidationIssue]) -> tuple[int, str, list[dict]]:
+    score = max(0, 100 - (len(issues) * 15))
+    status = "passed" if score >= 85 else "needs_review" if score >= 60 else "failed"
+    return score, status, [issue.dict() for issue in issues]
+
+
+def _test_case_snapshot(test_case: TestCase) -> dict:
+    return {
+        "id": str(test_case.id),
+        "title": test_case.title,
+        "description": test_case.description,
+        "prerequisite": test_case.prerequisite,
+        "priority": test_case.priority,
+        "severity": test_case.severity,
+        "category": test_case.category,
+        "type": test_case.type,
+        "status": test_case.status,
+        "version": test_case.version,
+        "steps": _step_snapshot(test_case),
+    }
+
+
+def _scenario_snapshot(scenario: TestScenario) -> dict:
+    return {
+        "id": str(scenario.id),
+        "title": scenario.title,
+        "description": scenario.description,
+        "priority": scenario.priority,
+        "severity": scenario.severity,
+        "category": scenario.category,
+        "type": scenario.type,
+        "status": scenario.status,
+        "version": scenario.version,
+    }
+
+
+async def _record_quality_evaluation(
+    db: AsyncSession,
+    target_level: str,
+    target_id: uuid.UUID,
+    issues: list[ValidationIssue],
+    evaluated_by: str = "system",
+) -> QualityEvaluation:
+    score, status, issue_payload = _quality_from_issues(issues)
+    evaluation = QualityEvaluation(
+        target_level=target_level,
+        target_id=target_id,
+        score=score,
+        status=status,
+        metrics={
+            "issue_count": len(issues),
+            "guardrail_score": score,
+        },
+        issues=issue_payload,
+        evaluated_by=evaluated_by,
+    )
+    db.add(evaluation)
+    db.add(
+        AuditLog(
+            entity_type=target_level,
+            entity_id=target_id,
+            action="quality_evaluated",
+            actor=evaluated_by,
+            details={"score": score, "status": status, "issue_count": len(issues)},
+        )
+    )
+    return evaluation
 
 
 async def _create_test_case_version(
@@ -522,6 +597,8 @@ async def create_feedback(
 ) -> FeedbackSummary:
     if payload.target_level not in TARGET_LEVELS:
         raise HTTPException(status_code=422, detail="Feedback target level must be requirement, scenario, or test_case")
+    if payload.feedback_type not in FEEDBACK_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported feedback type")
     if not payload.comment.strip():
         raise HTTPException(status_code=422, detail="Feedback comment is required")
 
@@ -532,6 +609,7 @@ async def create_feedback(
         feedback_type=payload.feedback_type,
         comment=payload.comment,
         created_by=payload.created_by,
+        vector_id=f"feedback:{payload.target_level}:{payload.target_id}:{uuid.uuid4()}",
     )
     db.add(feedback)
     audit = AuditLog(
@@ -566,6 +644,222 @@ async def list_feedback(
     if target_id:
         stmt = stmt.where(Feedback.target_id == target_id)
     stmt = stmt.order_by(Feedback.created_at.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@api_router.post(
+    "/feedback/revise",
+    response_model=RevisionRecordSummary,
+    tags=["Feedback"],
+)
+async def process_feedback_revision(
+    payload: FeedbackRevisionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> RevisionRecordSummary:
+    result = await db.execute(select(Feedback).where(Feedback.id == payload.feedback_id))
+    feedback = result.scalars().first()
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+
+    action = payload.action or feedback.feedback_type
+    if action not in FEEDBACK_TYPES:
+        raise HTTPException(status_code=422, detail="Unsupported feedback action")
+
+    source_snapshot: dict | None = None
+    result_snapshot: dict | None = None
+
+    if action == "generate_new":
+        scenario: TestScenario | None = None
+        if feedback.target_level == "scenario":
+            result = await db.execute(select(TestScenario).where(TestScenario.id == feedback.target_id))
+            scenario = result.scalars().first()
+        elif feedback.target_level == "test_case":
+            result = await db.execute(select(TestCase).where(TestCase.id == feedback.target_id))
+            source_case = result.scalars().first()
+            if source_case:
+                result = await db.execute(select(TestScenario).where(TestScenario.id == source_case.scenario_id))
+                scenario = result.scalars().first()
+        else:
+            result = await db.execute(
+                select(TestScenario)
+                .where(TestScenario.requirement_id == feedback.target_id)
+                .order_by(TestScenario.created_at.asc())
+            )
+            scenario = result.scalars().first()
+
+        if not scenario:
+            raise HTTPException(status_code=404, detail="Scenario context not found for new test case")
+
+        source_snapshot = _scenario_snapshot(scenario)
+        new_case = TestCase(
+            scenario_id=scenario.id,
+            requirement_id=scenario.requirement_id,
+            title=f"Feedback-driven case: {scenario.title}",
+            description=f"Generated from feedback: {feedback.comment}",
+            prerequisite="Review the linked requirement and feedback context before execution.",
+            priority=scenario.priority or "medium",
+            severity=scenario.severity or "major",
+            category=scenario.category or "functional",
+            type=scenario.type or "regression",
+            status="draft",
+        )
+        db.add(new_case)
+        await db.flush()
+        db.add(
+            TestCaseStepModel(
+                test_case_id=new_case.id,
+                step_number=1,
+                action="Execute the behavior requested by the feedback context.",
+                expected_result="The system satisfies the feedback without regressing the original requirement.",
+            )
+        )
+        result_snapshot = _test_case_snapshot(new_case)
+    elif action == "revise":
+        if feedback.target_level == "test_case":
+            result = await db.execute(
+                select(TestCase).where(TestCase.id == feedback.target_id).options(selectinload(TestCase.steps))
+            )
+            test_case = result.scalars().first()
+            if not test_case:
+                raise HTTPException(status_code=404, detail="Test case not found")
+            source_snapshot = _test_case_snapshot(test_case)
+            if test_case.locked:
+                revised_case = TestCase(
+                    scenario_id=test_case.scenario_id,
+                    requirement_id=test_case.requirement_id,
+                    title=f"{test_case.title} - revision",
+                    description=f"{test_case.description}\n\nRevision context: {feedback.comment}",
+                    prerequisite=test_case.prerequisite,
+                    priority=test_case.priority,
+                    severity=test_case.severity,
+                    category=test_case.category,
+                    type=test_case.type,
+                    status="draft",
+                    version=test_case.version + 1,
+                )
+                db.add(revised_case)
+                await db.flush()
+                for step in test_case.steps or []:
+                    db.add(
+                        TestCaseStepModel(
+                            test_case_id=revised_case.id,
+                            step_number=step.step_number,
+                            action=step.action,
+                            expected_result=step.expected_result,
+                        )
+                    )
+                result_snapshot = _test_case_snapshot(revised_case)
+            else:
+                test_case.description = f"{test_case.description}\n\nRevision context: {feedback.comment}"
+                test_case.status = "updated"
+                test_case.version += 1
+                result_snapshot = _test_case_snapshot(test_case)
+        elif feedback.target_level == "scenario":
+            result = await db.execute(select(TestScenario).where(TestScenario.id == feedback.target_id))
+            scenario = result.scalars().first()
+            if not scenario:
+                raise HTTPException(status_code=404, detail="Scenario not found")
+            source_snapshot = _scenario_snapshot(scenario)
+            scenario.description = f"{scenario.description}\n\nRevision context: {feedback.comment}"
+            scenario.status = "updated"
+            scenario.version += 1
+            result_snapshot = _scenario_snapshot(scenario)
+        else:
+            result = await db.execute(select(Requirement).where(Requirement.id == feedback.target_id))
+            requirement = result.scalars().first()
+            if not requirement:
+                raise HTTPException(status_code=404, detail="Requirement not found")
+            source_snapshot = {"id": str(requirement.id), "title": requirement.title, "description": requirement.description}
+            requirement.status = "reviewed"
+            requirement.metadata_json = {
+                **(requirement.metadata_json or {}),
+                "latest_feedback_context": feedback.comment,
+            }
+            result_snapshot = {
+                "id": str(requirement.id),
+                "status": requirement.status,
+                "latest_feedback_context": feedback.comment,
+            }
+    elif action == "deprecate":
+        if feedback.target_level == "test_case":
+            result = await db.execute(
+                select(TestCase).where(TestCase.id == feedback.target_id).options(selectinload(TestCase.steps))
+            )
+            test_case = result.scalars().first()
+            if not test_case:
+                raise HTTPException(status_code=404, detail="Test case not found")
+            source_snapshot = _test_case_snapshot(test_case)
+            test_case.status = "deprecated"
+            test_case.repository_status = "deprecated"
+            result_snapshot = _test_case_snapshot(test_case)
+        elif feedback.target_level == "scenario":
+            result = await db.execute(select(TestScenario).where(TestScenario.id == feedback.target_id))
+            scenario = result.scalars().first()
+            if not scenario:
+                raise HTTPException(status_code=404, detail="Scenario not found")
+            source_snapshot = _scenario_snapshot(scenario)
+            scenario.status = "deprecated"
+            result_snapshot = _scenario_snapshot(scenario)
+        else:
+            raise HTTPException(status_code=422, detail="Requirements cannot be deprecated through feedback")
+    else:
+        result_snapshot = {
+            "feedback_id": str(feedback.id),
+            "resolution": action,
+            "comment": feedback.comment,
+        }
+
+    feedback.status = "resolved"
+    feedback.resolved_at = datetime.utcnow()
+    feedback.resolution_notes = payload.notes or f"Processed as {action}"
+
+    revision = RevisionRecord(
+        feedback_id=feedback.id,
+        target_level=feedback.target_level,
+        target_id=feedback.target_id,
+        action=action,
+        status="completed",
+        created_by=payload.created_by,
+        notes=payload.notes,
+        source_snapshot=source_snapshot,
+        result_snapshot=result_snapshot,
+    )
+    db.add(revision)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type=feedback.target_level,
+            entity_id=feedback.target_id,
+            action=f"feedback_{action}_processed",
+            actor=payload.created_by,
+            details={"feedback_id": str(feedback.id), "revision_id": str(revision.id)},
+        )
+    )
+    await db.commit()
+    await db.refresh(revision)
+    return revision
+
+
+@api_router.get(
+    "/revisions",
+    response_model=list[RevisionRecordSummary],
+    tags=["Feedback"],
+)
+async def list_revisions(
+    target_level: str | None = Query(None),
+    target_id: uuid.UUID | None = Query(None),
+    feedback_id: uuid.UUID | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> list[RevisionRecordSummary]:
+    stmt = select(RevisionRecord)
+    if target_level:
+        stmt = stmt.where(RevisionRecord.target_level == target_level)
+    if target_id:
+        stmt = stmt.where(RevisionRecord.target_id == target_id)
+    if feedback_id:
+        stmt = stmt.where(RevisionRecord.feedback_id == feedback_id)
+    stmt = stmt.order_by(RevisionRecord.created_at.desc())
     result = await db.execute(stmt)
     return result.scalars().all()
 
@@ -699,6 +993,89 @@ async def validate_target(
         issues = _validate_test_case_content(test_case)
 
     return ValidationResult(valid=not issues, target_level=target_level, target_id=target_uuid, issues=issues)
+
+
+async def _collect_validation_issues(
+    db: AsyncSession,
+    target_level: str,
+    target_uuid: uuid.UUID,
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    if target_level == "requirement":
+        result = await db.execute(select(Requirement).where(Requirement.id == target_uuid))
+        requirement = result.scalars().first()
+        if not requirement:
+            raise HTTPException(status_code=404, detail="Requirement not found")
+        if len(requirement.title.strip()) < 5:
+            issues.append(ValidationIssue(field="title", message="Title must be descriptive."))
+        if len(requirement.description.strip()) < 12:
+            issues.append(ValidationIssue(field="description", message="Description must explain the requirement."))
+    elif target_level == "scenario":
+        result = await db.execute(select(TestScenario).where(TestScenario.id == target_uuid))
+        scenario = result.scalars().first()
+        if not scenario:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        if len(scenario.title.strip()) < 5:
+            issues.append(ValidationIssue(field="title", message="Title must be descriptive."))
+        if len(scenario.description.strip()) < 12:
+            issues.append(ValidationIssue(field="description", message="Description must explain the scenario."))
+        if not scenario.priority:
+            issues.append(ValidationIssue(field="priority", message="Priority is required."))
+        if not scenario.severity:
+            issues.append(ValidationIssue(field="severity", message="Severity is required."))
+    else:
+        result = await db.execute(
+            select(TestCase).where(TestCase.id == target_uuid).options(selectinload(TestCase.steps))
+        )
+        test_case = result.scalars().first()
+        if not test_case:
+            raise HTTPException(status_code=404, detail="Test case not found")
+        issues = _validate_test_case_content(test_case)
+    return issues
+
+
+@api_router.post(
+    "/quality/{target_level}/{target_id}",
+    response_model=QualityEvaluationSummary,
+    tags=["Quality"],
+)
+async def evaluate_quality(
+    target_level: str,
+    target_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> QualityEvaluationSummary:
+    if target_level not in TARGET_LEVELS:
+        raise HTTPException(status_code=422, detail="Target level must be requirement, scenario, or test_case")
+    try:
+        target_uuid = uuid.UUID(target_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    issues = await _collect_validation_issues(db, target_level, target_uuid)
+    evaluation = await _record_quality_evaluation(db, target_level, target_uuid, issues)
+    await db.commit()
+    await db.refresh(evaluation)
+    return evaluation
+
+
+@api_router.get(
+    "/quality",
+    response_model=list[QualityEvaluationSummary],
+    tags=["Quality"],
+)
+async def list_quality_evaluations(
+    target_level: str | None = Query(None),
+    target_id: uuid.UUID | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> list[QualityEvaluationSummary]:
+    stmt = select(QualityEvaluation)
+    if target_level:
+        stmt = stmt.where(QualityEvaluation.target_level == target_level)
+    if target_id:
+        stmt = stmt.where(QualityEvaluation.target_id == target_id)
+    stmt = stmt.order_by(QualityEvaluation.created_at.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
 @api_router.post(

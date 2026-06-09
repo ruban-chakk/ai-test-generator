@@ -133,7 +133,40 @@ class Feedback(Base):
     feedback_type = Column(String, nullable=False)
     comment = Column(Text, nullable=False)
     created_by = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="open")
+    resolved_at = Column(DateTime, nullable=True)
+    resolution_notes = Column(Text, nullable=True)
     vector_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class RevisionRecord(Base):
+    __tablename__ = "revision_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    feedback_id = Column(UUID(as_uuid=True), ForeignKey("feedback.id", ondelete="SET NULL"), nullable=True)
+    target_level = Column(String, nullable=False)
+    target_id = Column(UUID(as_uuid=True), nullable=False)
+    action = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="completed")
+    created_by = Column(String, nullable=False)
+    notes = Column(Text, nullable=True)
+    source_snapshot = Column(JSON, nullable=True)
+    result_snapshot = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class QualityEvaluation(Base):
+    __tablename__ = "quality_evaluations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    target_level = Column(String, nullable=False)
+    target_id = Column(UUID(as_uuid=True), nullable=False)
+    score = Column(Integer, nullable=False)
+    status = Column(String, nullable=False)
+    metrics = Column(JSON, nullable=False, default=dict)
+    issues = Column(JSON, nullable=False, default=list)
+    evaluated_by = Column(String, nullable=False, default="system")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

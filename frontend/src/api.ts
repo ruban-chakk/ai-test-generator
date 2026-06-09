@@ -113,6 +113,43 @@ export type FeedbackCreatePayload = {
 
 export type FeedbackSummary = FeedbackCreatePayload & {
   id: string;
+  status: string;
+  resolved_at?: string;
+  resolution_notes?: string;
+  vector_id?: string;
+  created_at: string;
+};
+
+export type FeedbackRevisionPayload = {
+  feedback_id: string;
+  action?: string;
+  created_by: string;
+  notes?: string;
+};
+
+export type RevisionRecordSummary = {
+  id: string;
+  feedback_id?: string;
+  target_level: string;
+  target_id: string;
+  action: string;
+  status: string;
+  created_by: string;
+  notes?: string;
+  source_snapshot?: Record<string, unknown>;
+  result_snapshot?: Record<string, unknown>;
+  created_at: string;
+};
+
+export type QualityEvaluationSummary = {
+  id: string;
+  target_level: string;
+  target_id: string;
+  score: number;
+  status: string;
+  metrics: Record<string, unknown>;
+  issues: Record<string, unknown>[];
+  evaluated_by: string;
   created_at: string;
 };
 
@@ -399,6 +436,37 @@ export async function getFeedback(
   return handleResponse<FeedbackSummary[]>(response);
 }
 
+export async function processFeedbackRevision(
+  payload: FeedbackRevisionPayload,
+): Promise<RevisionRecordSummary> {
+  const response = await fetch(`${API_BASE_URL}/feedback/revise`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<RevisionRecordSummary>(response);
+}
+
+export async function getRevisions(
+  targetLevel?: string,
+  targetId?: string,
+  feedbackId?: string,
+): Promise<RevisionRecordSummary[]> {
+  const params = new URLSearchParams();
+  if (targetLevel) params.set('target_level', targetLevel);
+  if (targetId) params.set('target_id', targetId);
+  if (feedbackId) params.set('feedback_id', feedbackId);
+  const url = `${API_BASE_URL}/revisions${params.toString() ? `?${params.toString()}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<RevisionRecordSummary[]>(response);
+}
+
 export async function getApprovals(
   targetLevel?: string,
   targetId?: string,
@@ -447,4 +515,33 @@ export async function validateTarget(targetLevel: string, targetId: string): Pro
     },
   });
   return handleResponse<ValidationResult>(response);
+}
+
+export async function evaluateQuality(
+  targetLevel: string,
+  targetId: string,
+): Promise<QualityEvaluationSummary> {
+  const response = await fetch(`${API_BASE_URL}/quality/${targetLevel}/${targetId}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<QualityEvaluationSummary>(response);
+}
+
+export async function getQualityEvaluations(
+  targetLevel?: string,
+  targetId?: string,
+): Promise<QualityEvaluationSummary[]> {
+  const params = new URLSearchParams();
+  if (targetLevel) params.set('target_level', targetLevel);
+  if (targetId) params.set('target_id', targetId);
+  const url = `${API_BASE_URL}/quality${params.toString() ? `?${params.toString()}` : ''}`;
+  const response = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<QualityEvaluationSummary[]>(response);
 }

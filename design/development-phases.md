@@ -23,12 +23,12 @@
 - Completed: Test case repository persistence workflow and change control guardrails are in place.
 
 ## Phase 3: Feedback, quality, and traceability
-- Add a feedback modal for requirement/scenario/test case comments.
-- Store feedback in PostgreSQL and embed feedback for retrieval.
-- Implement a revision pipeline that re-runs generation using feedback context.
-- Support generating new cases, revising existing ones, and deprecating outdated cases.
-- Capture feedback history and traceability for audit and continuous improvement.
-- Add quality evaluation metrics and guardrails to reduce hallucination.
+- Completed: Feedback modal for requirement, scenario, and test case comments.
+- Completed: Feedback is stored in PostgreSQL with stable vector IDs for later retrieval embedding.
+- Completed: Revision pipeline processes feedback context into traceable revision records.
+- Completed: Feedback actions support generating new cases, revising existing content, and deprecating outdated cases.
+- Completed: Feedback history, resolution state, revision trace, and audit trail are captured for continuous improvement.
+- Completed: Quality evaluation metrics and guardrail scores are stored for generated and reviewed content.
 
 ## Phase 4: Impact analysis and enterprise risk
 - Add similarity search across existing approved test cases.

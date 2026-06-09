@@ -51,6 +51,49 @@ class FeedbackCreate(BaseModel):
 
 class FeedbackSummary(FeedbackCreate):
     id: uuid.UUID
+    status: str = "open"
+    resolved_at: Optional[datetime] = None
+    resolution_notes: Optional[str] = None
+    vector_id: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class FeedbackRevisionRequest(BaseModel):
+    feedback_id: uuid.UUID
+    action: Optional[str] = None
+    created_by: str = "system"
+    notes: Optional[str] = None
+
+
+class RevisionRecordSummary(BaseModel):
+    id: uuid.UUID
+    feedback_id: Optional[uuid.UUID] = None
+    target_level: str
+    target_id: uuid.UUID
+    action: str
+    status: str
+    created_by: str
+    notes: Optional[str] = None
+    source_snapshot: Optional[dict] = None
+    result_snapshot: Optional[dict] = None
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class QualityEvaluationSummary(BaseModel):
+    id: uuid.UUID
+    target_level: str
+    target_id: uuid.UUID
+    score: int
+    status: str
+    metrics: dict
+    issues: List[dict]
+    evaluated_by: str
     created_at: datetime
 
     class Config:

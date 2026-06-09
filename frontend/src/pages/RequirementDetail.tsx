@@ -7,9 +7,12 @@ import {
   createFeedback,
   createScenarioForRequirement,
   createTestCaseForScenario,
+  evaluateQuality,
   getAudit,
   getApprovals,
   getFeedback,
+  getQualityEvaluations,
+  getRevisions,
   getTestCaseVersions,
   generateRequirementDraft,
   getRequirement,
@@ -19,9 +22,12 @@ import {
   ApprovalRecordSummary,
   AuditLogSummary,
   FeedbackSummary,
+  QualityEvaluationSummary,
   RequirementDetail,
+  RevisionRecordSummary,
   TestCaseVersionSummary,
   ValidationResult,
+  processFeedbackRevision,
   validateTarget,
 } from '../api';
 
@@ -68,12 +74,17 @@ export default function RequirementDetailPage() {
   const [feedbackComment, setFeedbackComment] = useState('');
   const [feedbackCreatedBy, setFeedbackCreatedBy] = useState('system');
   const [feedbackSaving, setFeedbackSaving] = useState(false);
+  const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
   const [feedbackList, setFeedbackList] = useState<FeedbackSummary[]>([]);
   const [approvalRecords, setApprovalRecords] = useState<ApprovalRecordSummary[]>([]);
   const [auditRecords, setAuditRecords] = useState<AuditLogSummary[]>([]);
   const [versionRecords, setVersionRecords] = useState<TestCaseVersionSummary[]>([]);
+  const [revisionRecords, setRevisionRecords] = useState<RevisionRecordSummary[]>([]);
+  const [qualityRecords, setQualityRecords] = useState<QualityEvaluationSummary[]>([]);
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
   const [validationSaving, setValidationSaving] = useState(false);
+  const [revisionSaving, setRevisionSaving] = useState<string | null>(null);
+  const [qualitySaving, setQualitySaving] = useState(false);
 
   useEffect(() => {
     if (!id) {
@@ -122,16 +133,20 @@ export default function RequirementDetailPage() {
   ) => {
     try {
       setError(null);
-      const [feedbackData, approvalsData, auditData, versionData] = await Promise.all([
+      const [feedbackData, approvalsData, auditData, versionData, revisionsData, qualityData] = await Promise.all([
         getFeedback(targetLevel, targetId),
         getApprovals(targetLevel, targetId),
         getAudit(targetLevel, targetId),
         targetLevel === 'test_case' ? getTestCaseVersions(targetId) : Promise.resolve([]),
+        getRevisions(targetLevel, targetId),
+        getQualityEvaluations(targetLevel, targetId),
       ]);
       setFeedbackList(feedbackData);
       setApprovalRecords(approvalsData);
       setAuditRecords(auditData);
       setVersionRecords(versionData);
+      setRevisionRecords(revisionsData);
+      setQualityRecords(qualityData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load review history');
     }
@@ -140,9 +155,11 @@ export default function RequirementDetailPage() {
   const handleSelectFeedbackTarget = (
     level: 'requirement' | 'scenario' | 'test_case',
     targetId: string,
+    openModal = false,
   ) => {
     setFeedbackTarget({ level, id: targetId });
     setValidationResult(null);
+    if (openModal) setFeedbackModalOpen(true);
     refreshHistory(targetId, level);
   };
 
@@ -161,6 +178,24 @@ export default function RequirementDetailPage() {
       setError(err instanceof Error ? err.message : 'Unable to validate target');
     } finally {
       setValidationSaving(false);
+    }
+  };
+
+  const handleEvaluateQuality = async () => {
+    if (!feedbackTarget) {
+      setError('Select a review target first');
+      return;
+    }
+
+    try {
+      setQualitySaving(true);
+      setError(null);
+      await evaluateQuality(feedbackTarget.level, feedbackTarget.id);
+      await refreshHistory(feedbackTarget.id, feedbackTarget.level);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to evaluate quality');
+    } finally {
+      setQualitySaving(false);
     }
   };
 
@@ -183,11 +218,33 @@ export default function RequirementDetailPage() {
         created_by: feedbackCreatedBy,
       });
       setFeedbackComment('');
+      setFeedbackModalOpen(false);
       await refreshHistory(feedbackTarget.id, feedbackTarget.level);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to submit feedback');
     } finally {
       setFeedbackSaving(false);
+    }
+  };
+
+  const handleProcessFeedback = async (feedback: FeedbackSummary, action?: string) => {
+    if (!feedbackTarget) return;
+
+    try {
+      setRevisionSaving(feedback.id);
+      setError(null);
+      await processFeedbackRevision({
+        feedback_id: feedback.id,
+        action: action ?? feedback.feedback_type,
+        created_by: feedbackCreatedBy,
+        notes: `Processed from ${feedback.feedback_type} feedback`,
+      });
+      await refreshRequirement();
+      await refreshHistory(feedbackTarget.id, feedbackTarget.level);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to process feedback');
+    } finally {
+      setRevisionSaving(null);
     }
   };
 
@@ -427,6 +484,14 @@ export default function RequirementDetailPage() {
               >
                 {validationSaving ? 'Validating...' : 'Run guardrails'}
               </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleEvaluateQuality}
+                disabled={qualitySaving}
+              >
+                {qualitySaving ? 'Scoring...' : 'Evaluate quality'}
+              </button>
             </div>
             {validationResult ? (
               <div className={validationResult.valid ? 'validation-card valid' : 'validation-card invalid'}>
@@ -458,6 +523,24 @@ export default function RequirementDetailPage() {
               </div>
             ) : (
               <p>No review history yet.</p>
+            )}
+
+            <h2>Quality metrics</h2>
+            {qualityRecords.length ? (
+              <div className="history-list">
+                {qualityRecords.map((record) => (
+                  <div key={record.id} className="history-card">
+                    <div>
+                      <strong>{record.score}/100</strong> · {record.status}
+                    </div>
+                    <div className="history-meta">
+                      {record.evaluated_by} · {new Date(record.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p>No quality evaluations yet for this target.</p>
             )}
 
             {feedbackTarget?.level === 'test_case' ? (
@@ -501,15 +584,33 @@ export default function RequirementDetailPage() {
               <p>No audit events yet for this target.</p>
             )}
 
+            <h2>Revision trace</h2>
+            {revisionRecords.length ? (
+              <div className="history-list">
+                {revisionRecords.map((record) => (
+                  <div key={record.id} className="history-card">
+                    <div>
+                      <strong>{record.action}</strong> · {record.status}
+                    </div>
+                    <div className="history-meta">
+                      {record.created_by} · {new Date(record.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p>No revision activity yet for this target.</p>
+            )}
+
             <h2>Feedback</h2>
             <div className="feedback-target-bar">
               <button
                 type="button"
                 className={feedbackTarget?.level === 'requirement' ? 'active' : 'secondary-button'}
-                onClick={() => handleSelectFeedbackTarget('requirement', requirement.id)}
-              >
-                Requirement
-              </button>
+                  onClick={() => handleSelectFeedbackTarget('requirement', requirement.id)}
+                >
+                  Requirement
+                </button>
               {requirement.scenarios?.map((scenario) => (
                 <button
                   key={scenario.id}
@@ -525,52 +626,35 @@ export default function RequirementDetailPage() {
                 </button>
               ))}
             </div>
-            <form className="feedback-form" onSubmit={handleCreateFeedback}>
-              <label>
-                Feedback type
-                <select value={feedbackType} onChange={(event) => setFeedbackType(event.target.value)}>
-                  <option value="revise">revise</option>
-                  <option value="generate_new">generate new</option>
-                  <option value="deprecate">deprecate</option>
-                  <option value="accept">accept</option>
-                  <option value="reject">reject</option>
-                </select>
-              </label>
-              <label>
-                Comment
-                <textarea
-                  value={feedbackComment}
-                  onChange={(event) => setFeedbackComment(event.target.value)}
-                  rows={4}
-                  required
-                />
-              </label>
-              <label>
-                Created by
-                <input
-                  type="text"
-                  value={feedbackCreatedBy}
-                  onChange={(event) => setFeedbackCreatedBy(event.target.value)}
-                  required
-                />
-              </label>
-              <div className="detail-actions">
-                <button className="primary-button" type="submit" disabled={feedbackSaving}>
-                  {feedbackSaving ? 'Submitting…' : 'Submit feedback'}
-                </button>
-              </div>
-            </form>
+            <div className="detail-actions">
+              <button className="primary-button" type="button" onClick={() => setFeedbackModalOpen(true)}>
+                Add feedback
+              </button>
+            </div>
             {feedbackList.length ? (
               <div className="feedback-list">
                 {feedbackList.map((feedback) => (
                   <div key={feedback.id} className="history-card">
                     <div>
-                      <strong>{feedback.feedback_type}</strong> · {feedback.target_level}
+                      <strong>{feedback.feedback_type}</strong> · {feedback.target_level} · {feedback.status}
                     </div>
                     <div>{feedback.comment}</div>
                     <div className="history-meta">
                       {feedback.created_by} · {new Date(feedback.created_at).toLocaleString()}
                     </div>
+                    {feedback.resolution_notes ? <div>{feedback.resolution_notes}</div> : null}
+                    {feedback.status !== 'resolved' ? (
+                      <div className="detail-actions">
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() => handleProcessFeedback(feedback)}
+                          disabled={revisionSaving === feedback.id}
+                        >
+                          {revisionSaving === feedback.id ? 'Processing...' : 'Process feedback'}
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
@@ -637,7 +721,7 @@ export default function RequirementDetailPage() {
                       <button
                         className="secondary-button"
                         type="button"
-                        onClick={() => handleSelectFeedbackTarget('scenario', scenario.id)}
+                        onClick={() => handleSelectFeedbackTarget('scenario', scenario.id, true)}
                       >
                         Add Feedback
                       </button>
@@ -719,7 +803,7 @@ export default function RequirementDetailPage() {
                               <button
                                 className="secondary-button"
                                 type="button"
-                                onClick={() => handleSelectFeedbackTarget('test_case', testCase.id)}
+                                onClick={() => handleSelectFeedbackTarget('test_case', testCase.id, true)}
                               >
                                 Add Feedback
                               </button>
@@ -757,6 +841,54 @@ export default function RequirementDetailPage() {
       ) : (
         <div className="status-message">Requirement not found.</div>
       )}
+
+      {feedbackModalOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <div className="modal-panel" role="dialog" aria-modal="true" aria-label="Add feedback">
+            <div className="modal-header">
+              <h2>Add feedback</h2>
+              <button className="secondary-button" type="button" onClick={() => setFeedbackModalOpen(false)}>
+                Close
+              </button>
+            </div>
+            <form className="feedback-form" onSubmit={handleCreateFeedback}>
+              <label>
+                Feedback type
+                <select value={feedbackType} onChange={(event) => setFeedbackType(event.target.value)}>
+                  <option value="revise">revise</option>
+                  <option value="generate_new">generate new</option>
+                  <option value="deprecate">deprecate</option>
+                  <option value="accept">accept</option>
+                  <option value="reject">reject</option>
+                </select>
+              </label>
+              <label>
+                Comment
+                <textarea
+                  value={feedbackComment}
+                  onChange={(event) => setFeedbackComment(event.target.value)}
+                  rows={4}
+                  required
+                />
+              </label>
+              <label>
+                Created by
+                <input
+                  type="text"
+                  value={feedbackCreatedBy}
+                  onChange={(event) => setFeedbackCreatedBy(event.target.value)}
+                  required
+                />
+              </label>
+              <div className="detail-actions">
+                <button className="primary-button" type="submit" disabled={feedbackSaving}>
+                  {feedbackSaving ? 'Submitting...' : 'Submit feedback'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
