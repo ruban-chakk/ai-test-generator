@@ -108,10 +108,10 @@ See `design/development-phases.md` for a detailed enterprise-grade roadmap.
 - Completed: Metrics and quality evaluation for generated content
 
 ### Phase 4: Impact analysis and compliance
-- Duplicate / deprecate / update recommendations
-- Requirement impact analysis for risk and coverage
-- Policy controls for depreciation and retention
-- Integration with enterprise evaluation and governance tooling
+- Completed: Duplicate / deprecate / update recommendations
+- Completed: Requirement impact analysis for risk and coverage
+- Completed: Policy controls for depreciation and update review
+- Completed: Integration with enterprise evaluation and governance tooling surfaces
 
 ### Phase 5: Integration and scale
 - Jira import automation and test repo synchronization

@@ -7,12 +7,15 @@ import {
   createFeedback,
   createScenarioForRequirement,
   createTestCaseForScenario,
+  deprecateImpactedTestCase,
   evaluateQuality,
+  flagImpactedTestCaseForUpdate,
   getAudit,
   getApprovals,
   getFeedback,
   getQualityEvaluations,
   getRevisions,
+  getRequirementImpact,
   getTestCaseVersions,
   generateRequirementDraft,
   getRequirement,
@@ -22,6 +25,8 @@ import {
   ApprovalRecordSummary,
   AuditLogSummary,
   FeedbackSummary,
+  ImpactAnalysisSummary,
+  ImpactCandidate,
   QualityEvaluationSummary,
   RequirementDetail,
   RevisionRecordSummary,
@@ -81,10 +86,13 @@ export default function RequirementDetailPage() {
   const [versionRecords, setVersionRecords] = useState<TestCaseVersionSummary[]>([]);
   const [revisionRecords, setRevisionRecords] = useState<RevisionRecordSummary[]>([]);
   const [qualityRecords, setQualityRecords] = useState<QualityEvaluationSummary[]>([]);
+  const [impactAnalysis, setImpactAnalysis] = useState<ImpactAnalysisSummary | null>(null);
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
   const [validationSaving, setValidationSaving] = useState(false);
   const [revisionSaving, setRevisionSaving] = useState<string | null>(null);
   const [qualitySaving, setQualitySaving] = useState(false);
+  const [impactSaving, setImpactSaving] = useState(false);
+  const [impactActionSaving, setImpactActionSaving] = useState<string | null>(null);
 
   useEffect(() => {
     if (!id) {
@@ -196,6 +204,52 @@ export default function RequirementDetailPage() {
       setError(err instanceof Error ? err.message : 'Unable to evaluate quality');
     } finally {
       setQualitySaving(false);
+    }
+  };
+
+  const handleRunImpactAnalysis = async () => {
+    if (!id) {
+      setError('Requirement ID is missing');
+      return;
+    }
+
+    try {
+      setImpactSaving(true);
+      setError(null);
+      const result = await getRequirementImpact(id);
+      setImpactAnalysis(result);
+      await refreshHistory(id, 'requirement');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to run impact analysis');
+    } finally {
+      setImpactSaving(false);
+    }
+  };
+
+  const handleImpactAction = async (candidate: ImpactCandidate, action: 'deprecate' | 'review_update') => {
+    try {
+      setImpactActionSaving(candidate.test_case_id);
+      setError(null);
+      if (action === 'deprecate') {
+        await deprecateImpactedTestCase(candidate.test_case_id, {
+          approved_by: feedbackCreatedBy,
+          notes: `Applied from impact analysis ${impactAnalysis?.id ?? ''}`,
+        });
+      } else {
+        await flagImpactedTestCaseForUpdate(candidate.test_case_id, {
+          approved_by: feedbackCreatedBy,
+          notes: `Applied from impact analysis ${impactAnalysis?.id ?? ''}`,
+        });
+      }
+      await refreshRequirement();
+      if (id) {
+        const result = await getRequirementImpact(id);
+        setImpactAnalysis(result);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to apply impact action');
+    } finally {
+      setImpactActionSaving(null);
     }
   };
 
@@ -394,6 +448,53 @@ export default function RequirementDetailPage() {
     }
   };
 
+  const renderImpactCandidates = (
+    title: string,
+    candidates: ImpactCandidate[],
+    action?: 'deprecate' | 'review_update',
+  ) => (
+    <div className="impact-group">
+      <h3>{title}</h3>
+      {candidates.length ? (
+        <div className="history-list">
+          {candidates.map((candidate) => (
+            <div key={`${title}-${candidate.test_case_id}`} className="impact-card">
+              <div className="impact-card-header">
+                <div>
+                  <strong>{candidate.title}</strong>
+                  <div className="history-meta">
+                    {candidate.type ?? 'case'} · {candidate.severity ?? 'severity'} · {candidate.repository_status}
+                  </div>
+                </div>
+                <span className="similarity-pill">{Math.round(candidate.similarity * 100)}%</span>
+              </div>
+              <p>{candidate.reason}</p>
+              <p className="case-meta">Recommended action: {candidate.recommended_action}</p>
+              {action ? (
+                <div className="detail-actions">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => handleImpactAction(candidate, action)}
+                    disabled={impactActionSaving === candidate.test_case_id}
+                  >
+                    {impactActionSaving === candidate.test_case_id
+                      ? 'Applying...'
+                      : action === 'deprecate'
+                        ? 'Mark deprecated'
+                        : 'Review update'}
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p>No candidates found.</p>
+      )}
+    </div>
+  );
+
   return (
     <main className="page-container">
       <header className="page-header">
@@ -463,6 +564,58 @@ export default function RequirementDetailPage() {
           <article className="detail-card">
             <h2>Description</h2>
             <p>{requirement.description}</p>
+          </article>
+
+          <article className="detail-card impact-panel">
+            <div className="impact-heading">
+              <div>
+                <h2>Impact analysis</h2>
+                <p className="case-meta">Compares this requirement against approved repository test cases.</p>
+              </div>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={handleRunImpactAnalysis}
+                disabled={impactSaving}
+              >
+                {impactSaving ? 'Analyzing...' : 'Run impact'}
+              </button>
+            </div>
+            {impactAnalysis ? (
+              <>
+                <div className="impact-summary-grid">
+                  <div className="history-card">
+                    <strong>{impactAnalysis.duplicates.length}</strong>
+                    <span>Duplicates</span>
+                  </div>
+                  <div className="history-card">
+                    <strong>{impactAnalysis.deprecations.length}</strong>
+                    <span>Deprecations</span>
+                  </div>
+                  <div className="history-card">
+                    <strong>{impactAnalysis.updates.length}</strong>
+                    <span>Updates</span>
+                  </div>
+                  <div className="history-card">
+                    <strong>{impactAnalysis.risk_score}/100</strong>
+                    <span>Risk</span>
+                  </div>
+                  <div className="history-card">
+                    <strong>{impactAnalysis.coverage_score}/100</strong>
+                    <span>Coverage</span>
+                  </div>
+                </div>
+                <p className="case-meta">
+                  Duplicate threshold: {Math.round(impactAnalysis.similarity_threshold * 100)}% · Scanned:{' '}
+                  {String(impactAnalysis.summary.approved_cases_scanned ?? 0)}
+                </p>
+                {renderImpactCandidates('Duplicate candidates', impactAnalysis.duplicates)}
+                {renderImpactCandidates('Deprecation candidates', impactAnalysis.deprecations, 'deprecate')}
+                {renderImpactCandidates('Update candidates', impactAnalysis.updates, 'review_update')}
+              </>
+            ) : (
+              <p>No impact analysis has been run for this requirement yet.</p>
+            )}
           </article>
 
           <article className="detail-card">

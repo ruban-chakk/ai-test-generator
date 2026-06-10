@@ -170,6 +170,23 @@ class QualityEvaluation(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class ImpactAnalysis(Base):
+    __tablename__ = "impact_analyses"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="SET NULL"), nullable=True)
+    source_text = Column(Text, nullable=False)
+    similarity_threshold = Column(Integer, nullable=False, default=80)
+    duplicates = Column(JSON, nullable=False, default=list)
+    deprecations = Column(JSON, nullable=False, default=list)
+    updates = Column(JSON, nullable=False, default=list)
+    risk_score = Column(Integer, nullable=False, default=0)
+    coverage_score = Column(Integer, nullable=False, default=0)
+    summary = Column(JSON, nullable=False, default=dict)
+    created_by = Column(String, nullable=False, default="system")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class ApprovalRecord(Base):
     __tablename__ = "approval_records"
 

@@ -153,6 +153,43 @@ export type QualityEvaluationSummary = {
   created_at: string;
 };
 
+export type ImpactCandidate = {
+  test_case_id: string;
+  requirement_id: string;
+  scenario_id: string;
+  title: string;
+  status: string;
+  repository_status: string;
+  similarity: number;
+  recommended_action: string;
+  reason: string;
+  priority?: string;
+  severity?: string;
+  category?: string;
+  type?: string;
+};
+
+export type ImpactAnalysisSummary = {
+  id: string;
+  requirement_id?: string;
+  source_text: string;
+  similarity_threshold: number;
+  duplicates: ImpactCandidate[];
+  deprecations: ImpactCandidate[];
+  updates: ImpactCandidate[];
+  risk_score: number;
+  coverage_score: number;
+  summary: Record<string, unknown>;
+  created_by: string;
+  created_at: string;
+};
+
+export type ImpactAnalyzePayload = {
+  text: string;
+  context_ids?: string[];
+  created_by: string;
+};
+
 export type ApprovalRecordSummary = {
   id: string;
   target_level: string;
@@ -544,4 +581,52 @@ export async function getQualityEvaluations(
     },
   });
   return handleResponse<QualityEvaluationSummary[]>(response);
+}
+
+export async function getRequirementImpact(requirementId: string): Promise<ImpactAnalysisSummary> {
+  const response = await fetch(`${API_BASE_URL}/requirements/${requirementId}/impact`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<ImpactAnalysisSummary>(response);
+}
+
+export async function analyzeImpact(payload: ImpactAnalyzePayload): Promise<ImpactAnalysisSummary> {
+  const response = await fetch(`${API_BASE_URL}/impact/analyze`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<ImpactAnalysisSummary>(response);
+}
+
+export async function deprecateImpactedTestCase(
+  testCaseId: string,
+  payload: ApprovalActionPayload,
+): Promise<TestCaseSummary> {
+  const response = await fetch(`${API_BASE_URL}/impact/test_cases/${testCaseId}/deprecate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<TestCaseSummary>(response);
+}
+
+export async function flagImpactedTestCaseForUpdate(
+  testCaseId: string,
+  payload: ApprovalActionPayload,
+): Promise<TestCaseSummary> {
+  const response = await fetch(`${API_BASE_URL}/impact/test_cases/${testCaseId}/review-update`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<TestCaseSummary>(response);
 }

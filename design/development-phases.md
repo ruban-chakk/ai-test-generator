@@ -31,12 +31,12 @@
 - Completed: Quality evaluation metrics and guardrail scores are stored for generated and reviewed content.
 
 ## Phase 4: Impact analysis and enterprise risk
-- Add similarity search across existing approved test cases.
-- Define duplicate thresholds (80%) and identify candidate duplicates.
-- Build deprecation/update recommendation logic.
-- Surface impact analysis results in the UI.
-- Automate new requirement comparison against approved repository content.
-- Add risk and coverage insights for enterprise stakeholders.
+- Completed: Similarity search across existing approved repository test cases.
+- Completed: Duplicate threshold is defined at 80% and candidate duplicates are identified.
+- Completed: Deprecation and update recommendation logic with policy actions.
+- Completed: Impact analysis results are surfaced in the requirement detail UI.
+- Completed: New requirements are automatically compared against approved repository content.
+- Completed: Risk and coverage insights are available for enterprise stakeholders.
 
 ## Phase 5: Integration, scale, and compliance
 - Add Jira import automation and repository sync.

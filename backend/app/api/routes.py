@@ -1,7 +1,9 @@
 import uuid
+import re
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -11,6 +13,7 @@ from app.models import (
     ApprovalRecord,
     AuditLog,
     Feedback,
+    ImpactAnalysis,
     QualityEvaluation,
     Requirement,
     RevisionRecord,
@@ -26,6 +29,9 @@ from app.schemas import (
     FeedbackCreate,
     FeedbackRevisionRequest,
     FeedbackSummary,
+    ImpactAnalyzeRequest,
+    ImpactAnalysisSummary,
+    ImpactCandidate,
     QualityEvaluationSummary,
     RequirementCreate,
     RequirementDetail,
@@ -45,6 +51,23 @@ api_router = APIRouter()
 
 TARGET_LEVELS = {"requirement", "scenario", "test_case"}
 FEEDBACK_TYPES = {"revise", "generate_new", "deprecate", "accept", "reject"}
+DUPLICATE_THRESHOLD = 0.80
+UPDATE_THRESHOLD = 0.45
+DEPRECATION_KEYWORDS = {
+    "replace",
+    "replaces",
+    "replaced",
+    "obsolete",
+    "deprecated",
+    "deprecate",
+    "retire",
+    "retired",
+    "remove",
+    "removed",
+    "instead",
+    "migrate",
+    "migration",
+}
 
 
 def _actor(payload: ApprovalAction) -> str:
@@ -97,6 +120,199 @@ def _quality_from_issues(issues: list[ValidationIssue]) -> tuple[int, str, list[
     score = max(0, 100 - (len(issues) * 15))
     status = "passed" if score >= 85 else "needs_review" if score >= 60 else "failed"
     return score, status, [issue.dict() for issue in issues]
+
+
+def _tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) > 2
+        and token
+        not in {
+            "the",
+            "and",
+            "for",
+            "with",
+            "that",
+            "this",
+            "should",
+            "shall",
+            "will",
+            "from",
+            "into",
+            "case",
+            "test",
+            "requirement",
+        }
+    }
+
+
+def _similarity(left: str, right: str) -> float:
+    left_tokens = _tokens(left)
+    right_tokens = _tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def _case_text(test_case: TestCase) -> str:
+    step_text = " ".join(
+        f"{step.action} {step.expected_result}" for step in sorted(test_case.steps or [], key=lambda item: item.step_number)
+    )
+    return " ".join(
+        value or ""
+        for value in [
+            test_case.title,
+            test_case.description,
+            test_case.prerequisite,
+            test_case.priority,
+            test_case.severity,
+            test_case.category,
+            test_case.type,
+            step_text,
+        ]
+    )
+
+
+def _candidate(
+    test_case: TestCase,
+    similarity: float,
+    action: str,
+    reason: str,
+) -> ImpactCandidate:
+    return ImpactCandidate(
+        test_case_id=test_case.id,
+        requirement_id=test_case.requirement_id,
+        scenario_id=test_case.scenario_id,
+        title=test_case.title,
+        status=test_case.status,
+        repository_status=test_case.repository_status,
+        similarity=round(similarity, 3),
+        recommended_action=action,
+        reason=reason,
+        priority=test_case.priority,
+        severity=test_case.severity,
+        category=test_case.category,
+        type=test_case.type,
+    )
+
+
+async def _run_impact_analysis(
+    db: AsyncSession,
+    source_text: str,
+    requirement_id: uuid.UUID | None,
+    created_by: str = "system",
+    context_ids: list[uuid.UUID] | None = None,
+) -> ImpactAnalysisSummary:
+    stmt = (
+        select(TestCase)
+        .where(TestCase.repository_status == "active")
+        .options(selectinload(TestCase.steps))
+        .order_by(TestCase.repository_synced_at.desc())
+    )
+    if context_ids:
+        stmt = stmt.where(TestCase.requirement_id.in_(context_ids))
+
+    result = await db.execute(stmt)
+    approved_cases = result.scalars().all()
+    duplicates: list[ImpactCandidate] = []
+    deprecations: list[ImpactCandidate] = []
+    updates: list[ImpactCandidate] = []
+    source_tokens = _tokens(source_text)
+
+    for test_case in approved_cases:
+        score = _similarity(source_text, _case_text(test_case))
+        case_tokens = _tokens(_case_text(test_case))
+        keyword_overlap = source_tokens & DEPRECATION_KEYWORDS
+        if score >= DUPLICATE_THRESHOLD:
+            duplicates.append(
+                _candidate(
+                    test_case,
+                    score,
+                    "archive_duplicate",
+                    "Similarity is at or above the 80% duplicate threshold.",
+                )
+            )
+        elif keyword_overlap and score >= 0.25:
+            deprecations.append(
+                _candidate(
+                    test_case,
+                    score,
+                    "mark_deprecated",
+                    "Requirement language indicates replacement or retirement of overlapping approved coverage.",
+                )
+            )
+        elif score >= UPDATE_THRESHOLD or (source_tokens & case_tokens and test_case.severity in {"major", "critical"}):
+            updates.append(
+                _candidate(
+                    test_case,
+                    score,
+                    "review_update",
+                    "Approved test case overlaps with the new requirement and should be reviewed for updates.",
+                )
+            )
+
+    duplicates.sort(key=lambda item: item.similarity, reverse=True)
+    deprecations.sort(key=lambda item: item.similarity, reverse=True)
+    updates.sort(key=lambda item: item.similarity, reverse=True)
+
+    coverage_score = min(100, (len(duplicates) * 35) + (len(updates) * 20) + (len(deprecations) * 10))
+    risk_score = min(
+        100,
+        (len(deprecations) * 25)
+        + (len(updates) * 15)
+        + (20 if not duplicates and not updates else 0)
+        + (10 if any(item.severity == "critical" for item in updates + deprecations) else 0),
+    )
+    summary = {
+        "approved_cases_scanned": len(approved_cases),
+        "duplicate_count": len(duplicates),
+        "deprecation_count": len(deprecations),
+        "update_count": len(updates),
+        "manual_review_recommended": bool(deprecations or updates or risk_score >= 40),
+        "thresholds": {"duplicate": DUPLICATE_THRESHOLD, "update": UPDATE_THRESHOLD},
+    }
+
+    analysis = ImpactAnalysis(
+        requirement_id=requirement_id,
+        source_text=source_text,
+        similarity_threshold=int(DUPLICATE_THRESHOLD * 100),
+        duplicates=jsonable_encoder(duplicates),
+        deprecations=jsonable_encoder(deprecations),
+        updates=jsonable_encoder(updates),
+        risk_score=risk_score,
+        coverage_score=coverage_score,
+        summary=summary,
+        created_by=created_by,
+    )
+    db.add(analysis)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="requirement" if requirement_id else "impact",
+            entity_id=requirement_id,
+            action="impact_analysis_completed",
+            actor=created_by,
+            details={"analysis_id": str(analysis.id), **summary},
+        )
+    )
+    await db.commit()
+    await db.refresh(analysis)
+
+    return ImpactAnalysisSummary(
+        id=analysis.id,
+        requirement_id=requirement_id,
+        source_text=source_text,
+        similarity_threshold=DUPLICATE_THRESHOLD,
+        duplicates=duplicates,
+        deprecations=deprecations,
+        updates=updates,
+        risk_score=risk_score,
+        coverage_score=coverage_score,
+        summary=summary,
+        created_by=created_by,
+        created_at=analysis.created_at,
+    )
 
 
 def _test_case_snapshot(test_case: TestCase) -> dict:
@@ -941,6 +1157,151 @@ async def list_repository_test_cases(
         stmt = stmt.where(TestCase.repository_status == status)
     result = await db.execute(stmt)
     return result.scalars().all()
+
+
+@api_router.get(
+    "/requirements/{requirement_id}/impact",
+    response_model=ImpactAnalysisSummary,
+    tags=["Impact"],
+)
+async def get_requirement_impact(
+    requirement_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> ImpactAnalysisSummary:
+    try:
+        requirement_uuid = uuid.UUID(requirement_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+
+    result = await db.execute(select(Requirement).where(Requirement.id == requirement_uuid))
+    requirement = result.scalars().first()
+    if not requirement:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+
+    source_text = " ".join([requirement.title, requirement.description])
+    return await _run_impact_analysis(db, source_text, requirement.id)
+
+
+@api_router.post(
+    "/impact/analyze",
+    response_model=ImpactAnalysisSummary,
+    tags=["Impact"],
+)
+async def analyze_impact(
+    payload: ImpactAnalyzeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ImpactAnalysisSummary:
+    if not payload.text.strip():
+        raise HTTPException(status_code=422, detail="Impact analysis text is required")
+    return await _run_impact_analysis(db, payload.text, None, payload.created_by, payload.context_ids)
+
+
+@api_router.get(
+    "/impact",
+    response_model=list[ImpactAnalysisSummary],
+    tags=["Impact"],
+)
+async def list_impact_analyses(
+    requirement_id: uuid.UUID | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> list[ImpactAnalysisSummary]:
+    stmt = select(ImpactAnalysis)
+    if requirement_id:
+        stmt = stmt.where(ImpactAnalysis.requirement_id == requirement_id)
+    stmt = stmt.order_by(ImpactAnalysis.created_at.desc())
+    result = await db.execute(stmt)
+    analyses = result.scalars().all()
+    return [
+        ImpactAnalysisSummary(
+            id=analysis.id,
+            requirement_id=analysis.requirement_id,
+            source_text=analysis.source_text,
+            similarity_threshold=analysis.similarity_threshold / 100,
+            duplicates=analysis.duplicates,
+            deprecations=analysis.deprecations,
+            updates=analysis.updates,
+            risk_score=analysis.risk_score,
+            coverage_score=analysis.coverage_score,
+            summary=analysis.summary,
+            created_by=analysis.created_by,
+            created_at=analysis.created_at,
+        )
+        for analysis in analyses
+    ]
+
+
+@api_router.post(
+    "/impact/test_cases/{test_case_id}/deprecate",
+    response_model=TestCaseSummary,
+    tags=["Impact"],
+)
+async def deprecate_impacted_test_case(
+    test_case_id: str,
+    payload: ApprovalAction,
+    db: AsyncSession = Depends(get_db),
+) -> TestCaseSummary:
+    try:
+        test_case_uuid = uuid.UUID(test_case_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Test case not found")
+
+    result = await db.execute(select(TestCase).where(TestCase.id == test_case_uuid).options(selectinload(TestCase.steps)))
+    test_case = result.scalars().first()
+    if not test_case:
+        raise HTTPException(status_code=404, detail="Test case not found")
+
+    test_case.status = "deprecated"
+    test_case.repository_status = "deprecated"
+    actor = _actor(payload)
+    db.add(
+        AuditLog(
+            entity_type="test_case",
+            entity_id=test_case.id,
+            action="impact_deprecated",
+            actor=actor,
+            details={"notes": payload.notes},
+        )
+    )
+    await db.commit()
+    await db.refresh(test_case)
+    return test_case
+
+
+@api_router.post(
+    "/impact/test_cases/{test_case_id}/review-update",
+    response_model=TestCaseSummary,
+    tags=["Impact"],
+)
+async def flag_impacted_test_case_for_update(
+    test_case_id: str,
+    payload: ApprovalAction,
+    db: AsyncSession = Depends(get_db),
+) -> TestCaseSummary:
+    try:
+        test_case_uuid = uuid.UUID(test_case_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Test case not found")
+
+    result = await db.execute(select(TestCase).where(TestCase.id == test_case_uuid).options(selectinload(TestCase.steps)))
+    test_case = result.scalars().first()
+    if not test_case:
+        raise HTTPException(status_code=404, detail="Test case not found")
+
+    test_case.status = "updated"
+    test_case.repository_status = "needs_update"
+    actor = _actor(payload)
+    db.add(
+        AuditLog(
+            entity_type="test_case",
+            entity_id=test_case.id,
+            action="impact_update_review_flagged",
+            actor=actor,
+            details={"notes": payload.notes},
+        )
+    )
+    await db.commit()
+    await db.refresh(test_case)
+    return test_case
 
 
 @api_router.get(

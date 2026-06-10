@@ -161,6 +161,24 @@ CREATE TABLE IF NOT EXISTS quality_evaluations (
 CREATE INDEX IF NOT EXISTS idx_quality_evaluations_target ON quality_evaluations(target_level, target_id);
 CREATE INDEX IF NOT EXISTS idx_quality_evaluations_status ON quality_evaluations(status);
 
+CREATE TABLE IF NOT EXISTS impact_analyses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  requirement_id uuid REFERENCES requirements(id) ON DELETE SET NULL,
+  source_text text NOT NULL,
+  similarity_threshold integer NOT NULL DEFAULT 80,
+  duplicates jsonb NOT NULL DEFAULT '[]'::jsonb,
+  deprecations jsonb NOT NULL DEFAULT '[]'::jsonb,
+  updates jsonb NOT NULL DEFAULT '[]'::jsonb,
+  risk_score integer NOT NULL DEFAULT 0,
+  coverage_score integer NOT NULL DEFAULT 0,
+  summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_by varchar NOT NULL DEFAULT 'system',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_impact_analyses_requirement_id ON impact_analyses(requirement_id);
+CREATE INDEX IF NOT EXISTS idx_impact_analyses_created_at ON impact_analyses(created_at);
+
 CREATE TABLE IF NOT EXISTS approval_records (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   target_level varchar NOT NULL,

@@ -100,6 +100,46 @@ class QualityEvaluationSummary(BaseModel):
         orm_mode = True
 
 
+class ImpactAnalyzeRequest(BaseModel):
+    text: str
+    context_ids: Optional[List[uuid.UUID]] = None
+    created_by: str = "system"
+
+
+class ImpactCandidate(BaseModel):
+    test_case_id: uuid.UUID
+    requirement_id: uuid.UUID
+    scenario_id: uuid.UUID
+    title: str
+    status: str
+    repository_status: str
+    similarity: float
+    recommended_action: str
+    reason: str
+    priority: Optional[str] = None
+    severity: Optional[str] = None
+    category: Optional[str] = None
+    type: Optional[str] = None
+
+
+class ImpactAnalysisSummary(BaseModel):
+    id: uuid.UUID
+    requirement_id: Optional[uuid.UUID] = None
+    source_text: str
+    similarity_threshold: float
+    duplicates: List[ImpactCandidate]
+    deprecations: List[ImpactCandidate]
+    updates: List[ImpactCandidate]
+    risk_score: int
+    coverage_score: int
+    summary: dict
+    created_by: str
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
 class ApprovalRecordSummary(BaseModel):
     id: uuid.UUID
     target_level: str

@@ -357,6 +357,58 @@ button {
   margin: 0;
 }
 
+.impact-panel {
+  grid-column: 1 / -1;
+}
+
+.impact-heading,
+.impact-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.impact-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin: 18px 0;
+}
+
+.impact-summary-grid .history-card {
+  display: grid;
+  gap: 6px;
+}
+
+.impact-summary-grid strong {
+  font-size: 1.45rem;
+}
+
+.impact-group {
+  margin-top: 20px;
+}
+
+.impact-group h3 {
+  margin: 0 0 12px;
+}
+
+.impact-card {
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.72);
+  padding: 16px;
+}
+
+.similarity-pill {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+  padding: 8px 12px;
+  font-weight: 800;
+}
+
 .detail-card textarea {
   min-height: 120px;
   resize: vertical;
