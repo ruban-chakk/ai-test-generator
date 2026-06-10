@@ -187,6 +187,70 @@ class ImpactAnalysis(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
+class IntegrationRun(Base):
+    __tablename__ = "integration_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    integration_type = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="completed")
+    requested_by = Column(String, nullable=False, default="system")
+    parameters = Column(JSON, nullable=False, default=dict)
+    result = Column(JSON, nullable=False, default=dict)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class RepositorySyncRun(Base):
+    __tablename__ = "repository_sync_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    repository = Column(String, nullable=False)
+    branch = Column(String, nullable=False, default="main")
+    status = Column(String, nullable=False, default="completed")
+    synced_count = Column(Integer, nullable=False, default=0)
+    vector_synced_count = Column(Integer, nullable=False, default=0)
+    requested_by = Column(String, nullable=False, default="system")
+    details = Column(JSON, nullable=False, default=dict)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    suite = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    score = Column(Integer, nullable=False, default=0)
+    metrics = Column(JSON, nullable=False, default=dict)
+    issues = Column(JSON, nullable=False, default=list)
+    requested_by = Column(String, nullable=False, default="system")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class OperationalMetric(Base):
+    __tablename__ = "operational_metrics"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    metric_name = Column(String, nullable=False)
+    metric_value = Column(Integer, nullable=False)
+    dimensions = Column(JSON, nullable=False, default=dict)
+    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class GovernancePolicy(Base):
+    __tablename__ = "governance_policies"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False, unique=True)
+    status = Column(String, nullable=False, default="active")
+    policy_type = Column(String, nullable=False)
+    rules = Column(JSON, nullable=False, default=dict)
+    created_by = Column(String, nullable=False, default="system")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class ApprovalRecord(Base):
     __tablename__ = "approval_records"
 

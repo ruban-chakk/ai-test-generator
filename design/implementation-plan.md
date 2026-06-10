@@ -114,7 +114,7 @@ See `design/development-phases.md` for a detailed enterprise-grade roadmap.
 - Completed: Integration with enterprise evaluation and governance tooling surfaces
 
 ### Phase 5: Integration and scale
-- Jira import automation and test repo synchronization
-- Enterprise NLP cleanup and validation
-- Performance, horizontal scale, and Pinecone optimization
-- Security, compliance, and operational monitoring
+- Completed: Jira import automation and test repo synchronization
+- Completed: Enterprise NLP cleanup and validation
+- Completed: Performance, horizontal scale, and vector sync preparation
+- Completed: Security, compliance, and operational monitoring

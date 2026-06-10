@@ -190,6 +190,64 @@ export type ImpactAnalyzePayload = {
   created_by: string;
 };
 
+export type IntegrationRunSummary = {
+  id: string;
+  integration_type: string;
+  status: string;
+  requested_by: string;
+  parameters: Record<string, unknown>;
+  result: Record<string, unknown>;
+  started_at: string;
+  completed_at?: string;
+};
+
+export type RepositorySyncRunSummary = {
+  id: string;
+  repository: string;
+  branch: string;
+  status: string;
+  synced_count: number;
+  vector_synced_count: number;
+  requested_by: string;
+  details: Record<string, unknown>;
+  started_at: string;
+  completed_at?: string;
+};
+
+export type CleanupResult = {
+  original_text: string;
+  cleaned_text: string;
+  issues: Record<string, unknown>[];
+};
+
+export type EvaluationRunSummary = {
+  id: string;
+  suite: string;
+  status: string;
+  score: number;
+  metrics: Record<string, unknown>;
+  issues: Record<string, unknown>[];
+  requested_by: string;
+  created_at: string;
+};
+
+export type MonitoringSummary = {
+  status: string;
+  metrics: Record<string, number>;
+  captured_at: string;
+};
+
+export type GovernancePolicySummary = {
+  id: string;
+  name: string;
+  policy_type: string;
+  rules: Record<string, unknown>;
+  created_by: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ApprovalRecordSummary = {
   id: string;
   target_level: string;
@@ -629,4 +687,95 @@ export async function flagImpactedTestCaseForUpdate(
     body: JSON.stringify(payload),
   });
   return handleResponse<TestCaseSummary>(response);
+}
+
+export async function importJiraRequirements(
+  folderPath: string,
+  requestedBy = 'system',
+): Promise<IntegrationRunSummary> {
+  const response = await fetch(`${API_BASE_URL}/integrations/jira/import`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ folder_path: folderPath, requested_by: requestedBy }),
+  });
+  return handleResponse<IntegrationRunSummary>(response);
+}
+
+export async function syncTestRepository(
+  repository: string,
+  branch = 'main',
+  requestedBy = 'system',
+): Promise<RepositorySyncRunSummary> {
+  const response = await fetch(`${API_BASE_URL}/integrations/test-repo/sync`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ repository, branch, requested_by: requestedBy }),
+  });
+  return handleResponse<RepositorySyncRunSummary>(response);
+}
+
+export async function cleanupRequirementText(text: string): Promise<CleanupResult> {
+  const response = await fetch(`${API_BASE_URL}/nlp/cleanup`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text }),
+  });
+  return handleResponse<CleanupResult>(response);
+}
+
+export async function runEvaluationSuite(
+  suite = 'quality',
+  requestedBy = 'system',
+): Promise<EvaluationRunSummary> {
+  const response = await fetch(`${API_BASE_URL}/evals/run`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ suite, requested_by: requestedBy }),
+  });
+  return handleResponse<EvaluationRunSummary>(response);
+}
+
+export async function getMonitoringSummary(): Promise<MonitoringSummary> {
+  const response = await fetch(`${API_BASE_URL}/monitoring/summary`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<MonitoringSummary>(response);
+}
+
+export async function createGovernancePolicy(
+  payload: {
+    name: string;
+    policy_type: string;
+    rules: Record<string, unknown>;
+    created_by: string;
+    status?: string;
+  },
+): Promise<GovernancePolicySummary> {
+  const response = await fetch(`${API_BASE_URL}/governance/policies`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<GovernancePolicySummary>(response);
+}
+
+export async function getGovernancePolicies(): Promise<GovernancePolicySummary[]> {
+  const response = await fetch(`${API_BASE_URL}/governance/policies`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  return handleResponse<GovernancePolicySummary[]>(response);
 }

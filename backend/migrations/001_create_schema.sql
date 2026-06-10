@@ -179,6 +179,72 @@ CREATE TABLE IF NOT EXISTS impact_analyses (
 CREATE INDEX IF NOT EXISTS idx_impact_analyses_requirement_id ON impact_analyses(requirement_id);
 CREATE INDEX IF NOT EXISTS idx_impact_analyses_created_at ON impact_analyses(created_at);
 
+CREATE TABLE IF NOT EXISTS integration_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  integration_type varchar NOT NULL,
+  status varchar NOT NULL DEFAULT 'completed',
+  requested_by varchar NOT NULL DEFAULT 'system',
+  parameters jsonb NOT NULL DEFAULT '{}'::jsonb,
+  result jsonb NOT NULL DEFAULT '{}'::jsonb,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS idx_integration_runs_type ON integration_runs(integration_type);
+CREATE INDEX IF NOT EXISTS idx_integration_runs_status ON integration_runs(status);
+
+CREATE TABLE IF NOT EXISTS repository_sync_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  repository varchar NOT NULL,
+  branch varchar NOT NULL DEFAULT 'main',
+  status varchar NOT NULL DEFAULT 'completed',
+  synced_count integer NOT NULL DEFAULT 0,
+  vector_synced_count integer NOT NULL DEFAULT 0,
+  requested_by varchar NOT NULL DEFAULT 'system',
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS idx_repository_sync_runs_status ON repository_sync_runs(status);
+
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  suite varchar NOT NULL,
+  status varchar NOT NULL,
+  score integer NOT NULL DEFAULT 0,
+  metrics jsonb NOT NULL DEFAULT '{}'::jsonb,
+  issues jsonb NOT NULL DEFAULT '[]'::jsonb,
+  requested_by varchar NOT NULL DEFAULT 'system',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_suite ON evaluation_runs(suite);
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_status ON evaluation_runs(status);
+
+CREATE TABLE IF NOT EXISTS operational_metrics (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  metric_name varchar NOT NULL,
+  metric_value integer NOT NULL,
+  dimensions jsonb NOT NULL DEFAULT '{}'::jsonb,
+  captured_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_operational_metrics_name ON operational_metrics(metric_name);
+
+CREATE TABLE IF NOT EXISTS governance_policies (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name varchar NOT NULL UNIQUE,
+  status varchar NOT NULL DEFAULT 'active',
+  policy_type varchar NOT NULL,
+  rules jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_by varchar NOT NULL DEFAULT 'system',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_governance_policies_status ON governance_policies(status);
+
 CREATE TABLE IF NOT EXISTS approval_records (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   target_level varchar NOT NULL,

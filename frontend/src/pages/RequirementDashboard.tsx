@@ -36,9 +36,14 @@ export default function RequirementDashboard() {
           <p className="eyebrow">Enterprise AI Test Case Generator</p>
           <h1>Requirements</h1>
         </div>
-        <Link to="/requirements/new" className="primary-button">
-          Add Requirement
-        </Link>
+        <div className="header-actions">
+          <Link to="/operations" className="secondary-button">
+            Operations
+          </Link>
+          <Link to="/requirements/new" className="primary-button">
+            Add Requirement
+          </Link>
+        </div>
       </header>
 
       <section className="filter-bar">

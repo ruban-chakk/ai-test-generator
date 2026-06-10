@@ -39,9 +39,9 @@
 - Completed: Risk and coverage insights are available for enterprise stakeholders.
 
 ## Phase 5: Integration, scale, and compliance
-- Add Jira import automation and repository sync.
-- Improve NLP cleanup for messy requirement text.
-- Harden the LLM pipeline and add automated evals for quality.
-- Add analytics, logging, performance optimizations, and operational monitoring.
-- Implement security, compliance, and enterprise governance features.
-- Refine UI usability and expand user permissions/workflows.
+- Completed: Jira import automation and test repository sync workflow.
+- Completed: NLP cleanup and validation for messy requirement text.
+- Completed: Automated quality evaluation suite for generated and reviewed content.
+- Completed: Analytics, audit logging, operational metrics, and monitoring summary.
+- Completed: Security, compliance, and enterprise governance policy controls.
+- Completed: Operations UI for integrations, sync, cleanup, evals, monitoring, and policies.

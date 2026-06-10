@@ -50,6 +50,13 @@ button {
   font-size: 2.5rem;
 }
 
+.header-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .primary-button,
 .secondary-button {
   border: none;
@@ -407,6 +414,12 @@ button {
   color: #7dd3fc;
   padding: 8px 12px;
   font-weight: 800;
+}
+
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 20px;
 }
 
 .detail-card textarea {

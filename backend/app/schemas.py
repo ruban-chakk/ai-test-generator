@@ -140,6 +140,99 @@ class ImpactAnalysisSummary(BaseModel):
         orm_mode = True
 
 
+class JiraImportRequest(BaseModel):
+    folder_path: str
+    requested_by: str = "system"
+
+
+class RepositorySyncRequest(BaseModel):
+    repository: str
+    branch: str = "main"
+    requested_by: str = "system"
+
+
+class IntegrationRunSummary(BaseModel):
+    id: uuid.UUID
+    integration_type: str
+    status: str
+    requested_by: str
+    parameters: dict
+    result: dict
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+
+    class Config:
+        orm_mode = True
+
+
+class RepositorySyncRunSummary(BaseModel):
+    id: uuid.UUID
+    repository: str
+    branch: str
+    status: str
+    synced_count: int
+    vector_synced_count: int
+    requested_by: str
+    details: dict
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+
+    class Config:
+        orm_mode = True
+
+
+class CleanupRequest(BaseModel):
+    text: str
+
+
+class CleanupResult(BaseModel):
+    original_text: str
+    cleaned_text: str
+    issues: List[dict]
+
+
+class EvaluationRunRequest(BaseModel):
+    suite: str = "quality"
+    requested_by: str = "system"
+
+
+class EvaluationRunSummary(BaseModel):
+    id: uuid.UUID
+    suite: str
+    status: str
+    score: int
+    metrics: dict
+    issues: List[dict]
+    requested_by: str
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class MonitoringSummary(BaseModel):
+    status: str
+    metrics: dict
+    captured_at: datetime
+
+
+class GovernancePolicyCreate(BaseModel):
+    name: str
+    policy_type: str
+    rules: dict
+    created_by: str = "system"
+    status: str = "active"
+
+
+class GovernancePolicySummary(GovernancePolicyCreate):
+    id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
 class ApprovalRecordSummary(BaseModel):
     id: uuid.UUID
     target_level: str

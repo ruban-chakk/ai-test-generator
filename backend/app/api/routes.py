@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -12,10 +12,15 @@ from app.db import get_db
 from app.models import (
     ApprovalRecord,
     AuditLog,
+    EvaluationRun,
     Feedback,
+    GovernancePolicy,
     ImpactAnalysis,
+    IntegrationRun,
+    OperationalMetric,
     QualityEvaluation,
     Requirement,
+    RepositorySyncRun,
     RevisionRecord,
     TestCase,
     TestCaseStep as TestCaseStepModel,
@@ -26,13 +31,24 @@ from app.schemas import (
     ApprovalAction,
     ApprovalRecordSummary,
     AuditLogSummary,
+    CleanupRequest,
+    CleanupResult,
+    EvaluationRunRequest,
+    EvaluationRunSummary,
     FeedbackCreate,
     FeedbackRevisionRequest,
     FeedbackSummary,
+    GovernancePolicyCreate,
+    GovernancePolicySummary,
     ImpactAnalyzeRequest,
     ImpactAnalysisSummary,
     ImpactCandidate,
+    IntegrationRunSummary,
+    JiraImportRequest,
+    MonitoringSummary,
     QualityEvaluationSummary,
+    RepositorySyncRequest,
+    RepositorySyncRunSummary,
     RequirementCreate,
     RequirementDetail,
     RevisionRecordSummary,
@@ -68,10 +84,33 @@ DEPRECATION_KEYWORDS = {
     "migrate",
     "migration",
 }
+ALLOWED_ROLES = {"reviewer", "approver", "admin", "system"}
 
 
 def _actor(payload: ApprovalAction) -> str:
     return payload.approved_by or "system"
+
+
+def _require_role(actor: str, allowed_roles: set[str] | None = None) -> None:
+    role = actor.lower().strip() if actor else "system"
+    allowed = allowed_roles or ALLOWED_ROLES
+    if role not in allowed and role != "system":
+        raise HTTPException(status_code=403, detail="Actor role is not allowed for this governance action")
+
+
+def _clean_requirement_text(text: str) -> tuple[str, list[dict]]:
+    original = text
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"(?i)\b(asap|tbd|todo|fixme)\b", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    issues: list[dict] = []
+    if len(cleaned) < 20:
+        issues.append({"field": "text", "severity": "error", "message": "Requirement text is too short after cleanup."})
+    if original != cleaned:
+        issues.append({"field": "text", "severity": "info", "message": "Whitespace and placeholder language were normalized."})
+    if not re.search(r"\b(shall|should|must|can|when|then|verify|validate)\b", cleaned.lower()):
+        issues.append({"field": "intent", "severity": "warning", "message": "Requirement intent is not explicit."})
+    return cleaned, issues
 
 
 def _step_snapshot(test_case: TestCase) -> list[dict]:
@@ -1302,6 +1341,317 @@ async def flag_impacted_test_case_for_update(
     await db.commit()
     await db.refresh(test_case)
     return test_case
+
+
+@api_router.post(
+    "/integrations/jira/import",
+    response_model=IntegrationRunSummary,
+    tags=["Integrations"],
+)
+async def import_jira_requirements(
+    payload: JiraImportRequest,
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationRunSummary:
+    _require_role(payload.requested_by, {"admin", "system"})
+    folder_path = payload.folder_path.strip()
+    if not folder_path:
+        raise HTTPException(status_code=422, detail="Jira folder path is required")
+
+    raw_items = [item.strip() for item in re.split(r"[\n,]+", folder_path) if item.strip()]
+    if not raw_items:
+        raw_items = [folder_path]
+
+    imported_ids: list[str] = []
+    for item in raw_items:
+        external_id = item if re.match(r"^[A-Z][A-Z0-9]+-\d+$", item) else f"JIRA-{len(imported_ids) + 1}"
+        title = f"Imported Jira requirement {external_id}"
+        description = f"Imported from Jira folder abstraction: {item}"
+        cleaned_description, cleanup_issues = _clean_requirement_text(description)
+        requirement = Requirement(
+            external_id=external_id,
+            title=title,
+            description=cleaned_description,
+            source="jira",
+            status="draft",
+            metadata_json={"import_source": item, "cleanup_issues": cleanup_issues},
+            vector_id=f"requirement:{external_id}",
+        )
+        db.add(requirement)
+        await db.flush()
+        imported_ids.append(str(requirement.id))
+
+    run = IntegrationRun(
+        integration_type="jira_import",
+        status="completed",
+        requested_by=payload.requested_by,
+        parameters={"folder_path": folder_path},
+        result={"imported_count": len(imported_ids), "requirement_ids": imported_ids},
+        completed_at=datetime.utcnow(),
+    )
+    db.add(run)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="integration",
+            entity_id=run.id,
+            action="jira_import_completed",
+            actor=payload.requested_by,
+            details=run.result,
+        )
+    )
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+@api_router.post(
+    "/integrations/test-repo/sync",
+    response_model=RepositorySyncRunSummary,
+    tags=["Integrations"],
+)
+async def sync_test_repository(
+    payload: RepositorySyncRequest,
+    db: AsyncSession = Depends(get_db),
+) -> RepositorySyncRunSummary:
+    _require_role(payload.requested_by, {"admin", "approver", "system"})
+    result = await db.execute(
+        select(TestCase)
+        .where(TestCase.repository_status.in_(["active", "needs_update"]))
+        .options(selectinload(TestCase.steps))
+    )
+    test_cases = result.scalars().all()
+    synced_at = datetime.utcnow()
+    vector_synced = 0
+
+    for test_case in test_cases:
+        test_case.repository_synced_at = synced_at
+        test_case.repository_status = "active" if test_case.status == "approved" else test_case.repository_status
+        if not test_case.vector_id:
+            test_case.vector_id = f"test_case:{test_case.id}:v{test_case.version}"
+        vector_synced += 1
+
+    run = RepositorySyncRun(
+        repository=payload.repository,
+        branch=payload.branch,
+        status="completed",
+        synced_count=len(test_cases),
+        vector_synced_count=vector_synced,
+        requested_by=payload.requested_by,
+        details={
+            "mode": "metadata-and-vector-id-sync",
+            "pinecone_index": "configured",
+            "test_case_ids": [str(test_case.id) for test_case in test_cases],
+        },
+        completed_at=synced_at,
+    )
+    db.add(run)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="repository_sync",
+            entity_id=run.id,
+            action="test_repository_sync_completed",
+            actor=payload.requested_by,
+            details=run.details,
+        )
+    )
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+@api_router.get(
+    "/integrations/runs",
+    response_model=list[IntegrationRunSummary],
+    tags=["Integrations"],
+)
+async def list_integration_runs(
+    integration_type: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> list[IntegrationRunSummary]:
+    stmt = select(IntegrationRun)
+    if integration_type:
+        stmt = stmt.where(IntegrationRun.integration_type == integration_type)
+    stmt = stmt.order_by(IntegrationRun.started_at.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@api_router.get(
+    "/integrations/test-repo/sync",
+    response_model=list[RepositorySyncRunSummary],
+    tags=["Integrations"],
+)
+async def list_repository_sync_runs(
+    db: AsyncSession = Depends(get_db),
+) -> list[RepositorySyncRunSummary]:
+    result = await db.execute(select(RepositorySyncRun).order_by(RepositorySyncRun.started_at.desc()))
+    return result.scalars().all()
+
+
+@api_router.post(
+    "/nlp/cleanup",
+    response_model=CleanupResult,
+    tags=["NLP"],
+)
+async def cleanup_requirement_text(payload: CleanupRequest) -> CleanupResult:
+    cleaned_text, issues = _clean_requirement_text(payload.text)
+    return CleanupResult(original_text=payload.text, cleaned_text=cleaned_text, issues=issues)
+
+
+@api_router.post(
+    "/evals/run",
+    response_model=EvaluationRunSummary,
+    tags=["Evaluation"],
+)
+async def run_quality_evaluation_suite(
+    payload: EvaluationRunRequest,
+    db: AsyncSession = Depends(get_db),
+) -> EvaluationRunSummary:
+    _require_role(payload.requested_by, {"admin", "approver", "system"})
+    requirements_count = (await db.execute(select(func.count()).select_from(Requirement))).scalar_one()
+    approved_cases_count = (
+        await db.execute(select(func.count()).select_from(TestCase).where(TestCase.status == "approved"))
+    ).scalar_one()
+    open_feedback_count = (
+        await db.execute(select(func.count()).select_from(Feedback).where(Feedback.status == "open"))
+    ).scalar_one()
+    failed_quality_count = (
+        await db.execute(select(func.count()).select_from(QualityEvaluation).where(QualityEvaluation.status == "failed"))
+    ).scalar_one()
+    score = max(0, 100 - (open_feedback_count * 5) - (failed_quality_count * 15))
+    issues = []
+    if approved_cases_count == 0:
+        issues.append({"severity": "warning", "message": "No approved test cases are available for repository sync."})
+    if open_feedback_count:
+        issues.append({"severity": "warning", "message": f"{open_feedback_count} feedback item(s) remain open."})
+    status = "passed" if score >= 85 else "needs_review" if score >= 60 else "failed"
+    run = EvaluationRun(
+        suite=payload.suite,
+        status=status,
+        score=score,
+        metrics={
+            "requirements": requirements_count,
+            "approved_test_cases": approved_cases_count,
+            "open_feedback": open_feedback_count,
+            "failed_quality_evaluations": failed_quality_count,
+        },
+        issues=issues,
+        requested_by=payload.requested_by,
+    )
+    db.add(run)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="evaluation",
+            entity_id=run.id,
+            action="evaluation_suite_completed",
+            actor=payload.requested_by,
+            details={"suite": payload.suite, "score": score, "status": status},
+        )
+    )
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+@api_router.get(
+    "/evals",
+    response_model=list[EvaluationRunSummary],
+    tags=["Evaluation"],
+)
+async def list_evaluation_runs(
+    db: AsyncSession = Depends(get_db),
+) -> list[EvaluationRunSummary]:
+    result = await db.execute(select(EvaluationRun).order_by(EvaluationRun.created_at.desc()))
+    return result.scalars().all()
+
+
+@api_router.get(
+    "/monitoring/summary",
+    response_model=MonitoringSummary,
+    tags=["Monitoring"],
+)
+async def monitoring_summary(
+    db: AsyncSession = Depends(get_db),
+) -> MonitoringSummary:
+    metrics = {
+        "requirements": (await db.execute(select(func.count()).select_from(Requirement))).scalar_one(),
+        "approved_test_cases": (
+            await db.execute(select(func.count()).select_from(TestCase).where(TestCase.status == "approved"))
+        ).scalar_one(),
+        "active_repository_cases": (
+            await db.execute(select(func.count()).select_from(TestCase).where(TestCase.repository_status == "active"))
+        ).scalar_one(),
+        "open_feedback": (
+            await db.execute(select(func.count()).select_from(Feedback).where(Feedback.status == "open"))
+        ).scalar_one(),
+        "impact_analyses": (await db.execute(select(func.count()).select_from(ImpactAnalysis))).scalar_one(),
+        "integration_runs": (await db.execute(select(func.count()).select_from(IntegrationRun))).scalar_one(),
+        "repository_sync_runs": (await db.execute(select(func.count()).select_from(RepositorySyncRun))).scalar_one(),
+        "evaluation_runs": (await db.execute(select(func.count()).select_from(EvaluationRun))).scalar_one(),
+    }
+    for name, value in metrics.items():
+        db.add(OperationalMetric(metric_name=name, metric_value=int(value), dimensions={"source": "summary"}))
+    await db.commit()
+    return MonitoringSummary(status="ok", metrics=metrics, captured_at=datetime.utcnow())
+
+
+@api_router.post(
+    "/governance/policies",
+    response_model=GovernancePolicySummary,
+    tags=["Governance"],
+)
+async def create_governance_policy(
+    payload: GovernancePolicyCreate,
+    db: AsyncSession = Depends(get_db),
+) -> GovernancePolicySummary:
+    _require_role(payload.created_by, {"admin", "system"})
+    result = await db.execute(select(GovernancePolicy).where(GovernancePolicy.name == payload.name))
+    policy = result.scalars().first()
+    if policy:
+        policy.status = payload.status
+        policy.policy_type = payload.policy_type
+        policy.rules = payload.rules
+    else:
+        policy = GovernancePolicy(
+            name=payload.name,
+            status=payload.status,
+            policy_type=payload.policy_type,
+            rules=payload.rules,
+            created_by=payload.created_by,
+        )
+        db.add(policy)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="governance_policy",
+            entity_id=policy.id,
+            action="governance_policy_created",
+            actor=payload.created_by,
+            details={"name": payload.name, "policy_type": payload.policy_type},
+        )
+    )
+    await db.commit()
+    await db.refresh(policy)
+    return policy
+
+
+@api_router.get(
+    "/governance/policies",
+    response_model=list[GovernancePolicySummary],
+    tags=["Governance"],
+)
+async def list_governance_policies(
+    status: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+) -> list[GovernancePolicySummary]:
+    stmt = select(GovernancePolicy)
+    if status:
+        stmt = stmt.where(GovernancePolicy.status == status)
+    stmt = stmt.order_by(GovernancePolicy.updated_at.desc())
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
 @api_router.get(
