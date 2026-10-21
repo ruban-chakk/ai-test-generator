@@ -1,8 +1,9 @@
 import json
+from io import StringIO
 
 import pytest
 
-from app.services.mapped_ingestion import MappedIngestionError, map_import_file
+from app.services.mapped_ingestion import MappedIngestionError, iter_source_records, map_import_file
 
 
 def test_maps_company_story_fields_and_preserves_custom_fields() -> None:
@@ -15,7 +16,16 @@ def test_maps_company_story_fields_and_preserves_custom_fields() -> None:
                 "separator": "\n\nAcceptance criteria:\n",
             },
         },
-        "custom_fields": {"priority": "priority.name", "epic": "epic"},
+        "custom_fields": {
+            "priority": {
+                "source": "priority.name",
+                "type": "string",
+                "required": True,
+                "allowed_values": ["P0", "P1", "P2"],
+                "semantic_weight": 2,
+            },
+            "epic": "epic",
+        },
         "options": {},
     }
     content = json.dumps([{
@@ -38,6 +48,8 @@ def test_maps_company_story_fields_and_preserves_custom_fields() -> None:
     assert item.external_id == "HC-257"
     assert "Acceptance criteria" in item.description
     assert item.metadata["custom_fields"] == {"priority": "P1", "epic": "Emergency Management"}
+    assert item.metadata["custom_field_schema"]["priority"]["semantic_weight"] == 2
+    assert item.metadata["custom_field_schema"]["priority"]["type"] == "string"
 
 
 def test_maps_numbered_steps_excel_dates_and_duplicate_story_links() -> None:
@@ -117,3 +129,41 @@ def test_rejects_unknown_canonical_fields() -> None:
             max_bytes=10_000,
             max_records=100,
         )
+
+
+def test_typed_custom_field_validation_reports_bad_company_values() -> None:
+    configuration = {
+        "fields": {
+            "external_id": "key",
+            "title": "summary",
+            "description": "description",
+        },
+        "custom_fields": {
+            "risk_score": {"source": "risk", "type": "integer", "required": True},
+            "owner": {"source": "owner", "type": "string", "pattern": r"[A-Z]{2,8}"},
+        },
+    }
+    batch = map_import_file(
+        "stories.json",
+        b'[{"key":"A-1","summary":"Story","description":"Description","risk":"high","owner":"qa"}]',
+        entity_type="requirement",
+        configuration=configuration,
+        max_bytes=10_000,
+        max_records=100,
+    )
+
+    assert batch.items == ()
+    assert batch.issues[0]["severity"] == "error"
+    assert "risk_score" in batch.issues[0]["message"]
+
+
+def test_streams_json_array_records_across_internal_read_boundaries() -> None:
+    payload = json.dumps([
+        {"key": "REQ-1", "description": "x" * 70_000},
+        {"key": "REQ-2", "description": "small"},
+    ])
+
+    records = list(iter_source_records(StringIO(payload), ".json"))
+
+    assert [record["key"] for record in records] == ["REQ-1", "REQ-2"]
+    assert len(records[0]["description"]) == 70_000

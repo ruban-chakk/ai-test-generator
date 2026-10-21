@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     outbox_batch_size: int = 25
     outbox_max_attempts: int = 8
     outbox_lock_timeout_seconds: int = 300
+    vector_chunking_enabled: bool = True
+    vector_chunk_target_tokens: int = 700
+    vector_chunk_max_tokens: int = 1000
+    vector_chunk_overlap_tokens: int = 80
+    rag_candidate_limit: int = 40
+    rag_context_limit: int = 8
+    rag_semantic_weight: float = 0.65
+    rag_keyword_weight: float = 0.25
+    rag_source_weight: float = 0.10
     jira_base_url: str = ""
     jira_email: str = ""
     jira_api_token: str = Field(default="", repr=False)
@@ -73,6 +82,10 @@ class Settings(BaseSettings):
     upload_max_test_cases: int = 500
     mapped_upload_max_bytes: int = 10_000_000
     mapped_import_max_records: int = 20_000
+    mapped_job_upload_max_bytes: int = 250_000_000
+    mapped_job_max_records: int = 1_000_000
+    mapped_job_batch_size: int = 250
+    mapped_import_spool_dir: str = "/tmp/ai-test-generator-imports"
     health_probe_timeout_seconds: float = 5.0
     oidc_enabled: bool = False
     oidc_issuer: str = ""

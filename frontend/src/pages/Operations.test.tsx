@@ -12,7 +12,9 @@ import {
   getComplianceProfile,
   getDependencyHealth,
   getGovernancePolicies,
+  getImportMappingProfileHistory,
   getImportMappingProfiles,
+  getMappedImportJobs,
   getMonitoringSummary,
   getOutboxEvents,
   getSemanticCalibrations,
@@ -40,7 +42,13 @@ vi.mock('../api', () => ({
   importRequirementFile: vi.fn(),
   importHistoricalTestCases: vi.fn(),
   getImportMappingProfiles: vi.fn(),
+  getImportMappingProfileHistory: vi.fn(),
+  getMappedImportJobs: vi.fn(),
   createImportMappingProfile: vi.fn(),
+  createMappedImportJob: vi.fn(),
+  updateImportMappingProfile: vi.fn(),
+  rollbackImportMappingProfile: vi.fn(),
+  retryMappedImportJob: vi.fn(),
   previewMappedImport: vi.fn(),
   executeMappedImport: vi.fn(),
   retryOutboxEvent: vi.fn(),
@@ -58,6 +66,8 @@ const project = {
 
 function mockRefresh() {
   vi.mocked(getImportMappingProfiles).mockResolvedValue([]);
+  vi.mocked(getImportMappingProfileHistory).mockResolvedValue([]);
+  vi.mocked(getMappedImportJobs).mockResolvedValue([]);
   vi.mocked(getMonitoringSummary).mockResolvedValue({
     status: 'ok',
     metrics: { requirements: 2 },

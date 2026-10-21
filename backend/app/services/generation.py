@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
@@ -73,6 +74,99 @@ class GenerationResult:
     requirement_vector_id: str
     retrieved_context: list[RetrievedContext]
     model: str
+    retrieval_mode: str = "hybrid"
+
+
+def _retrieval_key(context: RetrievedContext) -> tuple[str, str]:
+    metadata = context.metadata
+    entity_type = str(metadata.get("entity_type") or "unknown")
+    entity_id = str(
+        metadata.get("entity_id")
+        or metadata.get("test_case_id")
+        or metadata.get("requirement_id")
+        or metadata.get("target_id")
+        or metadata.get("parent_vector_id")
+        or context.id
+    )
+    return entity_type, entity_id
+
+
+def rerank_generation_contexts(
+    query: str,
+    semantic_contexts: list[RetrievedContext],
+    keyword_contexts: list[RetrievedContext] | None = None,
+    *,
+    exclude_parent_vector_id: str | None = None,
+    limit: int = 8,
+    semantic_weight: float = 0.65,
+    keyword_weight: float = 0.25,
+    source_weight: float = 0.10,
+) -> list[RetrievedContext]:
+    """Fuse retrieval evidence, weight trusted artifact types, and collapse chunks."""
+
+    query_tokens = set(re.findall(r"[a-z0-9_./:-]+", query.lower()))
+    source_priority = {"test_case": 1.0, "requirement": 0.8, "feedback": 0.6}
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for source, contexts in (("semantic", semantic_contexts), ("keyword", keyword_contexts or [])):
+        for context in contexts:
+            parent_id = str(context.metadata.get("parent_vector_id") or context.id)
+            if exclude_parent_vector_id and parent_id == exclude_parent_vector_id:
+                continue
+            key = _retrieval_key(context)
+            group = groups.setdefault(
+                key,
+                {"semantic": 0.0, "keyword": 0.0, "contexts": [], "metadata": {}},
+            )
+            score = max(0.0, min(1.0, float(context.score)))
+            group[source] = max(group[source], score)
+            group["contexts"].append(context)
+            group["metadata"].update(context.metadata)
+
+    ranked: list[tuple[float, RetrievedContext]] = []
+    for (entity_type, entity_id), group in groups.items():
+        candidates = sorted(group["contexts"], key=lambda item: item.score, reverse=True)
+        unique_text: list[str] = []
+        chunk_ids: list[str] = []
+        for candidate in candidates:
+            if candidate.text not in unique_text:
+                unique_text.append(candidate.text)
+                chunk_ids.append(candidate.id)
+            if len(unique_text) == 2:
+                break
+        combined_text = "\n\n".join(unique_text)[:6000]
+        text_tokens = set(re.findall(r"[a-z0-9_./:-]+", combined_text.lower()))
+        lexical_overlap = len(query_tokens & text_tokens) / max(1, len(query_tokens))
+        semantic_score = float(group["semantic"])
+        keyword_score = max(float(group["keyword"]), lexical_overlap)
+        weighted_source = source_priority.get(entity_type, 0.5)
+        score = (
+            semantic_weight * semantic_score
+            + keyword_weight * keyword_score
+            + source_weight * weighted_source
+        )
+        metadata = {
+            **group["metadata"],
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "semantic_score": round(semantic_score, 4),
+            "keyword_score": round(keyword_score, 4),
+            "source_weight": weighted_source,
+            "matched_chunk_ids": chunk_ids,
+            "retrieval_mode": "hybrid",
+        }
+        ranked.append(
+            (
+                score,
+                RetrievedContext(
+                    id=str(metadata.get("parent_vector_id") or candidates[0].id),
+                    score=round(score, 4),
+                    text=combined_text,
+                    metadata=metadata,
+                ),
+            )
+        )
+    ranked.sort(key=lambda item: (-item[0], item[1].id))
+    return [context for _, context in ranked[:limit]]
 
 
 class LanguageModel(Protocol):
@@ -85,6 +179,8 @@ class LanguageModel(Protocol):
 
 class VectorStore(Protocol):
     async def upsert(self, vector_id: str, values: list[float], metadata: dict[str, Any]) -> None: ...
+
+    async def delete(self, vector_ids: list[str]) -> None: ...
 
     async def query(
         self,
@@ -221,6 +317,14 @@ class PineconeVectorStore:
             },
         )
 
+    async def delete(self, vector_ids: list[str]) -> None:
+        if not vector_ids:
+            return
+        await self._post(
+            "/vectors/delete",
+            {"namespace": self._namespace, "ids": vector_ids},
+        )
+
     async def query(
         self,
         values: list[float],
@@ -254,9 +358,15 @@ class PineconeVectorStore:
 
 
 class GenerationService:
-    def __init__(self, language_model: LanguageModel, vector_store: VectorStore) -> None:
+    def __init__(
+        self,
+        language_model: LanguageModel,
+        vector_store: VectorStore,
+        config: Settings | None = None,
+    ) -> None:
         self._language_model = language_model
         self._vector_store = vector_store
+        self._config = config or Settings(_env_file=None)
 
     async def generate(
         self,
@@ -267,6 +377,7 @@ class GenerationService:
         description: str,
         external_id: str | None,
         requirement_version: int = 1,
+        keyword_contexts: list[RetrievedContext] | None = None,
     ) -> GenerationResult:
         source_text = f"Title: {title}\nDescription: {description}"
         embedding = await self._language_model.embed(source_text)
@@ -283,10 +394,20 @@ class GenerationService:
                 "text": source_text,
             },
         )
-        contexts = await self._vector_store.query(
+        semantic_contexts = await self._vector_store.query(
             embedding,
-            top_k=8,
+            top_k=self._config.rag_candidate_limit,
             project_id=project_id,
+        )
+        contexts = rerank_generation_contexts(
+            source_text,
+            semantic_contexts,
+            keyword_contexts,
+            exclude_parent_vector_id=vector_id,
+            limit=self._config.rag_context_limit,
+            semantic_weight=self._config.rag_semantic_weight,
+            keyword_weight=self._config.rag_keyword_weight,
+            source_weight=self._config.rag_source_weight,
         )
         context_text = "\n\n".join(
             f"[Historical context {index + 1}; score={item.score:.3f}]\n{item.text}"
@@ -324,13 +445,28 @@ class GenerationService:
         target_context: str,
         action: str,
         requirement_version: int = 1,
+        keyword_contexts: list[RetrievedContext] | None = None,
     ) -> GenerationResult:
         query_text = (
             f"Requirement title: {title}\nRequirement description: {description}\n"
             f"Current target: {target_context}\nReviewer feedback: {feedback_text}"
         )
         embedding = await self._language_model.embed(query_text)
-        contexts = await self._vector_store.query(embedding, top_k=8, project_id=project_id)
+        semantic_contexts = await self._vector_store.query(
+            embedding,
+            top_k=self._config.rag_candidate_limit,
+            project_id=project_id,
+        )
+        contexts = rerank_generation_contexts(
+            query_text,
+            semantic_contexts,
+            keyword_contexts,
+            exclude_parent_vector_id=f"requirement:{requirement_id}:v{requirement_version}",
+            limit=self._config.rag_context_limit,
+            semantic_weight=self._config.rag_semantic_weight,
+            keyword_weight=self._config.rag_keyword_weight,
+            source_weight=self._config.rag_source_weight,
+        )
         context_text = "\n\n".join(
             f"[Historical context {index + 1}; score={item.score:.3f}]\n{item.text}"
             for index, item in enumerate(contexts)
@@ -364,4 +500,5 @@ def build_generation_service(config: Settings = settings) -> GenerationService:
     return GenerationService(
         language_model=OpenAICompatibleLanguageModel(config),
         vector_store=PineconeVectorStore(config),
+        config=config,
     )

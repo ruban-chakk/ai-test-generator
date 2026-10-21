@@ -54,6 +54,7 @@ class TestCaseSummary(APIModel):
     repository_synced_at: Optional[datetime] = None
     steps: Optional[List[TestCaseStep]] = None
     custom_fields_json: dict = Field(default_factory=dict)
+    custom_field_schema_json: dict = Field(default_factory=dict)
 
 
 class ImportMappingProfileCreate(APIModel):
@@ -72,6 +73,9 @@ class ImportMappingProfileUpdate(APIModel):
 
 class ImportMappingProfileSummary(ImportMappingProfileCreate):
     id: uuid.UUID
+    version: int
+    parent_profile_id: Optional[uuid.UUID] = None
+    superseded_at: Optional[datetime] = None
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -87,6 +91,33 @@ class MappedImportPreview(APIModel):
     error_count: int = 0
     issues: List[dict] = Field(default_factory=list)
     samples: List[dict] = Field(default_factory=list)
+
+
+class MappedImportJobSummary(APIModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    profile_id: uuid.UUID
+    profile_version: int
+    entity_type: Literal["requirement", "test_case"]
+    original_filename: str
+    sha256: str
+    byte_size: int
+    status: Literal["queued", "processing", "completed", "failed", "cancelled"]
+    checkpoint_row: int
+    source_record_count: int
+    mapped_record_count: int
+    created_record_count: int
+    updated_record_count: int
+    existing_record_count: int
+    skipped_record_count: int
+    warning_count: int
+    error_count: int
+    result: dict = Field(default_factory=dict)
+    last_error_type: Optional[str] = None
+    requested_by: str
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
 
 
 

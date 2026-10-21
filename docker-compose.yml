@@ -34,6 +34,15 @@ services:
       - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
       - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
       - PINECONE_API_VERSION=${PINECONE_API_VERSION:-2026-07}
+      - VECTOR_CHUNKING_ENABLED=${VECTOR_CHUNKING_ENABLED:-true}
+      - VECTOR_CHUNK_TARGET_TOKENS=${VECTOR_CHUNK_TARGET_TOKENS:-700}
+      - VECTOR_CHUNK_MAX_TOKENS=${VECTOR_CHUNK_MAX_TOKENS:-1000}
+      - VECTOR_CHUNK_OVERLAP_TOKENS=${VECTOR_CHUNK_OVERLAP_TOKENS:-80}
+      - RAG_CANDIDATE_LIMIT=${RAG_CANDIDATE_LIMIT:-40}
+      - RAG_CONTEXT_LIMIT=${RAG_CONTEXT_LIMIT:-8}
+      - RAG_SEMANTIC_WEIGHT=${RAG_SEMANTIC_WEIGHT:-0.65}
+      - RAG_KEYWORD_WEIGHT=${RAG_KEYWORD_WEIGHT:-0.25}
+      - RAG_SOURCE_WEIGHT=${RAG_SOURCE_WEIGHT:-0.10}
       - JIRA_BASE_URL=${JIRA_BASE_URL:-}
       - JIRA_EMAIL=${JIRA_EMAIL:-}
       - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
@@ -64,6 +73,10 @@ services:
       - UPLOAD_MAX_TEST_CASES=${UPLOAD_MAX_TEST_CASES:-500}
       - MAPPED_UPLOAD_MAX_BYTES=${MAPPED_UPLOAD_MAX_BYTES:-10000000}
       - MAPPED_IMPORT_MAX_RECORDS=${MAPPED_IMPORT_MAX_RECORDS:-20000}
+      - MAPPED_JOB_UPLOAD_MAX_BYTES=${MAPPED_JOB_UPLOAD_MAX_BYTES:-250000000}
+      - MAPPED_JOB_MAX_RECORDS=${MAPPED_JOB_MAX_RECORDS:-1000000}
+      - MAPPED_JOB_BATCH_SIZE=${MAPPED_JOB_BATCH_SIZE:-250}
+      - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
       - HEALTH_PROBE_TIMEOUT_SECONDS=${HEALTH_PROBE_TIMEOUT_SECONDS:-5}
       - OIDC_ENABLED=${OIDC_ENABLED:-false}
       - OIDC_ISSUER=${OIDC_ISSUER:-}
@@ -80,6 +93,8 @@ services:
       - '8000:8000'
     depends_on:
       - postgres
+    volumes:
+      - import_spool:/var/lib/ai-test-generator/imports
     restart: on-failure
 
   indexer:
@@ -100,6 +115,18 @@ services:
       - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
       - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
       - PINECONE_API_VERSION=${PINECONE_API_VERSION:-2026-07}
+      - VECTOR_CHUNKING_ENABLED=${VECTOR_CHUNKING_ENABLED:-true}
+      - VECTOR_CHUNK_TARGET_TOKENS=${VECTOR_CHUNK_TARGET_TOKENS:-700}
+      - VECTOR_CHUNK_MAX_TOKENS=${VECTOR_CHUNK_MAX_TOKENS:-1000}
+      - VECTOR_CHUNK_OVERLAP_TOKENS=${VECTOR_CHUNK_OVERLAP_TOKENS:-80}
+      - RAG_CANDIDATE_LIMIT=${RAG_CANDIDATE_LIMIT:-40}
+      - RAG_CONTEXT_LIMIT=${RAG_CONTEXT_LIMIT:-8}
+      - RAG_SEMANTIC_WEIGHT=${RAG_SEMANTIC_WEIGHT:-0.65}
+      - RAG_KEYWORD_WEIGHT=${RAG_KEYWORD_WEIGHT:-0.25}
+      - RAG_SOURCE_WEIGHT=${RAG_SOURCE_WEIGHT:-0.10}
+      - MAPPED_JOB_MAX_RECORDS=${MAPPED_JOB_MAX_RECORDS:-1000000}
+      - MAPPED_JOB_BATCH_SIZE=${MAPPED_JOB_BATCH_SIZE:-250}
+      - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
       - TEST_REPOSITORY_BASE_URL=${TEST_REPOSITORY_BASE_URL:-}
       - TEST_REPOSITORY_TOKEN=${TEST_REPOSITORY_TOKEN:-}
       - TEST_REPOSITORY_PROVIDER=${TEST_REPOSITORY_PROVIDER:-generic}
@@ -128,6 +155,28 @@ services:
       postgres:
         condition: service_healthy
     restart: on-failure
+    volumes:
+      - import_spool:/var/lib/ai-test-generator/imports
+
+  import-worker:
+    build:
+      context: ./backend
+    container_name: ai-testgen-import-worker
+    command: ["python", "scripts/process_mapped_imports.py"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - MAPPED_JOB_MAX_RECORDS=${MAPPED_JOB_MAX_RECORDS:-1000000}
+      - MAPPED_JOB_BATCH_SIZE=${MAPPED_JOB_BATCH_SIZE:-250}
+      - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
+      - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    volumes:
+      - import_spool:/var/lib/ai-test-generator/imports
 
 volumes:
   postgres_data:
+  import_spool:

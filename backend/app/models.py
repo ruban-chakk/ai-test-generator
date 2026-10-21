@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Text,
     Boolean,
+    BigInteger,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -38,7 +39,9 @@ class Project(Base):
 class ImportMappingProfile(Base):
     __tablename__ = "import_mapping_profiles"
     __table_args__ = (
-        UniqueConstraint("project_id", "entity_type", "name", name="uq_import_mapping_profile_name"),
+        UniqueConstraint(
+            "project_id", "entity_type", "name", "version", name="uq_import_mapping_profile_name_version"
+        ),
     )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -46,12 +49,79 @@ class ImportMappingProfile(Base):
     name = Column(String(255), nullable=False)
     entity_type = Column(String(32), nullable=False, index=True)
     configuration = Column(JSON, nullable=False, default=dict)
+    version = Column(Integer, nullable=False, default=1)
+    parent_profile_id = Column(
+        UUID(as_uuid=True), ForeignKey("import_mapping_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     active = Column(Boolean, nullable=False, default=True)
+    superseded_at = Column(DateTime, nullable=True)
     created_by = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     project = relationship("Project", back_populates="import_mapping_profiles")
+
+
+class VectorChunk(Base):
+    """Durable inventory of vectors emitted for one outbox aggregate."""
+
+    __tablename__ = "vector_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "aggregate_type", "aggregate_id", "chunk_index", name="uq_vector_chunk_aggregate_index"
+        ),
+        UniqueConstraint("vector_id", name="uq_vector_chunk_vector_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    aggregate_type = Column(String(64), nullable=False, index=True)
+    aggregate_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    entity_type = Column(String(32), nullable=False, index=True)
+    entity_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    vector_id = Column(String(512), nullable=False)
+    chunk_index = Column(Integer, nullable=False)
+    chunk_count = Column(Integer, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
+    indexed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class MappedImportJob(Base):
+    __tablename__ = "mapped_import_jobs"
+    __table_args__ = (
+        UniqueConstraint("project_id", "profile_id", "sha256", name="uq_mapped_import_job_source"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    profile_id = Column(
+        UUID(as_uuid=True), ForeignKey("import_mapping_profiles.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    profile_version = Column(Integer, nullable=False)
+    entity_type = Column(String(32), nullable=False, index=True)
+    mapping_snapshot = Column(JSON, nullable=False)
+    original_filename = Column(String(255), nullable=False)
+    storage_key = Column(String(64), nullable=False, unique=True)
+    sha256 = Column(String(64), nullable=False)
+    byte_size = Column(BigInteger, nullable=False)
+    status = Column(String(32), nullable=False, default="queued", index=True)
+    checkpoint_row = Column(Integer, nullable=False, default=0)
+    source_record_count = Column(Integer, nullable=False, default=0)
+    mapped_record_count = Column(Integer, nullable=False, default=0)
+    created_record_count = Column(Integer, nullable=False, default=0)
+    updated_record_count = Column(Integer, nullable=False, default=0)
+    existing_record_count = Column(Integer, nullable=False, default=0)
+    skipped_record_count = Column(Integer, nullable=False, default=0)
+    warning_count = Column(Integer, nullable=False, default=0)
+    error_count = Column(Integer, nullable=False, default=0)
+    result = Column(JSON, nullable=False, default=dict)
+    last_error_type = Column(String(255), nullable=True)
+    requested_by = Column(String(255), nullable=False)
+    locked_at = Column(DateTime, nullable=True)
+    locked_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
 
 
 class Requirement(Base):
@@ -140,6 +210,9 @@ class TestCase(Base):
     repository_synced_at = Column(DateTime, nullable=True)
     vector_id = Column(String, nullable=True)
     custom_fields_json = Column("custom_fields", JSON, key="custom_fields_json", nullable=False, default=dict)
+    custom_field_schema_json = Column(
+        "custom_field_schema", JSON, key="custom_field_schema_json", nullable=False, default=dict
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -188,6 +261,9 @@ class TestCaseVersion(Base):
     steps_snapshot = Column(JSON, nullable=False, default=list)
     vector_id = Column(String, nullable=True)
     custom_fields_json = Column("custom_fields", JSON, key="custom_fields_json", nullable=False, default=dict)
+    custom_field_schema_json = Column(
+        "custom_field_schema", JSON, key="custom_field_schema_json", nullable=False, default=dict
+    )
 
     test_case = relationship("TestCase", back_populates="versions")
 

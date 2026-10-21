@@ -450,6 +450,36 @@ button:disabled {
   gap: 12px;
 }
 
+.mapping-builder {
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 10px;
+  margin: 14px 0;
+  padding: 14px;
+}
+
+.mapping-field-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.checkbox-label {
+  align-items: center;
+  display: inline-flex;
+  flex-direction: row;
+  gap: 6px;
+}
+
+.checkbox-label input {
+  width: auto;
+}
+
+.mapping-history {
+  border-left: 3px solid #cbd5e1;
+  margin: 10px 0 16px;
+  padding-left: 12px;
+}
+
 .search-result-heading {
   justify-content: space-between;
 }

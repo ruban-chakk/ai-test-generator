@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterable, Iterator, Literal, TextIO
 
 from app.services.file_ingestion import ParsedRequirement
 from app.services.historical_ingestion import ParsedHistoricalStep, ParsedHistoricalTestCase
@@ -36,6 +36,7 @@ ALLOWED_TRANSFORMS = {
     "string", "integer", "version_integer", "iso_datetime", "excel_datetime",
     "references", "numbered_steps", "lower", "upper",
 }
+CUSTOM_FIELD_TYPES = {"auto", "string", "integer", "number", "boolean", "date", "datetime", "list", "json"}
 
 
 def validate_mapping_configuration(entity_type: str, configuration: dict[str, Any]) -> None:
@@ -62,8 +63,25 @@ def validate_mapping_configuration(entity_type: str, configuration: dict[str, An
         if not rule.get("source") and not rule.get("sources") and "default" not in rule:
             raise MappedIngestionError(f"Field {target} requires source, sources, or default")
     custom = configuration.get("custom_fields", {})
-    if not isinstance(custom, dict) or any(not isinstance(value, str) for value in custom.values()):
-        raise MappedIngestionError("configuration.custom_fields must map names to source paths")
+    if not isinstance(custom, dict):
+        raise MappedIngestionError("configuration.custom_fields must be an object")
+    for name, raw_rule in custom.items():
+        if not isinstance(name, str) or not name.strip():
+            raise MappedIngestionError("Custom field names must be non-empty strings")
+        rule = _custom_rule(raw_rule)
+        if not rule.get("source"):
+            raise MappedIngestionError(f"Custom field {name} requires a source path")
+        if rule.get("type", "auto") not in CUSTOM_FIELD_TYPES:
+            raise MappedIngestionError(f"Custom field {name} uses an unsupported type")
+        if "allowed_values" in rule and not isinstance(rule["allowed_values"], list):
+            raise MappedIngestionError(f"Custom field {name} allowed_values must be an array")
+        if "semantic_weight" in rule and rule["semantic_weight"] not in {0, 1, 2, 3}:
+            raise MappedIngestionError(f"Custom field {name} semantic_weight must be 0, 1, 2, or 3")
+        if "pattern" in rule:
+            try:
+                re.compile(str(rule["pattern"]))
+            except re.error as exc:
+                raise MappedIngestionError(f"Custom field {name} has an invalid validation pattern") from exc
     options = configuration.get("options", {})
     if not isinstance(options, dict):
         raise MappedIngestionError("configuration.options must be an object")
@@ -71,6 +89,14 @@ def validate_mapping_configuration(entity_type: str, configuration: dict[str, An
         raise MappedIngestionError("multi_requirement_strategy must be reject, first, or duplicate")
     if options.get("unresolved_reference_policy", "reject") not in {"reject", "skip"}:
         raise MappedIngestionError("unresolved_reference_policy must be reject or skip")
+    existing_strategy = options.get("existing_record_strategy", "skip")
+    allowed_existing = {"skip", "update", "reject"} if entity_type == "requirement" else {
+        "skip", "new_version", "reject"
+    }
+    if existing_strategy not in allowed_existing:
+        raise MappedIngestionError(
+            "existing_record_strategy must be " + ", ".join(sorted(allowed_existing))
+        )
 
 
 def map_import_file(
@@ -101,27 +127,146 @@ def map_import_file(
     if len(records) > max_records:
         raise MappedIngestionError(f"The source exceeds the {max_records}-record mapped-import limit")
     digest = hashlib.sha256(content).hexdigest()
+    return map_import_records(
+        records,
+        entity_type=entity_type,
+        configuration=configuration,
+        filename=name,
+        digest=digest,
+        start_row=1,
+        max_records=max_records,
+    )
+
+
+def map_import_records(
+    records: Iterable[dict[str, Any]],
+    *,
+    entity_type: Literal["requirement", "test_case"],
+    configuration: dict[str, Any],
+    filename: str,
+    digest: str,
+    start_row: int = 1,
+    max_records: int,
+) -> MappedBatch:
+    validate_mapping_configuration(entity_type, configuration)
     issues: list[dict[str, Any]] = []
     items: list[ParsedRequirement | ParsedHistoricalTestCase] = []
-    for row_number, record in enumerate(records, start=1):
+    source_count = 0
+    for row_number, record in enumerate(records, start=start_row):
+        source_count += 1
+        if source_count > max_records:
+            raise MappedIngestionError(f"The batch exceeds the {max_records}-record mapped-import limit")
+        if not isinstance(record, dict):
+            issues.append({"row": row_number, "severity": "error", "message": "Source record must be an object"})
+            continue
         try:
             mapped = _map_record(record, configuration, issues, row_number)
-            custom_fields = {
-                name: value
-                for name, path in configuration.get("custom_fields", {}).items()
-                if _present(value := _get_path(record, path))
-            }
+            custom_fields, custom_schema = _map_custom_fields(record, configuration.get("custom_fields", {}))
             if entity_type == "requirement":
-                items.append(_requirement(mapped, custom_fields, name, digest, row_number))
+                items.append(_requirement(mapped, custom_fields, custom_schema, filename, digest, row_number))
             else:
-                items.extend(_test_cases(mapped, custom_fields, name, digest, row_number, configuration, issues))
+                items.extend(
+                    _test_cases(
+                        mapped,
+                        custom_fields,
+                        custom_schema,
+                        filename,
+                        digest,
+                        row_number,
+                        configuration,
+                        issues,
+                    )
+                )
         except (TypeError, ValueError) as exc:
             issues.append({"row": row_number, "severity": "error", "message": str(exc)})
     if len(items) > max_records:
         raise MappedIngestionError(
             f"Mapping expansion produced {len(items)} records, exceeding the {max_records}-record limit"
         )
-    return MappedBatch(entity_type=entity_type, source_record_count=len(records), items=tuple(items), issues=tuple(issues))
+    return MappedBatch(
+        entity_type=entity_type,
+        source_record_count=source_count,
+        items=tuple(items),
+        issues=tuple(issues),
+    )
+
+
+def iter_source_records(stream: TextIO, extension: str) -> Iterator[dict[str, Any]]:
+    """Stream top-level JSON arrays, NDJSON, or CSV without materializing the file."""
+
+    if extension == ".csv":
+        for record in csv.DictReader(stream):
+            yield dict(record)
+        return
+    if extension not in {".json", ".jsonl", ".ndjson"}:
+        raise MappedIngestionError("Streamed mapped imports support JSON, JSONL, NDJSON, and CSV")
+    if extension in {".jsonl", ".ndjson"}:
+        for row_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise MappedIngestionError(f"Invalid JSON object at source line {row_number}") from exc
+            if not isinstance(value, dict):
+                raise MappedIngestionError(f"Source line {row_number} must contain a JSON object")
+            yield value
+        return
+    yield from _iter_json_array(stream)
+
+
+def _iter_json_array(stream: TextIO) -> Iterator[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    buffer = ""
+    position = 0
+    started = False
+    eof = False
+    while True:
+        if position > 1_000_000:
+            buffer = buffer[position:]
+            position = 0
+        while position >= len(buffer) and not eof:
+            chunk = stream.read(64 * 1024)
+            if chunk:
+                buffer += chunk
+            else:
+                eof = True
+        while position < len(buffer) and buffer[position].isspace():
+            position += 1
+        if not started:
+            if position < len(buffer) and buffer[position] == "\ufeff":
+                position += 1
+                continue
+            if position >= len(buffer):
+                raise MappedIngestionError("The JSON source is empty")
+            if buffer[position] != "[":
+                raise MappedIngestionError("Streamed JSON imports require a top-level array")
+            position += 1
+            started = True
+            continue
+        while position < len(buffer) and (buffer[position].isspace() or buffer[position] == ","):
+            position += 1
+        if position < len(buffer) and buffer[position] == "]":
+            return
+        if position >= len(buffer):
+            if eof:
+                raise MappedIngestionError("The JSON array is incomplete")
+            continue
+        try:
+            value, next_position = decoder.raw_decode(buffer, position)
+        except json.JSONDecodeError as exc:
+            if eof:
+                raise MappedIngestionError("The JSON array contains an invalid record") from exc
+            chunk = stream.read(64 * 1024)
+            if chunk:
+                buffer += chunk
+                continue
+            eof = True
+            continue
+        if not isinstance(value, dict):
+            raise MappedIngestionError("Every streamed JSON array item must be an object")
+        position = next_position
+        yield value
 
 
 def _load_records(text: str, extension: str, record_path: str | None) -> list[dict[str, Any]]:
@@ -154,8 +299,86 @@ def _rule(value: Any) -> dict[str, Any]:
     return {"source": value} if isinstance(value, str) else dict(value or {})
 
 
+def _custom_rule(value: Any) -> dict[str, Any]:
+    return {"source": value, "type": "auto", "index": True, "semantic_weight": 1} if isinstance(value, str) else {
+        "type": "auto",
+        "index": True,
+        "semantic_weight": 1,
+        **dict(value or {}),
+    }
+
+
 def _present(value: Any) -> bool:
     return value is not None and value != ""
+
+
+def _map_custom_fields(
+    record: dict[str, Any],
+    configuration: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    values: dict[str, Any] = {}
+    schema: dict[str, Any] = {}
+    for name, raw_rule in configuration.items():
+        rule = _custom_rule(raw_rule)
+        raw_value = _get_path(record, str(rule["source"]))
+        if not _present(raw_value):
+            if "default" in rule:
+                raw_value = rule["default"]
+            elif rule.get("required"):
+                raise ValueError(f"Required custom field {name} is missing")
+            else:
+                continue
+        value = _coerce_custom_value(raw_value, rule.get("type", "auto"), name)
+        allowed = rule.get("allowed_values")
+        if allowed is not None and value not in allowed:
+            raise ValueError(f"Custom field {name} must be one of {allowed}")
+        if isinstance(value, str):
+            if rule.get("pattern") and not re.fullmatch(str(rule["pattern"]), value):
+                raise ValueError(f"Custom field {name} does not match its validation pattern")
+            if "min_length" in rule and len(value) < int(rule["min_length"]):
+                raise ValueError(f"Custom field {name} is shorter than min_length")
+            if "max_length" in rule and len(value) > int(rule["max_length"]):
+                raise ValueError(f"Custom field {name} exceeds max_length")
+        values[name] = value
+        schema[name] = {
+            key: rule[key]
+            for key in ("type", "required", "allowed_values", "index", "semantic_weight")
+            if key in rule
+        }
+    return values, schema
+
+
+def _coerce_custom_value(value: Any, field_type: str, name: str) -> Any:
+    try:
+        if field_type == "auto":
+            return value
+        if field_type == "string":
+            return str(value).strip()
+        if field_type == "integer":
+            return int(value)
+        if field_type == "number":
+            return float(value)
+        if field_type == "boolean":
+            if isinstance(value, bool):
+                return value
+            normalized = str(value).strip().lower()
+            if normalized in {"true", "1", "yes", "y"}:
+                return True
+            if normalized in {"false", "0", "no", "n"}:
+                return False
+            raise ValueError
+        if field_type in {"date", "datetime"}:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.date().isoformat() if field_type == "date" else parsed.isoformat()
+        if field_type == "list":
+            if isinstance(value, list):
+                return value
+            return [item.strip() for item in str(value).split(",") if item.strip()]
+        if field_type == "json":
+            return value if isinstance(value, (dict, list)) else json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Custom field {name} cannot be converted to {field_type}") from exc
+    raise ValueError(f"Custom field {name} uses unsupported type {field_type}")
 
 
 def _map_record(record: dict[str, Any], configuration: dict[str, Any], issues: list[dict], row: int) -> dict:
@@ -238,7 +461,14 @@ def _required(mapped: dict[str, Any], field: str) -> str:
     return value
 
 
-def _requirement(mapped: dict, custom: dict, filename: str, digest: str, row: int) -> ParsedRequirement:
+def _requirement(
+    mapped: dict,
+    custom: dict,
+    custom_schema: dict,
+    filename: str,
+    digest: str,
+    row: int,
+) -> ParsedRequirement:
     return ParsedRequirement(
         external_id=_required(mapped, "external_id"),
         title=_required(mapped, "title"),
@@ -248,12 +478,13 @@ def _requirement(mapped: dict, custom: dict, filename: str, digest: str, row: in
             "upload_sha256": digest,
             "upload_row": row,
             "custom_fields": custom,
+            "custom_field_schema": custom_schema,
         },
     )
 
 
 def _test_cases(
-    mapped: dict, custom: dict, filename: str, digest: str, row: int,
+    mapped: dict, custom: dict, custom_schema: dict, filename: str, digest: str, row: int,
     configuration: dict, issues: list[dict],
 ) -> list[ParsedHistoricalTestCase]:
     refs = mapped.get("requirement_external_id")
@@ -308,6 +539,7 @@ def _test_cases(
             upload_sha256=digest,
             upload_row=row,
             custom_fields=custom,
+            custom_field_schema=custom_schema,
         )
         for ref in refs
     ]

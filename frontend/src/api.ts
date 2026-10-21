@@ -35,6 +35,7 @@ export type TestCaseSummary = {
   repository_synced_at?: string;
   steps?: TestCaseStep[];
   custom_fields_json?: Record<string, unknown>;
+  custom_field_schema_json?: Record<string, unknown>;
 };
 
 export type TestScenarioSummary = {
@@ -319,7 +320,10 @@ export type ImportMappingProfile = {
   name: string;
   entity_type: 'requirement' | 'test_case';
   configuration: Record<string, unknown>;
+  version: number;
+  parent_profile_id?: string;
   active: boolean;
+  superseded_at?: string;
   created_by: string;
   created_at: string;
   updated_at: string;
@@ -335,6 +339,33 @@ export type MappedImportPreview = {
   error_count: number;
   issues: Array<Record<string, unknown>>;
   samples: Array<Record<string, unknown>>;
+};
+
+export type MappedImportJob = {
+  id: string;
+  project_id: string;
+  profile_id: string;
+  profile_version: number;
+  entity_type: 'requirement' | 'test_case';
+  original_filename: string;
+  sha256: string;
+  byte_size: number;
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  checkpoint_row: number;
+  source_record_count: number;
+  mapped_record_count: number;
+  created_record_count: number;
+  updated_record_count: number;
+  existing_record_count: number;
+  skipped_record_count: number;
+  warning_count: number;
+  error_count: number;
+  result: Record<string, unknown>;
+  last_error_type?: string;
+  requested_by: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
 };
 
 export type RepositorySyncRunSummary = {
@@ -1057,6 +1088,28 @@ export async function getImportMappingProfiles(projectId: string): Promise<Impor
   return request<ImportMappingProfile[]>(`${API_BASE_URL}/import-mappings?${params.toString()}`);
 }
 
+export async function getImportMappingProfileHistory(projectId: string): Promise<ImportMappingProfile[]> {
+  const params = new URLSearchParams({ project_id: projectId, include_history: 'true' });
+  return request<ImportMappingProfile[]>(`${API_BASE_URL}/import-mappings?${params.toString()}`);
+}
+
+export async function updateImportMappingProfile(
+  profileId: string,
+  payload: { name: string; configuration: Record<string, unknown>; active: boolean },
+): Promise<ImportMappingProfile> {
+  const response = await fetch(`${API_BASE_URL}/import-mappings/${profileId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<ImportMappingProfile>(response);
+}
+
+export async function rollbackImportMappingProfile(profileId: string): Promise<ImportMappingProfile> {
+  const response = await fetch(`${API_BASE_URL}/import-mappings/${profileId}/rollback`, { method: 'POST' });
+  return handleResponse<ImportMappingProfile>(response);
+}
+
 export async function createImportMappingProfile(payload: {
   project_id: string;
   name: string;
@@ -1086,6 +1139,20 @@ export function previewMappedImport(profileId: string, file: File): Promise<Mapp
 
 export function executeMappedImport(profileId: string, file: File): Promise<IntegrationRunSummary> {
   return mappedImportRequest<IntegrationRunSummary>('/imports/mapped', profileId, file);
+}
+
+export function createMappedImportJob(profileId: string, file: File): Promise<MappedImportJob> {
+  return mappedImportRequest<MappedImportJob>('/imports/mapped/jobs', profileId, file);
+}
+
+export function getMappedImportJobs(projectId: string): Promise<MappedImportJob[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<MappedImportJob[]>(`${API_BASE_URL}/imports/mapped/jobs?${params.toString()}`);
+}
+
+export async function retryMappedImportJob(jobId: string): Promise<MappedImportJob> {
+  const response = await fetch(`${API_BASE_URL}/imports/mapped/jobs/${jobId}/retry`, { method: 'POST' });
+  return handleResponse<MappedImportJob>(response);
 }
 
 export async function syncTestRepository(

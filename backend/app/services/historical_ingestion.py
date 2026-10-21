@@ -44,6 +44,7 @@ class ParsedHistoricalTestCase:
     upload_sha256: str
     upload_row: int
     custom_fields: dict[str, Any] = field(default_factory=dict)
+    custom_field_schema: dict[str, Any] = field(default_factory=dict)
 
 
 ALLOWED_EXTENSIONS = {".json", ".csv"}

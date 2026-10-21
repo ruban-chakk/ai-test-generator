@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import uuid
+from dataclasses import replace
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -105,6 +106,7 @@ def test_historical_import_is_atomic_idempotent_and_indexes_immutable_version() 
                 )
                 assert first.created_scenario_count == 1
                 assert first.created_test_case_count == 1
+                assert first.updated_test_case_count == 0
                 assert first.existing_test_case_count == 0
                 assert first.queued_vector_count == 1
 
@@ -117,6 +119,7 @@ def test_historical_import_is_atomic_idempotent_and_indexes_immutable_version() 
                 )
                 assert second.created_scenario_count == 0
                 assert second.created_test_case_count == 0
+                assert second.updated_test_case_count == 0
                 assert second.existing_test_case_count == 1
                 assert second.queued_vector_count == 0
 
@@ -172,6 +175,41 @@ def test_historical_import_is_atomic_idempotent_and_indexes_immutable_version() 
                 )
                 assert case_count == 1
                 assert version_count == 1
+
+            updated_items = [
+                replace(
+                    items[0],
+                    version=5,
+                    description="A consumed link remains invalid and creates security audit evidence.",
+                )
+            ]
+            async with session_factory() as db:
+                updated = await import_historical_test_cases(
+                    db,
+                    project_id=project_id,
+                    items=updated_items,
+                    actor=actor,
+                    existing_record_strategy="new_version",
+                )
+                assert updated.created_test_case_count == 0
+                assert updated.updated_test_case_count == 1
+                assert updated.queued_vector_count == 1
+                test_case = await db.scalar(
+                    select(CaseModel)
+                    .join(Requirement, Requirement.id == CaseModel.requirement_id)
+                    .where(
+                        Requirement.project_id == project_id,
+                        CaseModel.external_id == "LEGACY-TC-17",
+                    )
+                )
+                assert test_case is not None
+                assert test_case.version == 5
+                assert test_case.description == updated_items[0].description
+                assert await db.scalar(
+                    select(func.count()).select_from(VersionModel).where(
+                        VersionModel.test_case_id == test_case.id
+                    )
+                ) == 2
 
             missing_items = parse_historical_test_case_file(
                 "missing.json",

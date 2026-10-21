@@ -22,10 +22,15 @@ import {
   importJiraRequirements,
   importHistoricalTestCases,
   createImportMappingProfile,
+  createMappedImportJob,
   executeMappedImport,
+  getImportMappingProfileHistory,
   getImportMappingProfiles,
+  getMappedImportJobs,
   previewMappedImport,
+  rollbackImportMappingProfile,
   ImportMappingProfile,
+  MappedImportJob,
   MappedImportPreview,
   importRequirementFile,
   IntegrationRunSummary,
@@ -37,8 +42,10 @@ import {
   ProjectSummary,
   runEvaluationSuite,
   retryOutboxEvent,
+  retryMappedImportJob,
   syncTestRepository,
   updateComplianceProfile,
+  updateImportMappingProfile,
   exportComplianceEvidence,
 } from '../api';
 
@@ -55,7 +62,7 @@ const STORY_MAPPING = {
     status: 'status.name', priority: 'priority.name', project: 'project', epic: 'epic',
     risk: 'risk', labels: 'labels', components: 'components', source_type: 'sourceType',
   },
-  options: {},
+  options: { existing_record_strategy: 'update' },
 };
 
 const TEST_CASE_MAPPING = {
@@ -86,11 +93,30 @@ const TEST_CASE_MAPPING = {
     expected_result_source: 'expectedResults',
     multi_requirement_strategy: 'duplicate',
     unresolved_reference_policy: 'skip',
+    existing_record_strategy: 'new_version',
   },
 };
 
 type OperationsPageProps = {
   selectedProject: ProjectSummary | null;
+};
+
+type CustomFieldDraft = {
+  name: string;
+  source: string;
+  type: 'auto' | 'string' | 'integer' | 'number' | 'boolean' | 'date' | 'datetime' | 'list' | 'json';
+  required: boolean;
+  index: boolean;
+  semanticWeight: 0 | 1 | 2 | 3;
+};
+
+const EMPTY_CUSTOM_FIELD: CustomFieldDraft = {
+  name: '',
+  source: '',
+  type: 'string',
+  required: false,
+  index: true,
+  semanticWeight: 1,
 };
 
 export default function OperationsPage({ selectedProject }: OperationsPageProps) {
@@ -109,13 +135,17 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
   const [historicalRun, setHistoricalRun] = useState<IntegrationRunSummary | null>(null);
   const [historicalFile, setHistoricalFile] = useState<File | null>(null);
   const [mappingProfiles, setMappingProfiles] = useState<ImportMappingProfile[]>([]);
+  const [mappingHistory, setMappingHistory] = useState<ImportMappingProfile[]>([]);
   const [mappingEntity, setMappingEntity] = useState<'requirement' | 'test_case'>('requirement');
   const [mappingName, setMappingName] = useState('Company user stories');
   const [mappingConfig, setMappingConfig] = useState(JSON.stringify(STORY_MAPPING, null, 2));
+  const [editingProfileId, setEditingProfileId] = useState('');
+  const [customFieldDraft, setCustomFieldDraft] = useState<CustomFieldDraft>(EMPTY_CUSTOM_FIELD);
   const [mappedProfileId, setMappedProfileId] = useState('');
   const [mappedFile, setMappedFile] = useState<File | null>(null);
   const [mappedPreview, setMappedPreview] = useState<MappedImportPreview | null>(null);
   const [mappedRun, setMappedRun] = useState<IntegrationRunSummary | null>(null);
+  const [mappedJobs, setMappedJobs] = useState<MappedImportJob[]>([]);
   const [cleanupResult, setCleanupResult] = useState<CleanupResult | null>(null);
   const [evaluationRun, setEvaluationRun] = useState<EvaluationRunSummary | null>(null);
   const [policies, setPolicies] = useState<GovernancePolicySummary[]>([]);
@@ -173,16 +203,80 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
   useEffect(() => {
     refreshOperations();
     if (selectedProject) {
-      getImportMappingProfiles(selectedProject.id).then(setMappingProfiles).catch(() => setMappingProfiles([]));
+      Promise.all([
+        getImportMappingProfiles(selectedProject.id),
+        getImportMappingProfileHistory(selectedProject.id),
+        getMappedImportJobs(selectedProject.id),
+      ]).then(([active, history, jobs]) => {
+        setMappingProfiles(active);
+        setMappingHistory(history);
+        setMappedJobs(jobs);
+      }).catch(() => {
+        setMappingProfiles([]);
+        setMappingHistory([]);
+        setMappedJobs([]);
+      });
     } else {
       setMappingProfiles([]);
+      setMappingHistory([]);
+      setMappedJobs([]);
     }
   }, [selectedProject?.id]);
+
+  useEffect(() => {
+    if (!selectedProject || !mappedJobs.some((job) => job.status === 'queued' || job.status === 'processing')) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      getMappedImportJobs(selectedProject.id).then(setMappedJobs).catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [mappedJobs, selectedProject]);
 
   const changeMappingEntity = (entity: 'requirement' | 'test_case') => {
     setMappingEntity(entity);
     setMappingName(entity === 'requirement' ? 'Company user stories' : 'Company test cases');
     setMappingConfig(JSON.stringify(entity === 'requirement' ? STORY_MAPPING : TEST_CASE_MAPPING, null, 2));
+    setEditingProfileId('');
+  };
+
+  const selectMappingProfile = (profileId: string) => {
+    setMappedProfileId(profileId);
+    setMappedPreview(null);
+    const profile = mappingProfiles.find((item) => item.id === profileId);
+    if (!profile) return;
+    setEditingProfileId(profile.id);
+    setMappingEntity(profile.entity_type);
+    setMappingName(profile.name);
+    setMappingConfig(JSON.stringify(profile.configuration, null, 2));
+  };
+
+  const addCustomField = () => {
+    const name = customFieldDraft.name.trim();
+    const source = customFieldDraft.source.trim();
+    if (!name || !source) {
+      setError('Custom field name and source path are required.');
+      return;
+    }
+    try {
+      const configuration = JSON.parse(mappingConfig) as Record<string, unknown>;
+      const fields = (configuration.custom_fields as Record<string, unknown> | undefined) ?? {};
+      configuration.custom_fields = {
+        ...fields,
+        [name]: {
+          source,
+          type: customFieldDraft.type,
+          required: customFieldDraft.required,
+          index: customFieldDraft.index,
+          semantic_weight: customFieldDraft.semanticWeight,
+        },
+      };
+      setMappingConfig(JSON.stringify(configuration, null, 2));
+      setCustomFieldDraft(EMPTY_CUSTOM_FIELD);
+      setError(null);
+    } catch {
+      setError('Fix the mapping JSON before adding a guided custom field.');
+    }
   };
 
   const handleSaveMapping = (event: FormEvent<HTMLFormElement>) => {
@@ -192,15 +286,42 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
       return;
     }
     runAction('save-mapping', async () => {
-      const profile = await createImportMappingProfile({
-        project_id: selectedProject.id,
-        name: mappingName,
-        entity_type: mappingEntity,
-        configuration: JSON.parse(mappingConfig) as Record<string, unknown>,
-        active: true,
-      });
-      setMappingProfiles((current) => [...current, profile]);
+      const configuration = JSON.parse(mappingConfig) as Record<string, unknown>;
+      const profile = editingProfileId
+        ? await updateImportMappingProfile(editingProfileId, { name: mappingName, configuration, active: true })
+        : await createImportMappingProfile({
+            project_id: selectedProject.id,
+            name: mappingName,
+            entity_type: mappingEntity,
+            configuration,
+            active: true,
+          });
+      const [active, history] = await Promise.all([
+        getImportMappingProfiles(selectedProject.id),
+        getImportMappingProfileHistory(selectedProject.id),
+      ]);
+      setMappingProfiles(active);
+      setMappingHistory(history);
       setMappedProfileId(profile.id);
+      setEditingProfileId(profile.id);
+    });
+  };
+
+  const handleRollbackMapping = (profileId: string) => {
+    if (!selectedProject) return;
+    runAction(`rollback-mapping-${profileId}`, async () => {
+      const restored = await rollbackImportMappingProfile(profileId);
+      const [active, history] = await Promise.all([
+        getImportMappingProfiles(selectedProject.id),
+        getImportMappingProfileHistory(selectedProject.id),
+      ]);
+      setMappingProfiles(active);
+      setMappingHistory(history);
+      setMappedProfileId(restored.id);
+      setEditingProfileId(restored.id);
+      setMappingEntity(restored.entity_type);
+      setMappingName(restored.name);
+      setMappingConfig(JSON.stringify(restored.configuration, null, 2));
     });
   };
 
@@ -218,6 +339,21 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
     if (!mappedProfileId || !mappedFile) return;
     runAction('mapped-import', async () => {
       setMappedRun(await executeMappedImport(mappedProfileId, mappedFile));
+    });
+  };
+
+  const handleMappedImportJob = () => {
+    if (!mappedProfileId || !mappedFile) return;
+    runAction('mapped-import-job', async () => {
+      await createMappedImportJob(mappedProfileId, mappedFile);
+      if (selectedProject) setMappedJobs(await getMappedImportJobs(selectedProject.id));
+    });
+  };
+
+  const handleRetryMappedJob = (jobId: string) => {
+    runAction(`retry-mapped-job-${jobId}`, async () => {
+      await retryMappedImportJob(jobId);
+      if (selectedProject) setMappedJobs(await getMappedImportJobs(selectedProject.id));
     });
   };
 
@@ -383,24 +519,118 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
               Mapping name
               <input value={mappingName} onChange={(event) => setMappingName(event.target.value)} required />
             </label>
+            <fieldset className="mapping-builder">
+              <legend>Add a typed company field</legend>
+              <div className="mapping-field-grid">
+                <label>
+                  Field name
+                  <input
+                    value={customFieldDraft.name}
+                    onChange={(event) => setCustomFieldDraft((current) => ({ ...current, name: event.target.value }))}
+                    placeholder="business_unit"
+                  />
+                </label>
+                <label>
+                  Source path
+                  <input
+                    value={customFieldDraft.source}
+                    onChange={(event) => setCustomFieldDraft((current) => ({ ...current, source: event.target.value }))}
+                    placeholder="fields.businessUnit"
+                  />
+                </label>
+                <label>
+                  Data type
+                  <select
+                    value={customFieldDraft.type}
+                    onChange={(event) => setCustomFieldDraft((current) => ({
+                      ...current,
+                      type: event.target.value as CustomFieldDraft['type'],
+                    }))}
+                  >
+                    {['auto', 'string', 'integer', 'number', 'boolean', 'date', 'datetime', 'list', 'json'].map((value) => (
+                      <option key={value} value={value}>{value}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Semantic weight
+                  <select
+                    value={customFieldDraft.semanticWeight}
+                    onChange={(event) => setCustomFieldDraft((current) => ({
+                      ...current,
+                      semanticWeight: Number(event.target.value) as CustomFieldDraft['semanticWeight'],
+                    }))}
+                  >
+                    <option value={0}>Do not embed</option>
+                    <option value={1}>Normal</option>
+                    <option value={2}>High</option>
+                    <option value={3}>Critical</option>
+                  </select>
+                </label>
+              </div>
+              <div className="detail-actions">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={customFieldDraft.required}
+                    onChange={(event) => setCustomFieldDraft((current) => ({ ...current, required: event.target.checked }))}
+                  />
+                  Required
+                </label>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={customFieldDraft.index}
+                    onChange={(event) => setCustomFieldDraft((current) => ({ ...current, index: event.target.checked }))}
+                  />
+                  Searchable
+                </label>
+                <button className="secondary-button" type="button" onClick={addCustomField}>Add field</button>
+              </div>
+            </fieldset>
             <label>
-              Mapping configuration
+              Advanced mapping JSON
               <textarea rows={16} value={mappingConfig} onChange={(event) => setMappingConfig(event.target.value)} required />
             </label>
             <button className="secondary-button" type="submit" disabled={!selectedProject || busy === 'save-mapping'}>
-              {busy === 'save-mapping' ? 'Saving...' : 'Save mapping'}
+              {busy === 'save-mapping' ? 'Saving...' : editingProfileId ? 'Save new revision' : 'Create mapping'}
             </button>
           </form>
           <hr />
           <label>
             Saved mapping
-            <select value={mappedProfileId} onChange={(event) => { setMappedProfileId(event.target.value); setMappedPreview(null); }}>
+            <select value={mappedProfileId} onChange={(event) => selectMappingProfile(event.target.value)}>
               <option value="">Select mapping</option>
               {mappingProfiles.filter((profile) => profile.active).map((profile) => (
-                <option key={profile.id} value={profile.id}>{profile.name} · {profile.entity_type.replace('_', ' ')}</option>
+                <option key={profile.id} value={profile.id}>
+                  {profile.name} · v{profile.version} · {profile.entity_type.replace('_', ' ')}
+                </option>
               ))}
             </select>
           </label>
+          {editingProfileId ? (
+            <div className="mapping-history" aria-label="Mapping revision history">
+              <strong>Revision history</strong>
+              {mappingHistory
+                .filter((profile) => profile.name === mappingName && profile.entity_type === mappingEntity)
+                .sort((left, right) => right.version - left.version)
+                .map((profile) => (
+                  <div className="detail-actions" key={profile.id}>
+                    <span>v{profile.version} · {profile.active ? 'active' : 'superseded'}</span>
+                    {!profile.active ? (
+                      <button
+                        className="text-button"
+                        type="button"
+                        disabled={busy === `rollback-mapping-${profile.id}`}
+                        onClick={() => handleRollbackMapping(profile.id)}
+                      >
+                        Restore as new revision
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+            </div>
+          ) : null}
           <label>
             Company JSON or CSV file
             <input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => { setMappedFile(event.target.files?.[0] ?? null); setMappedPreview(null); }} />
@@ -412,6 +642,14 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
             <button className="primary-button" type="button" onClick={handleMappedImport} disabled={!mappedProfileId || !mappedFile || !mappedPreview || mappedPreview.error_count > 0 || busy === 'mapped-import'}>
               {busy === 'mapped-import' ? 'Importing...' : 'Import mapped data'}
             </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={handleMappedImportJob}
+              disabled={!mappedProfileId || !mappedFile || busy === 'mapped-import-job'}
+            >
+              {busy === 'mapped-import-job' ? 'Queueing...' : 'Queue large/resumable import'}
+            </button>
           </div>
           {mappedPreview ? (
             <p className="case-meta" role="status">
@@ -420,7 +658,40 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
               {mappedPreview.warning_count} · Errors {mappedPreview.error_count}
             </p>
           ) : null}
-          {mappedRun ? <p className="case-meta" role="status">Import completed: {String(mappedRun.result.created_count ?? mappedRun.result.created_test_case_count ?? 0)} created</p> : null}
+          {mappedRun ? (
+            <p className="case-meta" role="status">
+              Import completed: {String(mappedRun.result.created_count ?? mappedRun.result.created_test_case_count ?? 0)} created ·{' '}
+              {String(mappedRun.result.updated_count ?? mappedRun.result.updated_test_case_count ?? 0)} updated
+            </p>
+          ) : null}
+          {mappedJobs.length ? (
+            <div className="history-list" aria-live="polite">
+              <h3>Large import jobs</h3>
+              {mappedJobs.slice(0, 8).map((job) => (
+                <div className="history-card" key={job.id}>
+                  <div className="detail-actions">
+                    <strong>{job.original_filename}</strong>
+                    <span className={`status-pill status-${job.status}`}>{job.status}</span>
+                  </div>
+                  <p className="case-meta">
+                    Mapping v{job.profile_version} · Processed {job.source_record_count} · Created {job.created_record_count} ·{' '}
+                    Updated {job.updated_record_count} · Skipped {job.skipped_record_count}
+                  </p>
+                  {job.last_error_type ? <p className="status-message status-error">{job.last_error_type}</p> : null}
+                  {job.status === 'failed' ? (
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => handleRetryMappedJob(job.id)}
+                      disabled={busy === `retry-mapped-job-${job.id}`}
+                    >
+                      Retry from checkpoint
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </article>
         <article className="detail-card">
           <h2>Monitoring</h2>

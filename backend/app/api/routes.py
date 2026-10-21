@@ -2,6 +2,7 @@ import uuid
 import re
 import hashlib
 import json
+from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -25,6 +26,7 @@ from app.models import (
     ImpactAnalysis,
     IntegrationRun,
     ImportMappingProfile,
+    MappedImportJob,
     OperationalMetric,
     OutboxEvent,
     Project,
@@ -67,6 +69,7 @@ from app.schemas import (
     ImportMappingProfileUpdate,
     ImportMappingProfileSummary,
     MappedImportPreview,
+    MappedImportJobSummary,
     JiraImportRequest,
     MonitoringSummary,
     DependencyHealthSummary,
@@ -101,6 +104,7 @@ from app.schemas import (
 from app.services.generation import (
     GenerationConfigurationError,
     GenerationProviderError,
+    RetrievedContext,
     build_generation_service,
 )
 from app.services.outbox import (
@@ -159,6 +163,36 @@ DEPRECATION_KEYWORDS = {
     "migration",
 }
 ALLOWED_ROLES = {"reviewer", "approver", "admin", "system"}
+
+
+async def _generation_keyword_contexts(
+    db: AsyncSession,
+    *,
+    query: str,
+    project_id: uuid.UUID | None,
+) -> list[RetrievedContext]:
+    if project_id is None:
+        return []
+    matches = await KeywordSearchService(db).search(
+        query,
+        project_id=str(project_id),
+        limit=settings.rag_candidate_limit,
+    )
+    return [
+        RetrievedContext(
+            id=match.vector_id,
+            score=match.keyword_score if match.keyword_score is not None else match.score,
+            text=match.text,
+            metadata={
+                **match.metadata,
+                "entity_type": match.entity_type,
+                "entity_id": match.entity_id,
+                "title": match.title,
+                "retrieval_source": "keyword",
+            },
+        )
+        for match in matches
+    ]
 
 
 async def _require_project_access(
@@ -1547,6 +1581,10 @@ async def process_feedback_revision(
             target_context = source_snapshot
 
         try:
+            feedback_query = (
+                f"Requirement title: {requirement.title}\nRequirement description: {requirement.description}\n"
+                f"Current target: {target_context}\nReviewer feedback: {feedback.comment}"
+            )
             generation_result = await build_generation_service().generate_from_feedback(
                 requirement_id=str(requirement.id),
                 project_id=str(requirement.project_id) if requirement.project_id else None,
@@ -1557,6 +1595,11 @@ async def process_feedback_revision(
                 target_context=str(target_context),
                 action=action,
                 requirement_version=requirement.version,
+                keyword_contexts=await _generation_keyword_contexts(
+                    db,
+                    query=feedback_query,
+                    project_id=requirement.project_id,
+                ),
             )
         except GenerationConfigurationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1843,6 +1886,7 @@ async def semantic_search(
             limit=candidate_limit,
         )
     semantic_matches = []
+    semantic_fallback = False
     if mode in {"semantic", "hybrid"}:
         try:
             semantic_matches = await build_semantic_search_service().search(
@@ -1852,11 +1896,21 @@ async def semantic_search(
                 limit=candidate_limit,
             )
         except GenerationConfigurationError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            if mode == "hybrid":
+                semantic_fallback = True
+            else:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         except GenerationProviderError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if mode == "hybrid":
+                semantic_fallback = True
+            else:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
     if mode == "hybrid":
-        matches = fuse_search_matches(semantic_matches, keyword_matches, limit=limit)
+        matches = (
+            keyword_matches[:limit]
+            if semantic_fallback
+            else fuse_search_matches(semantic_matches, keyword_matches, limit=limit)
+        )
     elif mode == "keyword":
         matches = keyword_matches[:limit]
     else:
@@ -1869,8 +1923,8 @@ async def semantic_search(
             title=match.title,
             text=match.text,
             score=round(match.score, 4),
-            metadata=match.metadata,
-            search_mode=mode,
+            metadata={**match.metadata, **({"semantic_fallback": True} if semantic_fallback else {})},
+            search_mode="keyword" if semantic_fallback else mode,
             semantic_score=round(match.semantic_score, 4) if match.semantic_score is not None else None,
             keyword_score=round(match.keyword_score, 4) if match.keyword_score is not None else None,
             matched_fields=list(match.matched_fields),
@@ -2369,6 +2423,7 @@ async def import_historical_test_case_file(
 async def list_import_mapping_profiles(
     project_id: uuid.UUID,
     entity_type: Literal["requirement", "test_case"] | None = None,
+    include_history: bool = False,
     db: AsyncSession = Depends(get_db),
 ) -> list[ImportMappingProfile]:
     await _ensure_project(db, project_id)
@@ -2376,7 +2431,15 @@ async def list_import_mapping_profiles(
     query = select(ImportMappingProfile).where(ImportMappingProfile.project_id == project_id)
     if entity_type:
         query = query.where(ImportMappingProfile.entity_type == entity_type)
-    result = await db.execute(query.order_by(ImportMappingProfile.entity_type, ImportMappingProfile.name))
+    if not include_history:
+        query = query.where(ImportMappingProfile.active.is_(True))
+    result = await db.execute(
+        query.order_by(
+            ImportMappingProfile.entity_type,
+            ImportMappingProfile.name,
+            ImportMappingProfile.version.desc(),
+        )
+    )
     return list(result.scalars().all())
 
 
@@ -2402,6 +2465,7 @@ async def create_import_mapping_profile(
                 ImportMappingProfile.project_id == payload.project_id,
                 ImportMappingProfile.entity_type == payload.entity_type,
                 ImportMappingProfile.name == payload.name.strip(),
+                ImportMappingProfile.active.is_(True),
             )
         )
     ).scalars().first()
@@ -2441,7 +2505,7 @@ async def update_import_mapping_profile(
 ) -> ImportMappingProfile:
     require_global_role("approver", "admin")
     profile = await db.get(ImportMappingProfile, profile_id)
-    if not profile:
+    if not profile or not profile.active:
         raise HTTPException(status_code=404, detail="Import mapping profile not found")
     await _require_project_access(db, profile.project_id, {"approver", "admin"})
     try:
@@ -2455,24 +2519,109 @@ async def update_import_mapping_profile(
                 ImportMappingProfile.entity_type == profile.entity_type,
                 ImportMappingProfile.name == payload.name.strip(),
                 ImportMappingProfile.id != profile.id,
+                ImportMappingProfile.active.is_(True),
             )
         )
     ).scalars().first()
     if duplicate:
         raise HTTPException(status_code=409, detail="An import mapping profile with this name already exists")
-    profile.name = payload.name.strip()
-    profile.configuration = payload.configuration
-    profile.active = payload.active
+    profile.active = False
+    profile.superseded_at = datetime.utcnow()
+    latest_version = await db.scalar(
+        select(func.max(ImportMappingProfile.version)).where(
+            ImportMappingProfile.project_id == profile.project_id,
+            ImportMappingProfile.entity_type == profile.entity_type,
+            ImportMappingProfile.name == payload.name.strip(),
+        )
+    )
+    revision = ImportMappingProfile(
+        project_id=profile.project_id,
+        name=payload.name.strip(),
+        entity_type=profile.entity_type,
+        configuration=payload.configuration,
+        version=int(latest_version or 0) + 1,
+        parent_profile_id=profile.id,
+        active=payload.active,
+        created_by=current_principal().username,
+    )
+    db.add(revision)
+    await db.flush()
     db.add(AuditLog(
         entity_type="import_mapping_profile",
-        entity_id=profile.id,
+        entity_id=revision.id,
         action="import_mapping_profile_updated",
         actor=current_principal().username,
-        details={"project_id": str(profile.project_id), "name": profile.name},
+        details={
+            "project_id": str(profile.project_id),
+            "name": revision.name,
+            "version": revision.version,
+            "supersedes": str(profile.id),
+        },
     ))
     await db.commit()
-    await db.refresh(profile)
-    return profile
+    await db.refresh(revision)
+    return revision
+
+
+@api_router.post(
+    "/import-mappings/{profile_id}/rollback",
+    response_model=ImportMappingProfileSummary,
+    tags=["Integrations"],
+)
+async def rollback_import_mapping_profile(
+    profile_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> ImportMappingProfile:
+    require_global_role("approver", "admin")
+    target = await db.get(ImportMappingProfile, profile_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Import mapping profile not found")
+    await _require_project_access(db, target.project_id, {"approver", "admin"})
+    latest = (
+        await db.execute(
+            select(ImportMappingProfile)
+            .where(
+                ImportMappingProfile.project_id == target.project_id,
+                ImportMappingProfile.entity_type == target.entity_type,
+                ImportMappingProfile.name == target.name,
+                ImportMappingProfile.active.is_(True),
+            )
+            .order_by(ImportMappingProfile.version.desc())
+            .with_for_update()
+        )
+    ).scalars().first()
+    if latest:
+        latest.active = False
+        latest.superseded_at = datetime.utcnow()
+    next_version = max(target.version, latest.version if latest else 0) + 1
+    revision = ImportMappingProfile(
+        project_id=target.project_id,
+        name=target.name,
+        entity_type=target.entity_type,
+        configuration=target.configuration,
+        version=next_version,
+        parent_profile_id=latest.id if latest else target.id,
+        active=True,
+        created_by=current_principal().username,
+    )
+    db.add(revision)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="import_mapping_profile",
+            entity_id=revision.id,
+            action="import_mapping_profile_rolled_back",
+            actor=current_principal().username,
+            details={
+                "project_id": str(target.project_id),
+                "restored_profile_id": str(target.id),
+                "version": next_version,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(revision)
+    return revision
 
 
 async def _mapped_upload(profile_id: uuid.UUID, uploaded_file: UploadFile, db: AsyncSession):
@@ -2495,6 +2644,177 @@ async def _mapped_upload(profile_id: uuid.UUID, uploaded_file: UploadFile, db: A
     except MappedIngestionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return profile, batch, content
+
+
+def _mapped_job_path(storage_key: str) -> Path:
+    if not storage_key or Path(storage_key).name != storage_key:
+        raise HTTPException(status_code=500, detail="Import storage key is invalid")
+    root = Path(settings.mapped_import_spool_dir).resolve()
+    path = (root / storage_key).resolve()
+    if root not in path.parents:
+        raise HTTPException(status_code=500, detail="Import storage path is invalid")
+    return path
+
+
+@api_router.post(
+    "/imports/mapped/jobs",
+    response_model=MappedImportJobSummary,
+    tags=["Integrations"],
+)
+async def create_mapped_import_job(
+    profile_id: uuid.UUID = Form(...),
+    uploaded_file: UploadFile = File(..., alias="file"),
+    db: AsyncSession = Depends(get_db),
+) -> MappedImportJob:
+    require_global_role("approver", "admin")
+    profile = await db.get(ImportMappingProfile, profile_id)
+    if not profile or not profile.active:
+        raise HTTPException(status_code=404, detail="Active import mapping profile not found")
+    await _require_project_access(db, profile.project_id, {"approver", "admin"})
+    filename = Path(uploaded_file.filename or "").name[:255]
+    extension = Path(filename).suffix.lower()
+    if extension not in {".json", ".jsonl", ".ndjson", ".csv"}:
+        await uploaded_file.close()
+        raise HTTPException(status_code=422, detail="Import jobs support JSON, JSONL, NDJSON, and CSV files")
+    if profile.configuration.get("record_path"):
+        await uploaded_file.close()
+        raise HTTPException(status_code=422, detail="Streamed import jobs require top-level source records")
+    root = Path(settings.mapped_import_spool_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    storage_key = f"{uuid.uuid4().hex}{extension}"
+    final_path = _mapped_job_path(storage_key)
+    partial_path = final_path.with_suffix(final_path.suffix + ".partial")
+    digest = hashlib.sha256()
+    byte_size = 0
+    try:
+        with partial_path.open("xb") as target:
+            while chunk := await uploaded_file.read(1024 * 1024):
+                byte_size += len(chunk)
+                if byte_size > settings.mapped_job_upload_max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="The uploaded file exceeds the configured streamed-import limit",
+                    )
+                digest.update(chunk)
+                target.write(chunk)
+        partial_path.chmod(0o600)
+        partial_path.replace(final_path)
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await uploaded_file.close()
+    if byte_size == 0:
+        final_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="The uploaded file is empty")
+    sha256 = digest.hexdigest()
+    existing = (
+        await db.execute(
+            select(MappedImportJob).where(
+                MappedImportJob.project_id == profile.project_id,
+                MappedImportJob.profile_id == profile.id,
+                MappedImportJob.sha256 == sha256,
+            )
+        )
+    ).scalars().first()
+    if existing:
+        final_path.unlink(missing_ok=True)
+        return existing
+    job = MappedImportJob(
+        project_id=profile.project_id,
+        profile_id=profile.id,
+        profile_version=profile.version,
+        entity_type=profile.entity_type,
+        mapping_snapshot=profile.configuration,
+        original_filename=filename,
+        storage_key=storage_key,
+        sha256=sha256,
+        byte_size=byte_size,
+        status="queued",
+        requested_by=current_principal().username,
+    )
+    db.add(job)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="mapped_import_job",
+            entity_id=job.id,
+            action="mapped_import_job_queued",
+            actor=current_principal().username,
+            details={
+                "project_id": str(profile.project_id),
+                "profile_id": str(profile.id),
+                "profile_version": profile.version,
+                "filename": filename,
+                "sha256": sha256,
+                "byte_size": byte_size,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@api_router.get(
+    "/imports/mapped/jobs",
+    response_model=list[MappedImportJobSummary],
+    tags=["Integrations"],
+)
+async def list_mapped_import_jobs(
+    project_id: uuid.UUID,
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> list[MappedImportJob]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    return list(
+        (
+            await db.execute(
+                select(MappedImportJob)
+                .where(MappedImportJob.project_id == project_id)
+                .order_by(MappedImportJob.created_at.desc())
+                .limit(limit)
+            )
+        ).scalars().all()
+    )
+
+
+@api_router.post(
+    "/imports/mapped/jobs/{job_id}/retry",
+    response_model=MappedImportJobSummary,
+    tags=["Integrations"],
+)
+async def retry_mapped_import_job(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> MappedImportJob:
+    require_global_role("approver", "admin")
+    job = await db.get(MappedImportJob, job_id, with_for_update=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Mapped import job not found")
+    await _require_project_access(db, job.project_id, {"approver", "admin"})
+    if job.status != "failed":
+        raise HTTPException(status_code=409, detail="Only failed import jobs can be retried")
+    if not _mapped_job_path(job.storage_key).is_file():
+        raise HTTPException(status_code=409, detail="The retained import source is unavailable")
+    job.status = "queued"
+    job.last_error_type = None
+    job.locked_at = None
+    job.locked_by = None
+    db.add(
+        AuditLog(
+            entity_type="mapped_import_job",
+            entity_id=job.id,
+            action="mapped_import_job_retried",
+            actor=current_principal().username,
+            details={"checkpoint_row": job.checkpoint_row},
+        )
+    )
+    await db.commit()
+    await db.refresh(job)
+    return job
 
 
 @api_router.post(
@@ -2591,7 +2911,15 @@ async def execute_mapped_import(
         if not items:
             raise HTTPException(status_code=422, detail="No mapped test cases reference requirements in this project")
         try:
-            result = await import_historical_test_cases(db, project_id=profile.project_id, items=items, actor=actor)
+            result = await import_historical_test_cases(
+                db,
+                project_id=profile.project_id,
+                items=items,
+                actor=actor,
+                existing_record_strategy=profile.configuration.get("options", {}).get(
+                    "existing_record_strategy", "skip"
+                ),
+            )
         except HistoricalImportConflictError as exc:
             await db.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2609,6 +2937,7 @@ async def execute_mapped_import(
         return run
 
     created_count = 0
+    updated_count = 0
     existing_count = 0
     requirement_ids: list[str] = []
     for item in batch.items:
@@ -2621,7 +2950,29 @@ async def execute_mapped_import(
             )
         ).scalars().first()
         if requirement:
-            existing_count += 1
+            strategy = profile.configuration.get("options", {}).get("existing_record_strategy", "skip")
+            metadata = item.metadata
+            differs = (
+                requirement.title != item.title
+                or requirement.description != item.description
+                or (requirement.metadata_json or {}) != metadata
+            )
+            if differs and strategy == "reject":
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Requirement {item.external_id} already exists with different content",
+                )
+            if differs and strategy == "update":
+                requirement.title = item.title
+                requirement.description = item.description
+                requirement.metadata_json = metadata
+                requirement.source = "mapped_import"
+                requirement.version += 1
+                await _snapshot_requirement_and_enqueue(db, requirement)
+                updated_count += 1
+            else:
+                existing_count += 1
         else:
             requirement = Requirement(
                 project_id=profile.project_id,
@@ -2651,6 +3002,7 @@ async def execute_mapped_import(
             "source_record_count": batch.source_record_count,
             "mapped_count": len(batch.items),
             "created_count": created_count,
+            "updated_count": updated_count,
             "existing_count": existing_count,
             "requirement_ids": requirement_ids,
             "mapping_warning_count": len(batch.issues),
@@ -2664,7 +3016,13 @@ async def execute_mapped_import(
         entity_id=run.id,
         action="mapped_requirements_imported",
         actor=actor,
-        details={"project_id": str(profile.project_id), "profile_id": str(profile.id), "created_count": created_count},
+        details={
+            "project_id": str(profile.project_id),
+            "profile_id": str(profile.id),
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "existing_count": existing_count,
+        },
     ))
     await db.commit()
     await db.refresh(run)
@@ -3933,6 +4291,7 @@ async def generate_requirement_draft(
 
     try:
         generation_service = build_generation_service()
+        source_text = f"Title: {requirement.title}\nDescription: {requirement.description}"
         generation_result = await generation_service.generate(
             requirement_id=str(requirement.id),
             project_id=str(requirement.project_id) if requirement.project_id else None,
@@ -3940,6 +4299,11 @@ async def generate_requirement_draft(
             description=requirement.description,
             external_id=requirement.external_id,
             requirement_version=requirement.version,
+            keyword_contexts=await _generation_keyword_contexts(
+                db,
+                query=source_text,
+                project_id=requirement.project_id,
+            ),
         )
     except GenerationConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -3996,6 +4360,7 @@ async def generate_requirement_draft(
             actor=current_principal().username,
             details={
                 "model": generation_result.model,
+                "retrieval_mode": generation_result.retrieval_mode,
                 "scenario_count": len(generation_result.draft.scenarios),
                 "retrieved_vector_ids": [item.id for item in generation_result.retrieved_context],
             },

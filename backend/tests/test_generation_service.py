@@ -14,6 +14,7 @@ from app.services.generation import (
     PineconeVectorStore,
     RetrievedContext,
     build_generation_service,
+    rerank_generation_contexts,
 )
 
 
@@ -76,7 +77,7 @@ class FakeVectorStore:
         project_id: str | None,
     ) -> list[RetrievedContext]:
         assert values == [0.1, 0.2, 0.3]
-        assert top_k == 8
+        assert top_k == 40
         assert project_id == "project-1"
         return [
             RetrievedContext(
@@ -129,6 +130,47 @@ def test_generated_test_case_rejects_non_contiguous_steps() -> None:
                 )
             ],
         )
+
+
+def test_generation_contexts_fuse_keyword_evidence_and_collapse_chunks() -> None:
+    semantic = [
+        RetrievedContext(
+            id="test_case:1:v2",
+            score=0.80,
+            text="Reset link validation overview.",
+            metadata={
+                "entity_type": "test_case",
+                "entity_id": "case-1",
+                "parent_vector_id": "test_case:1:v2",
+            },
+        ),
+        RetrievedContext(
+            id="test_case:1:v2:chunk:1",
+            score=0.78,
+            text="Expired links are rejected and an audit event is recorded.",
+            metadata={
+                "entity_type": "test_case",
+                "entity_id": "case-1",
+                "parent_vector_id": "test_case:1:v2",
+            },
+        ),
+    ]
+    keyword = [
+        RetrievedContext(
+            id="test_case:1:v2",
+            score=0.90,
+            text="Expired links are rejected and an audit event is recorded.",
+            metadata={"entity_type": "test_case", "entity_id": "case-1"},
+        )
+    ]
+
+    results = rerank_generation_contexts("expired link audit", semantic, keyword, limit=8)
+
+    assert len(results) == 1
+    assert results[0].id == "test_case:1:v2"
+    assert results[0].metadata["retrieval_mode"] == "hybrid"
+    assert len(results[0].metadata["matched_chunk_ids"]) == 2
+    assert "audit event" in results[0].text
 
 
 def test_feedback_generation_retrieves_context_without_overwriting_requirement_vector() -> None:

@@ -6,7 +6,14 @@ import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.models import Feedback, Project, Requirement, TestCase as CaseModel, TestScenario as ScenarioModel
+from app.models import (
+    Feedback,
+    Project,
+    Requirement,
+    TestCase as CaseModel,
+    TestCaseStep as StepModel,
+    TestScenario as ScenarioModel,
+)
 from app.services.search import KeywordSearchService
 
 
@@ -65,6 +72,14 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                 )
                 db.add(test_case)
                 await db.flush()
+                db.add(
+                    StepModel(
+                        test_case_id=test_case.id,
+                        step_number=1,
+                        action="Complete the captcha challenge and submit the expired token.",
+                        expected_result="The token is rejected without changing credentials.",
+                    )
+                )
                 feedback = Feedback(
                     target_level="test_case",
                     target_id=test_case.id,
@@ -86,6 +101,24 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                 assert all(match.entity_id != str(hidden_requirement.id) for match in matches)
                 feedback_match = next(match for match in matches if match.entity_type == "feedback")
                 assert feedback_match.metadata["requirement_id"] == str(requirement.id)
+
+                step_matches = await service.search(
+                    "captcha challenge",
+                    project_id=str(project.id),
+                    entity_type="test_case",
+                    limit=10,
+                )
+                assert [match.entity_id for match in step_matches] == [str(test_case.id)]
+                assert "steps" in step_matches[0].matched_fields
+
+                scenario_matches = await service.search(
+                    "Recovery security",
+                    project_id=str(project.id),
+                    entity_type="test_case",
+                    limit=10,
+                )
+                assert [match.entity_id for match in scenario_matches] == [str(test_case.id)]
+                assert "scenario" in scenario_matches[0].matched_fields
         finally:
             if project_id or other_project_id:
                 async with session_factory() as db:
@@ -119,6 +152,7 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                             ]
                             if test_case_ids:
                                 await db.execute(delete(Feedback).where(Feedback.target_id.in_(test_case_ids)))
+                                await db.execute(delete(StepModel).where(StepModel.test_case_id.in_(test_case_ids)))
                             await db.execute(
                                 delete(CaseModel).where(CaseModel.requirement_id.in_(requirement_ids))
                             )

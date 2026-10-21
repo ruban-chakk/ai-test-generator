@@ -4,11 +4,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from sqlalchemy import and_, case, func, literal_column, or_, select
+from sqlalchemy import Text, and_, case, cast, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings, settings
-from app.models import Feedback, Requirement, TestCase, TestScenario
+from app.models import Feedback, Requirement, TestCase, TestCaseStep, TestScenario
 from app.services.generation import (
     LanguageModel,
     OpenAICompatibleLanguageModel,
@@ -50,7 +51,7 @@ class SemanticSearchService:
             top_k=min(max(limit * 4, 20), 200),
             project_id=project_id,
         )
-        matches: list[SearchMatch] = []
+        matches_by_entity: dict[tuple[str, str], SearchMatch] = {}
         for context in contexts:
             metadata = context.metadata
             current_type = str(metadata.get("entity_type") or "")
@@ -58,9 +59,9 @@ class SemanticSearchService:
             if not current_type or not current_id or (entity_type and current_type != entity_type):
                 continue
             title = str(metadata.get("title") or metadata.get("external_id") or current_type.replace("_", " ").title())
-            matches.append(
-                SearchMatch(
-                    vector_id=context.id,
+            key = (current_type, current_id)
+            candidate = SearchMatch(
+                    vector_id=str(metadata.get("parent_vector_id") or context.id),
                     entity_type=current_type,
                     entity_id=current_id,
                     title=title,
@@ -73,10 +74,11 @@ class SemanticSearchService:
                         if key not in {"text", "project_id"}
                     },
                 )
-            )
-            if len(matches) >= limit:
-                break
-        return matches
+            current = matches_by_entity.get(key)
+            if current is None or candidate.score > current.score:
+                matches_by_entity[key] = candidate
+        matches = sorted(matches_by_entity.values(), key=lambda item: (-item.score, item.entity_type, item.entity_id))
+        return matches[:limit]
 
 
 def _search_vector(*fields):
@@ -148,7 +150,13 @@ class KeywordSearchService:
         return matches[:limit]
 
     async def _requirements(self, query: str, project_id: str, limit: int) -> list[SearchMatch]:
-        vector = _search_vector(Requirement.external_id, Requirement.title, Requirement.description)
+        custom_fields = cast(Requirement.metadata_json, Text)
+        vector = _search_vector(
+            Requirement.external_id,
+            Requirement.title,
+            Requirement.description,
+            custom_fields,
+        )
         query_expression = _query_expression(query)
         rank = _rank_score(
             vector,
@@ -166,6 +174,7 @@ class KeywordSearchService:
                     _escaped_contains(Requirement.external_id, query),
                     _escaped_contains(Requirement.title, query),
                     _escaped_contains(Requirement.description, query),
+                    _escaped_contains(custom_fields, query),
                 ),
             )
             .order_by(rank.desc(), Requirement.updated_at.desc())
@@ -187,6 +196,7 @@ class KeywordSearchService:
                         "external ID": requirement.external_id,
                         "title": requirement.title,
                         "description": requirement.description,
+                        "custom fields": str((requirement.metadata_json or {}).get("custom_fields", {})),
                     },
                 ),
                 metadata={
@@ -200,6 +210,7 @@ class KeywordSearchService:
         ]
 
     async def _test_cases(self, query: str, project_id: str, limit: int) -> list[SearchMatch]:
+        custom_fields = cast(TestCase.custom_fields_json, Text)
         vector = _search_vector(
             TestCase.title,
             TestCase.description,
@@ -208,12 +219,31 @@ class KeywordSearchService:
             TestCase.severity,
             TestCase.category,
             TestCase.type,
+            TestScenario.title,
+            TestScenario.description,
+            custom_fields,
         )
         query_expression = _query_expression(query)
-        rank = _rank_score(vector, query_expression, title_field=TestCase.title, query=query).label("keyword_rank")
+        step_match = (
+            select(TestCaseStep.id)
+            .where(
+                TestCaseStep.test_case_id == TestCase.id,
+                or_(
+                    _escaped_contains(TestCaseStep.action, query),
+                    _escaped_contains(TestCaseStep.expected_result, query),
+                ),
+            )
+            .exists()
+        )
+        rank = (
+            _rank_score(vector, query_expression, title_field=TestCase.title, query=query)
+            + case((step_match, 0.75), else_=0.0)
+        ).label("keyword_rank")
         statement = (
-            select(TestCase, rank)
+            select(TestCase, TestScenario, rank)
             .join(Requirement, Requirement.id == TestCase.requirement_id)
+            .join(TestScenario, TestScenario.id == TestCase.scenario_id)
+            .options(selectinload(TestCase.steps))
             .where(
                 Requirement.project_id == project_id,
                 TestCase.status == "approved",
@@ -222,6 +252,10 @@ class KeywordSearchService:
                     _escaped_contains(TestCase.title, query),
                     _escaped_contains(TestCase.description, query),
                     _escaped_contains(TestCase.prerequisite, query),
+                    _escaped_contains(TestScenario.title, query),
+                    _escaped_contains(TestScenario.description, query),
+                    _escaped_contains(custom_fields, query),
+                    step_match,
                 ),
             )
             .order_by(rank.desc(), TestCase.updated_at.desc())
@@ -235,7 +269,18 @@ class KeywordSearchService:
                 entity_id=str(test_case.id),
                 title=test_case.title,
                 text=" ".join(
-                    part for part in [test_case.title, test_case.description, test_case.prerequisite] if part
+                    part
+                    for part in [
+                        test_case.title,
+                        test_case.description,
+                        test_case.prerequisite,
+                        scenario.title,
+                        " ".join(
+                            f"Step {step.step_number}: {step.action} Expected: {step.expected_result}"
+                            for step in sorted(test_case.steps, key=lambda item: item.step_number)
+                        ),
+                    ]
+                    if part
                 )[:1000],
                 score=_normalize_keyword_score(raw_score),
                 keyword_score=_normalize_keyword_score(raw_score),
@@ -249,6 +294,11 @@ class KeywordSearchService:
                         "severity": test_case.severity,
                         "category": test_case.category,
                         "type": test_case.type,
+                        "scenario": f"{scenario.title} {scenario.description}",
+                        "steps": " ".join(
+                            f"{step.action} {step.expected_result}" for step in test_case.steps
+                        ),
+                        "custom fields": str(test_case.custom_fields_json or {}),
                     },
                 ),
                 metadata={
@@ -263,7 +313,7 @@ class KeywordSearchService:
                     "type": test_case.type or "",
                 },
             )
-            for test_case, raw_score in rows
+            for test_case, scenario, raw_score in rows
         ]
 
     async def _feedback(self, query: str, project_id: str, limit: int) -> list[SearchMatch]:

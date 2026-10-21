@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -28,10 +28,11 @@ class HistoricalImportConflictError(ValueError):
 
 @dataclass(frozen=True)
 class HistoricalImportResult:
-    run_id: uuid.UUID
+    run_id: uuid.UUID | None
     parsed_count: int
     created_scenario_count: int
     created_test_case_count: int
+    updated_test_case_count: int
     existing_test_case_count: int
     queued_vector_count: int
 
@@ -85,6 +86,7 @@ def _case_matches(test_case: TestCase, item: ParsedHistoricalTestCase, scenario_
         and _naive_utc(test_case.approved_at) == _naive_utc(item.approved_at)
         and _existing_step_payload(test_case) == _step_payload(item)
         and (test_case.custom_fields_json or {}) == item.custom_fields
+        and (test_case.custom_field_schema_json or {}) == item.custom_field_schema
     )
 
 
@@ -94,9 +96,14 @@ async def import_historical_test_cases(
     project_id: uuid.UUID,
     items: list[ParsedHistoricalTestCase],
     actor: str,
+    existing_record_strategy: str = "reject",
+    record_run: bool = True,
+    commit: bool = True,
 ) -> HistoricalImportResult:
     if not items:
         raise ValueError("At least one historical test case is required")
+    if existing_record_strategy not in {"skip", "new_version", "reject"}:
+        raise ValueError("existing_record_strategy must be skip, new_version, or reject")
 
     requirement_external_ids = {item.requirement_external_id for item in items}
     requirements = list(
@@ -162,22 +169,28 @@ async def import_historical_test_cases(
     for item in items:
         requirement = requirement_by_external_id[item.requirement_external_id]
         scenario = scenario_by_identity.get((requirement.id, item.scenario_external_id))
-        if scenario and (
+        scenario_differs = scenario and (
             scenario.title != item.scenario_title
             or scenario.description != item.scenario_description
+        )
+        test_case = case_by_identity.get((requirement.id, item.external_id))
+        if scenario_differs and not (
+            existing_record_strategy == "new_version"
+            or (test_case and existing_record_strategy == "skip")
         ):
             raise HistoricalImportConflictError(
                 f"Scenario {item.scenario_external_id} already exists with different content"
             )
-        test_case = case_by_identity.get((requirement.id, item.external_id))
         if test_case:
-            if scenario is None or not _case_matches(test_case, item, scenario.id):
+            matches = scenario is not None and _case_matches(test_case, item, scenario.id)
+            if not matches and existing_record_strategy == "reject":
                 raise HistoricalImportConflictError(
                     f"Test case {item.external_id} already exists with different content"
                 )
 
     created_scenario_count = 0
     created_test_case_count = 0
+    updated_test_case_count = 0
     existing_test_case_count = 0
     queued_vector_count = 0
     for item in items:
@@ -197,10 +210,99 @@ async def import_historical_test_cases(
             await db.flush()
             scenario_by_identity[scenario_identity] = scenario
             created_scenario_count += 1
+        elif (
+            existing_record_strategy == "new_version"
+            and (scenario.title != item.scenario_title or scenario.description != item.scenario_description)
+        ):
+            scenario.title = item.scenario_title
+            scenario.description = item.scenario_description
+            scenario.status = "approved"
+            scenario.version += 1
 
         identity = (requirement.id, item.external_id)
-        if identity in case_by_identity:
+        existing_case = case_by_identity.get(identity)
+        if existing_case and _case_matches(existing_case, item, scenario.id):
             existing_test_case_count += 1
+            continue
+        if existing_case and existing_record_strategy == "skip":
+            existing_test_case_count += 1
+            continue
+        if existing_case and existing_record_strategy == "new_version":
+            next_version = max(item.version, existing_case.version + 1)
+            vector_id = f"test_case:{existing_case.id}:v{next_version}"
+            existing_case.scenario_id = scenario.id
+            existing_case.title = item.title
+            existing_case.description = item.description
+            existing_case.prerequisite = item.prerequisite
+            existing_case.priority = item.priority
+            existing_case.severity = item.severity
+            existing_case.category = item.category
+            existing_case.type = item.test_type
+            existing_case.status = item.status
+            existing_case.version = next_version
+            existing_case.approved_at = item.approved_at
+            existing_case.locked = True
+            existing_case.repository_status = "pending_index"
+            existing_case.repository_synced_at = None
+            existing_case.vector_id = vector_id
+            existing_case.custom_fields_json = item.custom_fields
+            existing_case.custom_field_schema_json = item.custom_field_schema
+            await db.execute(delete(TestCaseStep).where(TestCaseStep.test_case_id == existing_case.id))
+            for step in item.steps:
+                db.add(
+                    TestCaseStep(
+                        test_case_id=existing_case.id,
+                        step_number=step.step_number,
+                        action=step.action,
+                        expected_result=step.expected_result,
+                    )
+                )
+            version = TestCaseVersion(
+                test_case_id=existing_case.id,
+                requirement_id=requirement.id,
+                scenario_id=scenario.id,
+                version=next_version,
+                external_id=item.external_id,
+                source="historical_import",
+                title=item.title,
+                description=item.description,
+                prerequisite=item.prerequisite,
+                priority=item.priority,
+                severity=item.severity,
+                category=item.category,
+                type=item.test_type,
+                status=item.status,
+                approved_by=item.source_approved_by or actor,
+                approved_at=item.approved_at,
+                notes=f"Updated by {actor} from {item.upload_filename}",
+                steps_snapshot=_step_payload(item),
+                vector_id=vector_id,
+                custom_fields_json=item.custom_fields,
+                custom_field_schema_json=item.custom_field_schema,
+            )
+            db.add(version)
+            await db.flush()
+            db.add(
+                ApprovalRecord(
+                    target_level="test_case",
+                    target_id=existing_case.id,
+                    approved_by=actor,
+                    approved_at=_utcnow(),
+                    version=next_version,
+                    status=item.status,
+                    notes=f"Historical update from {item.upload_filename}",
+                )
+            )
+            enqueue_index_event(
+                db,
+                event_key=f"test_case_version.index:{version.id}",
+                event_type=TEST_CASE_VERSION_INDEX_REQUESTED,
+                aggregate_type="test_case_version",
+                aggregate_id=version.id,
+                payload={"test_case_id": str(existing_case.id), "version": next_version},
+            )
+            updated_test_case_count += 1
+            queued_vector_count += 1
             continue
 
         test_case_id = uuid.uuid4()
@@ -225,6 +327,7 @@ async def import_historical_test_cases(
             repository_status="pending_index",
             vector_id=vector_id,
             custom_fields_json=item.custom_fields,
+            custom_field_schema_json=item.custom_field_schema,
         )
         db.add(test_case)
         await db.flush()
@@ -258,6 +361,7 @@ async def import_historical_test_cases(
             steps_snapshot=_step_payload(item),
             vector_id=vector_id,
             custom_fields_json=item.custom_fields,
+            custom_field_schema_json=item.custom_field_schema,
         )
         db.add(version)
         await db.flush()
@@ -287,49 +391,58 @@ async def import_historical_test_cases(
         created_test_case_count += 1
         queued_vector_count += 1
 
-    now = _utcnow()
-    first = items[0]
-    run = IntegrationRun(
-        integration_type="historical_test_case_import",
-        status="completed",
-        requested_by=actor,
-        parameters={
-            "project_id": str(project_id),
-            "filename": first.upload_filename,
-            "sha256": first.upload_sha256,
-        },
-        result={
-            "parsed_count": len(items),
-            "created_scenario_count": created_scenario_count,
-            "created_test_case_count": created_test_case_count,
-            "existing_test_case_count": existing_test_case_count,
-            "queued_vector_count": queued_vector_count,
-        },
-        completed_at=now,
-    )
-    db.add(run)
-    await db.flush()
-    db.add(
-        AuditLog(
-            entity_type="integration",
-            entity_id=run.id,
-            action="historical_test_cases_imported",
-            actor=actor,
-            details={
+    run_id: uuid.UUID | None = None
+    if record_run:
+        now = _utcnow()
+        first = items[0]
+        run = IntegrationRun(
+            integration_type="historical_test_case_import",
+            status="completed",
+            requested_by=actor,
+            parameters={
                 "project_id": str(project_id),
+                "filename": first.upload_filename,
                 "sha256": first.upload_sha256,
+            },
+            result={
+                "parsed_count": len(items),
+                "created_scenario_count": created_scenario_count,
                 "created_test_case_count": created_test_case_count,
+                "updated_test_case_count": updated_test_case_count,
                 "existing_test_case_count": existing_test_case_count,
                 "queued_vector_count": queued_vector_count,
             },
+            completed_at=now,
         )
-    )
-    await db.commit()
+        db.add(run)
+        await db.flush()
+        run_id = run.id
+        db.add(
+            AuditLog(
+                entity_type="integration",
+                entity_id=run.id,
+                action="historical_test_cases_imported",
+                actor=actor,
+                details={
+                    "project_id": str(project_id),
+                    "sha256": first.upload_sha256,
+                    "created_test_case_count": created_test_case_count,
+                    "updated_test_case_count": updated_test_case_count,
+                    "existing_test_case_count": existing_test_case_count,
+                    "queued_vector_count": queued_vector_count,
+                },
+            )
+        )
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
     return HistoricalImportResult(
-        run_id=run.id,
+        run_id=run_id,
         parsed_count=len(items),
         created_scenario_count=created_scenario_count,
         created_test_case_count=created_test_case_count,
+        updated_test_case_count=updated_test_case_count,
         existing_test_case_count=existing_test_case_count,
         queued_vector_count=queued_vector_count,
     )

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import uuid
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -20,11 +21,12 @@ from app.models import (
     TestCaseVersion,
     TestExecutionRun,
     TestScenario,
+    VectorChunk,
 )
 from app.services.alerts import ALERT_DELIVERY_REQUESTED, AlertWebhookClient, create_alert
 from app.services.execution import ExecutableTestCase, ExecutionResult, TestExecutionClient
 from app.services.integrations import RepositoryClient, RepositoryTestCase, build_test_repository_client
-from app.services.indexing import IndexableArtifact, IndexingService, build_indexing_service
+from app.services.indexing import IndexableArtifact, IndexingResult, IndexingService, build_indexing_service
 
 
 TEST_CASE_INDEX_REQUESTED = "test_case.index_requested"
@@ -40,11 +42,33 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _text_with_custom_fields(text: str, custom_fields: dict) -> str:
-    if not custom_fields:
+def _text_with_custom_fields(text: str, custom_fields: dict, schema: dict | None = None) -> str:
+    schema = schema or {}
+    indexed_fields = {
+        key: value
+        for key, value in custom_fields.items()
+        if not isinstance(schema.get(key), dict)
+        or (
+            schema[key].get("index", True) is not False
+            and int(schema[key].get("semantic_weight", 1)) > 0
+        )
+    }
+    if not indexed_fields:
         return text
-    rendered = json.dumps(custom_fields, ensure_ascii=False, sort_keys=True, default=str)
+    rendered = json.dumps(indexed_fields, ensure_ascii=False, sort_keys=True, default=str)
     return f"{text}\nCustom fields: {rendered[:8000]}"
+
+
+def _custom_field_segments(custom_fields: dict, schema: dict | None = None) -> tuple[str, ...]:
+    segments: list[str] = []
+    schema = schema or {}
+    for key, value in sorted(custom_fields.items()):
+        policy = schema.get(key, {}) if isinstance(schema.get(key, {}), dict) else {}
+        if policy.get("index", True) is False or int(policy.get("semantic_weight", 1)) == 0:
+            continue
+        segment = f"Custom field {key}: {json.dumps(value, ensure_ascii=False, default=str)}"
+        segments.extend([segment] * min(3, max(1, int(policy.get("semantic_weight", 1)))))
+    return tuple(segments)
 
 
 def enqueue_outbox_event(
@@ -141,6 +165,8 @@ class OutboxProcessor:
 
     async def _process_claimed_event(self, event_id: uuid.UUID) -> None:
         execution_result: ExecutionResult | None = None
+        indexing_result: IndexingResult | None = None
+        indexed_artifact: IndexableArtifact | None = None
         try:
             async with self._session_factory() as db:
                 event = await db.get(OutboxEvent, event_id)
@@ -165,7 +191,8 @@ class OutboxProcessor:
             if operation[0] == "index":
                 if self._indexing_service is None:
                     self._indexing_service = build_indexing_service(self._config)
-                await self._indexing_service.index(operation[1])
+                indexed_artifact = operation[1]
+                indexing_result = await self._indexing_service.index(indexed_artifact)
             elif operation[0] == "repository":
                 if self._repository_client is None:
                     self._repository_client = build_test_repository_client(self._config)
@@ -203,6 +230,8 @@ class OutboxProcessor:
             event.locked_at = None
             event.locked_by = None
             event.last_error = None
+            if indexing_result is not None and indexed_artifact is not None:
+                await self._replace_vector_chunk_inventory(db, event, indexed_artifact, indexing_result)
             if event.event_type == REQUIREMENT_INDEX_REQUESTED:
                 requirement = await db.get(Requirement, event.aggregate_id)
                 if requirement:
@@ -235,6 +264,36 @@ class OutboxProcessor:
             elif event.event_type == ALERT_DELIVERY_REQUESTED:
                 await self._complete_alert_delivery(db, event)
             await db.commit()
+
+    async def _replace_vector_chunk_inventory(
+        self,
+        db: AsyncSession,
+        event: OutboxEvent,
+        artifact: IndexableArtifact,
+        result: IndexingResult,
+    ) -> None:
+        await db.execute(
+            delete(VectorChunk).where(
+                VectorChunk.aggregate_type == event.aggregate_type,
+                VectorChunk.aggregate_id == event.aggregate_id,
+            )
+        )
+        now = _utcnow()
+        for chunk in result.chunks:
+            db.add(
+                VectorChunk(
+                    project_id=uuid.UUID(artifact.project_id),
+                    aggregate_type=event.aggregate_type,
+                    aggregate_id=event.aggregate_id,
+                    entity_type=artifact.entity_type,
+                    entity_id=uuid.UUID(artifact.entity_id),
+                    vector_id=chunk.vector_id,
+                    chunk_index=chunk.chunk_index,
+                    chunk_count=chunk.chunk_count,
+                    content_sha256=chunk.content_sha256,
+                    indexed_at=now,
+                )
+            )
 
     async def _record_failure(self, event_id: uuid.UUID, error_type: str) -> None:
         async with self._session_factory() as db:
@@ -298,14 +357,22 @@ class OutboxProcessor:
             requirement = await db.get(Requirement, event.aggregate_id)
             if not requirement or not requirement.project_id:
                 raise LookupError("requirement project is unavailable")
-            return IndexableArtifact(
+            custom_fields = (requirement.metadata_json or {}).get("custom_fields", {})
+            custom_schema = (requirement.metadata_json or {}).get("custom_field_schema", {})
+            return await self._tracked_artifact(db, event, IndexableArtifact(
                 vector_id=requirement.vector_id or f"requirement:{requirement.id}",
                 entity_type="requirement",
                 entity_id=str(requirement.id),
                 project_id=str(requirement.project_id),
                 text=_text_with_custom_fields(
                     f"Title: {requirement.title}\nDescription: {requirement.description}",
-                    (requirement.metadata_json or {}).get("custom_fields", {}),
+                    custom_fields,
+                    custom_schema,
+                ),
+                logical_segments=(
+                    f"Requirement: {requirement.external_id or requirement.id} — {requirement.title}",
+                    f"Description: {requirement.description}",
+                    *_custom_field_segments(custom_fields, custom_schema),
                 ),
                 metadata={
                     "requirement_id": str(requirement.id),
@@ -313,20 +380,28 @@ class OutboxProcessor:
                     "source": requirement.source,
                     "status": requirement.status,
                 },
-            )
+            ))
 
         if event.event_type == REQUIREMENT_VERSION_INDEX_REQUESTED:
             version = await db.get(RequirementVersion, event.aggregate_id)
             if not version or not version.project_id:
                 raise LookupError("requirement version project is unavailable")
-            return IndexableArtifact(
+            custom_fields = (version.metadata_json or {}).get("custom_fields", {})
+            custom_schema = (version.metadata_json or {}).get("custom_field_schema", {})
+            return await self._tracked_artifact(db, event, IndexableArtifact(
                 vector_id=version.vector_id or f"requirement:{version.requirement_id}:v{version.version}",
                 entity_type="requirement",
                 entity_id=str(version.requirement_id),
                 project_id=str(version.project_id),
                 text=_text_with_custom_fields(
                     f"Title: {version.title}\nDescription: {version.description}",
-                    (version.metadata_json or {}).get("custom_fields", {}),
+                    custom_fields,
+                    custom_schema,
+                ),
+                logical_segments=(
+                    f"Requirement: {version.external_id or version.requirement_id} — {version.title}",
+                    f"Description: {version.description}",
+                    *_custom_field_segments(custom_fields, custom_schema),
                 ),
                 metadata={
                     "requirement_version_id": str(version.id),
@@ -339,7 +414,7 @@ class OutboxProcessor:
                     "created_at": version.created_at.isoformat(),
                     "immutable_version": True,
                 },
-            )
+            ))
 
         if event.event_type == TEST_CASE_INDEX_REQUESTED:
             result = await db.execute(
@@ -367,13 +442,30 @@ class OutboxProcessor:
                 ]
                 if part
             )
-            text = _text_with_custom_fields(text, test_case.custom_fields_json or {})
-            return IndexableArtifact(
+            text = _text_with_custom_fields(
+                text,
+                test_case.custom_fields_json or {},
+                test_case.custom_field_schema_json or {},
+            )
+            identity = f"Test case: {test_case.external_id or test_case.id} — {test_case.title}"
+            return await self._tracked_artifact(db, event, IndexableArtifact(
                 vector_id=test_case.vector_id or f"test_case:{test_case.id}:v{test_case.version}",
                 entity_type="test_case",
                 entity_id=str(test_case.id),
                 project_id=str(requirement.project_id),
                 text=text,
+                logical_segments=(
+                    identity,
+                    f"Description: {test_case.description}",
+                    *((f"Prerequisite: {test_case.prerequisite}",) if test_case.prerequisite else ()),
+                    *tuple(
+                        f"Step {step.step_number}: {step.action}\nExpected: {step.expected_result}"
+                        for step in sorted(test_case.steps, key=lambda item: item.step_number)
+                    ),
+                    *_custom_field_segments(
+                        test_case.custom_fields_json or {}, test_case.custom_field_schema_json or {}
+                    ),
+                ),
                 metadata={
                     "requirement_id": str(test_case.requirement_id),
                     "scenario_id": str(test_case.scenario_id),
@@ -386,7 +478,7 @@ class OutboxProcessor:
                     "category": test_case.category or "",
                     "type": test_case.type or "",
                 },
-            )
+            ))
 
         if event.event_type == TEST_CASE_VERSION_INDEX_REQUESTED:
             version = await db.get(TestCaseVersion, event.aggregate_id)
@@ -413,13 +505,34 @@ class OutboxProcessor:
                 ]
                 if part
             )
-            text = _text_with_custom_fields(text, version.custom_fields_json or {})
-            return IndexableArtifact(
+            text = _text_with_custom_fields(
+                text,
+                version.custom_fields_json or {},
+                version.custom_field_schema_json or {},
+            )
+            identity = f"Test case: {version.external_id or version.test_case_id} — {version.title}"
+            return await self._tracked_artifact(db, event, IndexableArtifact(
                 vector_id=version.vector_id or f"test_case:{version.test_case_id}:v{version.version}",
                 entity_type="test_case",
                 entity_id=str(version.test_case_id),
                 project_id=str(requirement.project_id),
                 text=text,
+                logical_segments=(
+                    identity,
+                    f"Description: {version.description}",
+                    *((f"Prerequisite: {version.prerequisite}",) if version.prerequisite else ()),
+                    *tuple(
+                        f"Step {step.get('step_number')}: {step.get('action', '')}\n"
+                        f"Expected: {step.get('expected_result', '')}"
+                        for step in sorted(
+                            version.steps_snapshot or [],
+                            key=lambda item: int(item.get("step_number", 0)),
+                        )
+                    ),
+                    *_custom_field_segments(
+                        version.custom_fields_json or {}, version.custom_field_schema_json or {}
+                    ),
+                ),
                 metadata={
                     "test_case_version_id": str(version.id),
                     "requirement_id": str(version.requirement_id),
@@ -437,7 +550,7 @@ class OutboxProcessor:
                     "approved_at": version.approved_at.isoformat(),
                     "immutable_version": True,
                 },
-            )
+            ))
 
         if event.event_type == FEEDBACK_INDEX_REQUESTED:
             feedback = await db.get(Feedback, event.aggregate_id)
@@ -446,21 +559,43 @@ class OutboxProcessor:
             requirement = await self._feedback_requirement(db, feedback)
             if not requirement.project_id:
                 raise LookupError("feedback project is unavailable")
-            return IndexableArtifact(
+            return await self._tracked_artifact(db, event, IndexableArtifact(
                 vector_id=feedback.vector_id or f"feedback:{feedback.id}",
                 entity_type="feedback",
                 entity_id=str(feedback.id),
                 project_id=str(requirement.project_id),
                 text=feedback.comment,
+                logical_segments=(
+                    f"{feedback.feedback_type.replace('_', ' ').title()} feedback",
+                    feedback.comment,
+                ),
                 metadata={
                     "target_level": feedback.target_level,
                     "target_id": str(feedback.target_id),
                     "feedback_type": feedback.feedback_type,
                     "status": feedback.status,
                 },
-            )
+            ))
 
         raise ValueError("unsupported outbox event type")
+
+    async def _tracked_artifact(
+        self,
+        db: AsyncSession,
+        event: OutboxEvent,
+        artifact: IndexableArtifact,
+    ) -> IndexableArtifact:
+        existing = tuple(
+            (
+                await db.execute(
+                    select(VectorChunk.vector_id).where(
+                        VectorChunk.aggregate_type == event.aggregate_type,
+                        VectorChunk.aggregate_id == event.aggregate_id,
+                    )
+                )
+            ).scalars().all()
+        )
+        return replace(artifact, existing_vector_ids=existing)
 
     async def _load_repository_delivery(
         self,
