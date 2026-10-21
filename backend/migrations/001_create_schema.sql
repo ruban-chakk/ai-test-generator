@@ -3,8 +3,18 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
+CREATE TABLE IF NOT EXISTS projects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name varchar NOT NULL UNIQUE,
+  description text,
+  status varchar NOT NULL DEFAULT 'active',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS requirements (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
   external_id varchar,
   title text NOT NULL,
   description text NOT NULL,
@@ -16,8 +26,13 @@ CREATE TABLE IF NOT EXISTS requirements (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE requirements ADD COLUMN IF NOT EXISTS project_id uuid REFERENCES projects(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_requirements_project_id ON requirements(project_id);
 CREATE INDEX IF NOT EXISTS idx_requirements_status ON requirements(status);
 CREATE INDEX IF NOT EXISTS idx_requirements_external_id ON requirements(external_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_requirements_project_external_id
+  ON requirements(project_id, external_id)
+  WHERE external_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_requirements_title_trgm ON requirements USING gin (title gin_trgm_ops);
 
 CREATE TABLE IF NOT EXISTS test_scenarios (
@@ -143,6 +158,10 @@ CREATE TABLE IF NOT EXISTS revision_records (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_revision_records_feedback_resolution
+  ON revision_records(feedback_id)
+  WHERE feedback_id IS NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_revision_records_target ON revision_records(target_level, target_id);
 CREATE INDEX IF NOT EXISTS idx_revision_records_feedback_id ON revision_records(feedback_id);
 
@@ -245,6 +264,27 @@ CREATE TABLE IF NOT EXISTS governance_policies (
 
 CREATE INDEX IF NOT EXISTS idx_governance_policies_status ON governance_policies(status);
 
+CREATE TABLE IF NOT EXISTS test_execution_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  test_case_id uuid NOT NULL REFERENCES test_cases(id) ON DELETE CASCADE,
+  test_case_version integer NOT NULL,
+  environment varchar NOT NULL DEFAULT 'default',
+  runner varchar NOT NULL DEFAULT 'generic',
+  status varchar NOT NULL DEFAULT 'queued',
+  idempotency_key varchar NOT NULL UNIQUE,
+  external_run_id varchar,
+  result jsonb NOT NULL DEFAULT '{}'::jsonb,
+  requested_by varchar NOT NULL,
+  started_at timestamptz,
+  completed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_execution_runs_project ON test_execution_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_test_execution_runs_test_case ON test_execution_runs(test_case_id);
+CREATE INDEX IF NOT EXISTS idx_test_execution_runs_status ON test_execution_runs(status);
+
 CREATE TABLE IF NOT EXISTS approval_records (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   target_level varchar NOT NULL,
@@ -263,9 +303,28 @@ CREATE TABLE IF NOT EXISTS users (
   username varchar NOT NULL UNIQUE,
   email varchar NOT NULL UNIQUE,
   role varchar NOT NULL,
+  password_hash varchar NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  token_version integer NOT NULL DEFAULT 1,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash varchar;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version integer NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS project_memberships (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role varchar NOT NULL DEFAULT 'reviewer',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT uq_project_membership UNIQUE (project_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_memberships_project ON project_memberships(project_id);
+CREATE INDEX IF NOT EXISTS idx_project_memberships_user ON project_memberships(user_id);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -279,6 +338,27 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
 
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_key varchar NOT NULL UNIQUE,
+  event_type varchar NOT NULL,
+  aggregate_type varchar NOT NULL,
+  aggregate_id uuid NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status varchar NOT NULL DEFAULT 'pending',
+  attempts integer NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT now(),
+  locked_at timestamptz,
+  locked_by varchar,
+  processed_at timestamptz,
+  last_error varchar,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_events_status_available ON outbox_events(status, available_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_events_type ON outbox_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_outbox_events_aggregate ON outbox_events(aggregate_type, aggregate_id);
+
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS trigger AS $$
 BEGIN
@@ -287,21 +367,25 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trg_requirements_updated_at ON requirements;
 CREATE TRIGGER trg_requirements_updated_at
 BEFORE UPDATE ON requirements
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS trg_test_scenarios_updated_at ON test_scenarios;
 CREATE TRIGGER trg_test_scenarios_updated_at
 BEFORE UPDATE ON test_scenarios
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS trg_test_cases_updated_at ON test_cases;
 CREATE TRIGGER trg_test_cases_updated_at
 BEFORE UPDATE ON test_cases
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS trg_test_case_steps_updated_at ON test_case_steps;
 CREATE TRIGGER trg_test_case_steps_updated_at
 BEFORE UPDATE ON test_case_steps
 FOR EACH ROW

@@ -2,6 +2,15 @@
 
 An enterprise-grade full-stack solution for generating and managing test cases from requirement documents using RAG and LLMs.
 
+## Implementation status
+
+The end-to-end review workflow is implemented: database-backed authentication and project RBAC, manual/Jira/file
+ingestion, OpenAI-compatible RAG generation, Pinecone indexing and semantic search, approval/versioning,
+feedback-driven revision, impact analysis, audit history, and durable repository delivery. Repository delivery
+supports a generic idempotent HTTP contract, Xray Cloud, and TestRail. Generic OIDC login, dependency probes,
+outbox recovery controls, durable automated execution through a configured runner, component tests, and mocked
+browser critical-path tests are also included. External features fail closed when their credentials are absent.
+
 ## Goal
 
 Create an enterprise-ready system that:
@@ -31,8 +40,8 @@ Create an enterprise-ready system that:
 
 ## Next steps
 
-1. Review the design documents
-2. Choose backend and vector DB implementations
-3. Build data model and API contract
-4. Implement the UI review/approval flows
-5. Add feedback and impact analysis services
+1. Calibrate semantic impact thresholds against labeled enterprise examples.
+2. Expand browser coverage beyond the operations/import critical path.
+3. Add Zephyr Cloud after validating a tenant-specific public API contract.
+4. Add alert routing, rate limits, load tests, and disaster-recovery exercises.
+5. Validate OIDC, Xray, and TestRail against the target enterprise tenants before production rollout.

@@ -1,14 +1,17 @@
 import uuid
 import re
+import hashlib
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db import get_db
+from app.core.config import settings
+from app.core.security import current_principal, require_global_role
 from app.models import (
     ApprovalRecord,
     AuditLog,
@@ -18,6 +21,9 @@ from app.models import (
     ImpactAnalysis,
     IntegrationRun,
     OperationalMetric,
+    OutboxEvent,
+    Project,
+    ProjectMembership,
     QualityEvaluation,
     Requirement,
     RepositorySyncRun,
@@ -25,7 +31,9 @@ from app.models import (
     TestCase,
     TestCaseStep as TestCaseStepModel,
     TestCaseVersion,
+    TestExecutionRun,
     TestScenario,
+    User,
 )
 from app.schemas import (
     ApprovalAction,
@@ -46,9 +54,17 @@ from app.schemas import (
     IntegrationRunSummary,
     JiraImportRequest,
     MonitoringSummary,
+    DependencyHealthSummary,
+    DependencyStatusSummary,
+    OutboxEventSummary,
+    ProjectCreate,
+    ProjectMembershipSummary,
+    ProjectMembershipUpsert,
+    ProjectSummary,
     QualityEvaluationSummary,
     RepositorySyncRequest,
     RepositorySyncRunSummary,
+    SemanticSearchResult,
     RequirementCreate,
     RequirementDetail,
     RevisionRecordSummary,
@@ -57,11 +73,36 @@ from app.schemas import (
     TestCaseStepCreate,
     TestCaseSummary,
     TestCaseVersionSummary,
+    TestExecutionRequest,
+    TestExecutionRunSummary,
     TestScenarioCreate,
     TestScenarioSummary,
     ValidationIssue,
     ValidationResult,
 )
+from app.services.generation import (
+    GenerationConfigurationError,
+    GenerationProviderError,
+    build_generation_service,
+)
+from app.services.outbox import (
+    FEEDBACK_INDEX_REQUESTED,
+    REQUIREMENT_INDEX_REQUESTED,
+    TEST_CASE_INDEX_REQUESTED,
+    TEST_CASE_REPOSITORY_SYNC_REQUESTED,
+    TEST_CASE_EXECUTION_REQUESTED,
+    enqueue_outbox_event,
+    enqueue_index_event,
+)
+from app.services.impact import build_semantic_impact_service
+from app.services.integrations import (
+    IntegrationConfigurationError,
+    IntegrationProviderError,
+    JiraCloudClient,
+)
+from app.services.file_ingestion import FileIngestionError, parse_requirement_file
+from app.services.health import probe_external_dependencies
+from app.services.search import build_semantic_search_service
 
 api_router = APIRouter()
 
@@ -87,15 +128,91 @@ DEPRECATION_KEYWORDS = {
 ALLOWED_ROLES = {"reviewer", "approver", "admin", "system"}
 
 
+async def _require_project_access(
+    db: AsyncSession,
+    project_id: uuid.UUID | None,
+    allowed_roles: set[str] | None = None,
+) -> None:
+    principal = current_principal()
+    if principal.role == "admin":
+        return
+    if project_id is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    result = await db.execute(
+        select(ProjectMembership).where(
+            ProjectMembership.project_id == project_id,
+            ProjectMembership.user_id == principal.user_id,
+        )
+    )
+    membership = result.scalars().first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    if allowed_roles and membership.role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Insufficient project role for this action")
+
+
+async def _require_requirement_access(
+    db: AsyncSession,
+    requirement_id: uuid.UUID,
+    allowed_roles: set[str] | None = None,
+) -> None:
+    result = await db.execute(select(Requirement.project_id).where(Requirement.id == requirement_id))
+    project_id = result.scalar_one_or_none()
+    if project_id is None:
+        principal = current_principal()
+        exists = await db.execute(select(Requirement.id).where(Requirement.id == requirement_id))
+        if principal.role != "admin" or exists.scalar_one_or_none() is None:
+            raise HTTPException(status_code=404, detail="Requirement not found")
+        return
+    await _require_project_access(db, project_id, allowed_roles)
+
+
+async def _require_target_access(
+    db: AsyncSession,
+    target_level: str,
+    target_id: uuid.UUID,
+    allowed_roles: set[str] | None = None,
+) -> None:
+    if target_level == "requirement":
+        requirement_id = target_id
+    elif target_level == "scenario":
+        result = await db.execute(
+            select(TestScenario.requirement_id).where(TestScenario.id == target_id)
+        )
+        requirement_id = result.scalar_one_or_none()
+    elif target_level == "test_case":
+        result = await db.execute(select(TestCase.requirement_id).where(TestCase.id == target_id))
+        requirement_id = result.scalar_one_or_none()
+    else:
+        raise HTTPException(status_code=422, detail="Unsupported target level")
+    if requirement_id is None:
+        raise HTTPException(status_code=404, detail="Target not found")
+    await _require_requirement_access(db, requirement_id, allowed_roles)
+
+
+async def _ensure_project(db: AsyncSession, project_id: uuid.UUID | None) -> Project | None:
+    principal = current_principal()
+    if project_id is None:
+        if principal.role != "admin":
+            raise HTTPException(status_code=422, detail="A project is required")
+        return None
+
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalars().first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if principal.role != "admin":
+        await _require_project_access(db, project_id)
+    return project
+
+
 def _actor(payload: ApprovalAction) -> str:
-    return payload.approved_by or "system"
+    return current_principal().username
 
 
 def _require_role(actor: str, allowed_roles: set[str] | None = None) -> None:
-    role = actor.lower().strip() if actor else "system"
     allowed = allowed_roles or ALLOWED_ROLES
-    if role not in allowed and role != "system":
-        raise HTTPException(status_code=403, detail="Actor role is not allowed for this governance action")
+    require_global_role(*sorted(role for role in allowed if role != "system"))
 
 
 def _clean_requirement_text(text: str) -> tuple[str, list[dict]]:
@@ -158,7 +275,7 @@ def _validate_test_case_content(test_case: TestCase) -> list[ValidationIssue]:
 def _quality_from_issues(issues: list[ValidationIssue]) -> tuple[int, str, list[dict]]:
     score = max(0, 100 - (len(issues) * 15))
     status = "passed" if score >= 85 else "needs_review" if score >= 60 else "failed"
-    return score, status, [issue.dict() for issue in issues]
+    return score, status, [issue.model_dump() for issue in issues]
 
 
 def _tokens(text: str) -> set[str]:
@@ -186,53 +303,26 @@ def _tokens(text: str) -> set[str]:
     }
 
 
-def _similarity(left: str, right: str) -> float:
-    left_tokens = _tokens(left)
-    right_tokens = _tokens(right)
-    if not left_tokens or not right_tokens:
-        return 0.0
-    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-
-
-def _case_text(test_case: TestCase) -> str:
-    step_text = " ".join(
-        f"{step.action} {step.expected_result}" for step in sorted(test_case.steps or [], key=lambda item: item.step_number)
-    )
-    return " ".join(
-        value or ""
-        for value in [
-            test_case.title,
-            test_case.description,
-            test_case.prerequisite,
-            test_case.priority,
-            test_case.severity,
-            test_case.category,
-            test_case.type,
-            step_text,
-        ]
-    )
-
-
-def _candidate(
-    test_case: TestCase,
+def _semantic_candidate(
+    metadata: dict,
     similarity: float,
     action: str,
     reason: str,
 ) -> ImpactCandidate:
     return ImpactCandidate(
-        test_case_id=test_case.id,
-        requirement_id=test_case.requirement_id,
-        scenario_id=test_case.scenario_id,
-        title=test_case.title,
-        status=test_case.status,
-        repository_status=test_case.repository_status,
+        test_case_id=uuid.UUID(metadata["entity_id"]),
+        requirement_id=uuid.UUID(metadata["requirement_id"]),
+        scenario_id=uuid.UUID(metadata["scenario_id"]),
+        title=metadata.get("title") or "Indexed test case",
+        status=metadata.get("status") or "approved",
+        repository_status="indexed",
         similarity=round(similarity, 3),
         recommended_action=action,
         reason=reason,
-        priority=test_case.priority,
-        severity=test_case.severity,
-        category=test_case.category,
-        type=test_case.type,
+        priority=metadata.get("priority") or None,
+        severity=metadata.get("severity") or None,
+        category=metadata.get("category") or None,
+        type=metadata.get("type") or None,
     )
 
 
@@ -240,56 +330,63 @@ async def _run_impact_analysis(
     db: AsyncSession,
     source_text: str,
     requirement_id: uuid.UUID | None,
+    project_id: uuid.UUID,
     created_by: str = "system",
     context_ids: list[uuid.UUID] | None = None,
 ) -> ImpactAnalysisSummary:
-    stmt = (
-        select(TestCase)
-        .where(TestCase.repository_status == "active")
-        .options(selectinload(TestCase.steps))
-        .order_by(TestCase.repository_synced_at.desc())
-    )
-    if context_ids:
-        stmt = stmt.where(TestCase.requirement_id.in_(context_ids))
+    try:
+        semantic_service = build_semantic_impact_service()
+        matches = await semantic_service.search(source_text, project_id=str(project_id))
+    except GenerationConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GenerationProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    result = await db.execute(stmt)
-    approved_cases = result.scalars().all()
+    allowed_requirement_ids = {str(item) for item in context_ids or []}
+    if allowed_requirement_ids:
+        matches = [
+            match
+            for match in matches
+            if str(match.metadata.get("requirement_id")) in allowed_requirement_ids
+        ]
     duplicates: list[ImpactCandidate] = []
     deprecations: list[ImpactCandidate] = []
     updates: list[ImpactCandidate] = []
     source_tokens = _tokens(source_text)
 
-    for test_case in approved_cases:
-        score = _similarity(source_text, _case_text(test_case))
-        case_tokens = _tokens(_case_text(test_case))
+    for match in matches:
+        score = match.score
         keyword_overlap = source_tokens & DEPRECATION_KEYWORDS
-        if score >= DUPLICATE_THRESHOLD:
-            duplicates.append(
-                _candidate(
-                    test_case,
-                    score,
-                    "archive_duplicate",
-                    "Similarity is at or above the 80% duplicate threshold.",
+        try:
+            if score >= DUPLICATE_THRESHOLD:
+                duplicates.append(
+                    _semantic_candidate(
+                        match.metadata,
+                        score,
+                        "archive_duplicate",
+                        "Semantic similarity is at or above the 80% duplicate threshold.",
+                    )
                 )
-            )
-        elif keyword_overlap and score >= 0.25:
-            deprecations.append(
-                _candidate(
-                    test_case,
-                    score,
-                    "mark_deprecated",
-                    "Requirement language indicates replacement or retirement of overlapping approved coverage.",
+            elif keyword_overlap and score >= 0.25:
+                deprecations.append(
+                    _semantic_candidate(
+                        match.metadata,
+                        score,
+                        "mark_deprecated",
+                        "Requirement language indicates replacement or retirement of semantically overlapping coverage.",
+                    )
                 )
-            )
-        elif score >= UPDATE_THRESHOLD or (source_tokens & case_tokens and test_case.severity in {"major", "critical"}):
-            updates.append(
-                _candidate(
-                    test_case,
-                    score,
-                    "review_update",
-                    "Approved test case overlaps with the new requirement and should be reviewed for updates.",
+            elif score >= UPDATE_THRESHOLD:
+                updates.append(
+                    _semantic_candidate(
+                        match.metadata,
+                        score,
+                        "review_update",
+                        "Approved test case semantically overlaps with the new requirement and should be reviewed.",
+                    )
                 )
-            )
+        except (KeyError, TypeError, ValueError):
+            continue
 
     duplicates.sort(key=lambda item: item.similarity, reverse=True)
     deprecations.sort(key=lambda item: item.similarity, reverse=True)
@@ -304,12 +401,13 @@ async def _run_impact_analysis(
         + (10 if any(item.severity == "critical" for item in updates + deprecations) else 0),
     )
     summary = {
-        "approved_cases_scanned": len(approved_cases),
+        "approved_cases_scanned": len(matches),
         "duplicate_count": len(duplicates),
         "deprecation_count": len(deprecations),
         "update_count": len(updates),
         "manual_review_recommended": bool(deprecations or updates or risk_score >= 40),
         "thresholds": {"duplicate": DUPLICATE_THRESHOLD, "update": UPDATE_THRESHOLD},
+        "similarity_mode": "embedding_cosine",
     }
 
     analysis = ImpactAnalysis(
@@ -384,6 +482,72 @@ def _scenario_snapshot(scenario: TestScenario) -> dict:
     }
 
 
+async def _create_generated_test_case(
+    db: AsyncSession,
+    *,
+    requirement_id: uuid.UUID,
+    scenario_id: uuid.UUID,
+    generated_case,
+    version: int = 1,
+) -> tuple[TestCase, dict]:
+    test_case = TestCase(
+        scenario_id=scenario_id,
+        requirement_id=requirement_id,
+        title=generated_case.title,
+        description=generated_case.description,
+        prerequisite=generated_case.prerequisite,
+        priority=generated_case.priority,
+        severity=generated_case.severity,
+        category=generated_case.category,
+        type=generated_case.type,
+        status="draft",
+        version=version,
+    )
+    db.add(test_case)
+    await db.flush()
+    for generated_step in generated_case.steps:
+        db.add(
+            TestCaseStepModel(
+                test_case_id=test_case.id,
+                step_number=generated_step.step_number,
+                action=generated_step.action,
+                expected_result=generated_step.expected_result,
+            )
+        )
+    snapshot = {
+        "id": str(test_case.id),
+        **generated_case.model_dump(),
+        "status": "draft",
+        "version": version,
+    }
+    return test_case, snapshot
+
+
+async def _create_generated_scenario(db: AsyncSession, requirement_id: uuid.UUID, generated_scenario) -> dict:
+    scenario = TestScenario(
+        requirement_id=requirement_id,
+        title=generated_scenario.title,
+        description=generated_scenario.description,
+        priority=generated_scenario.priority,
+        severity=generated_scenario.severity,
+        category=generated_scenario.category,
+        type=generated_scenario.type,
+        status="draft",
+    )
+    db.add(scenario)
+    await db.flush()
+    case_snapshots = []
+    for generated_case in generated_scenario.test_cases:
+        _, case_snapshot = await _create_generated_test_case(
+            db,
+            requirement_id=requirement_id,
+            scenario_id=scenario.id,
+            generated_case=generated_case,
+        )
+        case_snapshots.append(case_snapshot)
+    return {**_scenario_snapshot(scenario), "test_cases": case_snapshots}
+
+
 async def _record_quality_evaluation(
     db: AsyncSession,
     target_level: str,
@@ -445,16 +609,208 @@ async def _create_test_case_version(
 
 
 @api_router.get(
+    "/projects",
+    response_model=list[ProjectSummary],
+    tags=["Projects"],
+)
+async def list_projects(
+    db: AsyncSession = Depends(get_db),
+) -> list[ProjectSummary]:
+    principal = current_principal()
+    requirement_counts = (
+        select(Requirement.project_id, func.count(Requirement.id).label("requirement_count"))
+        .group_by(Requirement.project_id)
+        .subquery()
+    )
+    test_case_counts = (
+        select(Requirement.project_id, func.count(TestCase.id).label("test_case_count"))
+        .join(TestCase, TestCase.requirement_id == Requirement.id)
+        .group_by(Requirement.project_id)
+        .subquery()
+    )
+    stmt = (
+        select(
+            Project,
+            func.coalesce(requirement_counts.c.requirement_count, 0),
+            func.coalesce(test_case_counts.c.test_case_count, 0),
+        )
+        .outerjoin(requirement_counts, requirement_counts.c.project_id == Project.id)
+        .outerjoin(test_case_counts, test_case_counts.c.project_id == Project.id)
+        .order_by(Project.name.asc())
+    )
+    if principal.role != "admin":
+        stmt = stmt.join(
+            ProjectMembership,
+            ProjectMembership.project_id == Project.id,
+        ).where(ProjectMembership.user_id == principal.user_id)
+    result = await db.execute(stmt)
+    projects: list[ProjectSummary] = []
+    for project, requirement_count, test_case_count in result.all():
+        projects.append(
+            ProjectSummary(
+                id=project.id,
+                name=project.name,
+                description=project.description,
+                status=project.status,
+                requirement_count=requirement_count,
+                test_case_count=test_case_count,
+                created_at=project.created_at,
+                updated_at=project.updated_at,
+            )
+        )
+    return projects
+
+
+@api_router.post(
+    "/projects",
+    response_model=ProjectSummary,
+    tags=["Projects"],
+)
+async def create_project(
+    payload: ProjectCreate,
+    db: AsyncSession = Depends(get_db),
+) -> ProjectSummary:
+    principal = require_global_role("admin")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Project name is required")
+
+    existing = await db.execute(select(Project).where(func.lower(Project.name) == name.lower()))
+    if existing.scalars().first():
+        raise HTTPException(status_code=409, detail="Project name already exists")
+
+    project = Project(
+        name=name,
+        description=payload.description.strip() if payload.description else None,
+        status=payload.status or "active",
+    )
+    db.add(project)
+    await db.flush()
+    db.add(
+        ProjectMembership(
+            project_id=project.id,
+            user_id=principal.user_id,
+            role="admin",
+        )
+    )
+    await db.commit()
+    await db.refresh(project)
+    return ProjectSummary(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        status=project.status,
+        requirement_count=0,
+        test_case_count=0,
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+    )
+
+
+@api_router.get(
+    "/projects/{project_id}/members",
+    response_model=list[ProjectMembershipSummary],
+    tags=["Projects"],
+)
+async def list_project_members(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[ProjectMembershipSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"admin"})
+    result = await db.execute(
+        select(ProjectMembership, User)
+        .join(User, User.id == ProjectMembership.user_id)
+        .where(ProjectMembership.project_id == project_id)
+        .order_by(User.username.asc())
+    )
+    return [
+        ProjectMembershipSummary(
+            id=membership.id,
+            project_id=membership.project_id,
+            user_id=user.id,
+            username=user.username,
+            email=user.email,
+            role=membership.role,
+            created_at=membership.created_at,
+        )
+        for membership, user in result.all()
+    ]
+
+
+@api_router.put(
+    "/projects/{project_id}/members",
+    response_model=ProjectMembershipSummary,
+    tags=["Projects"],
+)
+async def upsert_project_member(
+    project_id: uuid.UUID,
+    payload: ProjectMembershipUpsert,
+    db: AsyncSession = Depends(get_db),
+) -> ProjectMembershipSummary:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"admin"})
+    if payload.role not in {"reviewer", "approver", "admin"}:
+        raise HTTPException(status_code=422, detail="Unsupported project role")
+    user = await db.get(User, payload.user_id)
+    if not user or not user.active:
+        raise HTTPException(status_code=404, detail="User not found")
+    result = await db.execute(
+        select(ProjectMembership).where(
+            ProjectMembership.project_id == project_id,
+            ProjectMembership.user_id == payload.user_id,
+        )
+    )
+    membership = result.scalars().first()
+    action = "project_member_role_updated"
+    if membership:
+        membership.role = payload.role
+    else:
+        action = "project_member_added"
+        membership = ProjectMembership(
+            project_id=project_id,
+            user_id=payload.user_id,
+            role=payload.role,
+        )
+        db.add(membership)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="project",
+            entity_id=project_id,
+            action=action,
+            actor=current_principal().username,
+            details={"user_id": str(user.id), "role": payload.role},
+        )
+    )
+    await db.commit()
+    await db.refresh(membership)
+    return ProjectMembershipSummary(
+        id=membership.id,
+        project_id=membership.project_id,
+        user_id=user.id,
+        username=user.username,
+        email=user.email,
+        role=membership.role,
+        created_at=membership.created_at,
+    )
+
+
+@api_router.get(
     "/requirements",
     response_model=list[RequirementDetail],
     tags=["Requirements"],
 )
 async def list_requirements(
+    project_id: uuid.UUID | None = Query(None),
     status: str | None = Query(None),
     source: str | None = Query(None),
     search: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> list[RequirementDetail]:
+    principal = current_principal()
     stmt = (
         select(Requirement)
         .options(
@@ -464,6 +820,16 @@ async def list_requirements(
         )
         .order_by(Requirement.updated_at.desc())
     )
+
+    if project_id:
+        await _ensure_project(db, project_id)
+        stmt = stmt.where(Requirement.project_id == project_id)
+
+    if principal.role != "admin":
+        stmt = stmt.join(
+            ProjectMembership,
+            ProjectMembership.project_id == Requirement.project_id,
+        ).where(ProjectMembership.user_id == principal.user_id)
 
     if status:
         stmt = stmt.where(Requirement.status == status)
@@ -480,7 +846,7 @@ async def list_requirements(
             )
         )
 
-    result = await db.execute(stmt)
+    result = await db.execute(stmt.limit(limit).offset(offset))
     return result.scalars().all()
 
 
@@ -493,7 +859,9 @@ async def create_requirement(
     payload: RequirementCreate,
     db: AsyncSession = Depends(get_db),
 ) -> RequirementDetail:
+    await _ensure_project(db, payload.project_id)
     requirement = Requirement(
+        project_id=payload.project_id,
         external_id=payload.external_id,
         title=payload.title,
         description=payload.description,
@@ -501,9 +869,26 @@ async def create_requirement(
         status="draft",
     )
     db.add(requirement)
+    await db.flush()
+    enqueue_index_event(
+        db,
+        event_key=f"requirement.index:{requirement.id}:created",
+        event_type=REQUIREMENT_INDEX_REQUESTED,
+        aggregate_type="requirement",
+        aggregate_id=requirement.id,
+    )
     await db.commit()
-    await db.refresh(requirement)
-    return requirement
+    stmt = (
+        select(Requirement)
+        .where(Requirement.id == requirement.id)
+        .options(
+            selectinload(Requirement.scenarios)
+            .selectinload(TestScenario.test_cases)
+            .selectinload(TestCase.steps)
+        )
+    )
+    result = await db.execute(stmt)
+    return result.scalar_one()
 
 
 @api_router.get(
@@ -519,6 +904,8 @@ async def get_requirement(
         requirement_uuid = uuid.UUID(requirement_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Requirement not found")
+
+    await _require_requirement_access(db, requirement_uuid)
 
     stmt = (
         select(Requirement)
@@ -579,6 +966,9 @@ async def approve_requirement(
     except ValueError:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, requirement_uuid, {"approver", "admin"})
+
     stmt = select(Requirement).where(Requirement.id == requirement_uuid)
     result = await db.execute(stmt)
     requirement = result.scalars().first()
@@ -629,6 +1019,9 @@ async def reject_requirement(
         requirement_uuid = uuid.UUID(requirement_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Requirement not found")
+
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, requirement_uuid, {"approver", "admin"})
 
     stmt = select(Requirement).where(Requirement.id == requirement_uuid)
     result = await db.execute(stmt)
@@ -689,6 +1082,9 @@ async def approve_scenario(
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, scenario.requirement_id, {"approver", "admin"})
+
     if len(scenario.title.strip()) < 5 or len(scenario.description.strip()) < 12:
         raise HTTPException(status_code=422, detail="Scenario title and description must be reviewable before approval")
 
@@ -735,6 +1131,9 @@ async def reject_scenario(
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, scenario.requirement_id, {"approver", "admin"})
+
     scenario.status = "rejected"
     await _create_approval_record(
         db,
@@ -772,11 +1171,14 @@ async def approve_test_case(
     if not test_case:
         raise HTTPException(status_code=404, detail="Test case not found")
 
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, test_case.requirement_id, {"approver", "admin"})
+
     issues = _validate_test_case_content(test_case)
     if issues:
         raise HTTPException(
             status_code=422,
-            detail={"message": "Test case failed governance validation", "issues": [issue.dict() for issue in issues]},
+            detail={"message": "Test case failed governance validation", "issues": [issue.model_dump() for issue in issues]},
         )
 
     if test_case.status == "approved":
@@ -784,8 +1186,8 @@ async def approve_test_case(
     test_case.status = "approved"
     test_case.approved_at = datetime.utcnow()
     test_case.locked = True
-    test_case.repository_status = "active"
-    test_case.repository_synced_at = datetime.utcnow()
+    test_case.repository_status = "pending_index"
+    test_case.repository_synced_at = None
     test_case.vector_id = test_case.vector_id or f"test_case:{test_case.id}:v{test_case.version}"
     actor = _actor(payload)
     await _create_test_case_version(db, test_case, actor, payload.notes)
@@ -797,6 +1199,13 @@ async def approve_test_case(
         test_case.version,
         actor,
         payload.notes,
+    )
+    enqueue_index_event(
+        db,
+        event_key=f"test_case.index:{test_case.id}:v{test_case.version}",
+        event_type=TEST_CASE_INDEX_REQUESTED,
+        aggregate_type="test_case",
+        aggregate_id=test_case.id,
     )
     await db.commit()
     await db.refresh(test_case)
@@ -824,6 +1233,9 @@ async def reject_test_case(
 
     if not test_case:
         raise HTTPException(status_code=404, detail="Test case not found")
+
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, test_case.requirement_id, {"approver", "admin"})
 
     test_case.status = "rejected"
     test_case.repository_status = "rejected"
@@ -856,6 +1268,8 @@ async def create_feedback(
         raise HTTPException(status_code=422, detail="Unsupported feedback type")
     if not payload.comment.strip():
         raise HTTPException(status_code=422, detail="Feedback comment is required")
+    await _require_target_access(db, payload.target_level, payload.target_id)
+    actor = current_principal().username
 
     feedback = Feedback(
         target_level=payload.target_level,
@@ -863,15 +1277,23 @@ async def create_feedback(
         source=payload.source,
         feedback_type=payload.feedback_type,
         comment=payload.comment,
-        created_by=payload.created_by,
-        vector_id=f"feedback:{payload.target_level}:{payload.target_id}:{uuid.uuid4()}",
+        created_by=actor,
     )
     db.add(feedback)
+    await db.flush()
+    feedback.vector_id = f"feedback:{feedback.id}"
+    enqueue_index_event(
+        db,
+        event_key=f"feedback.index:{feedback.id}",
+        event_type=FEEDBACK_INDEX_REQUESTED,
+        aggregate_type="feedback",
+        aggregate_id=feedback.id,
+    )
     audit = AuditLog(
         entity_type="feedback",
         entity_id=feedback.id,
         action="feedback_created",
-        actor=payload.created_by,
+        actor=actor,
         details={
             "target_level": payload.target_level,
             "feedback_type": payload.feedback_type,
@@ -893,6 +1315,10 @@ async def list_feedback(
     target_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[FeedbackSummary]:
+    if target_level and target_id:
+        await _require_target_access(db, target_level, target_id)
+    elif current_principal().role != "admin":
+        raise HTTPException(status_code=422, detail="target_level and target_id are required")
     stmt = select(Feedback)
     if target_level:
         stmt = stmt.where(Feedback.target_level == target_level)
@@ -916,126 +1342,152 @@ async def process_feedback_revision(
     feedback = result.scalars().first()
     if not feedback:
         raise HTTPException(status_code=404, detail="Feedback not found")
+    await _require_target_access(db, feedback.target_level, feedback.target_id)
+    actor = current_principal().username
 
     action = payload.action or feedback.feedback_type
     if action not in FEEDBACK_TYPES:
         raise HTTPException(status_code=422, detail="Unsupported feedback action")
+    if feedback.status == "resolved":
+        previous = await db.execute(
+            select(RevisionRecord)
+            .where(RevisionRecord.feedback_id == feedback.id)
+            .order_by(RevisionRecord.created_at.desc())
+        )
+        previous_revision = previous.scalars().first()
+        if previous_revision:
+            return previous_revision
+        raise HTTPException(status_code=409, detail="Feedback has already been resolved")
+    if action == "deprecate":
+        require_global_role("approver", "admin")
+        await _require_target_access(db, feedback.target_level, feedback.target_id, {"approver", "admin"})
 
     source_snapshot: dict | None = None
     result_snapshot: dict | None = None
 
-    if action == "generate_new":
+    if action in {"generate_new", "revise"}:
         scenario: TestScenario | None = None
-        if feedback.target_level == "scenario":
-            result = await db.execute(select(TestScenario).where(TestScenario.id == feedback.target_id))
-            scenario = result.scalars().first()
-        elif feedback.target_level == "test_case":
-            result = await db.execute(select(TestCase).where(TestCase.id == feedback.target_id))
-            source_case = result.scalars().first()
-            if source_case:
-                result = await db.execute(select(TestScenario).where(TestScenario.id == source_case.scenario_id))
-                scenario = result.scalars().first()
-        else:
-            result = await db.execute(
-                select(TestScenario)
-                .where(TestScenario.requirement_id == feedback.target_id)
-                .order_by(TestScenario.created_at.asc())
-            )
-            scenario = result.scalars().first()
-
-        if not scenario:
-            raise HTTPException(status_code=404, detail="Scenario context not found for new test case")
-
-        source_snapshot = _scenario_snapshot(scenario)
-        new_case = TestCase(
-            scenario_id=scenario.id,
-            requirement_id=scenario.requirement_id,
-            title=f"Feedback-driven case: {scenario.title}",
-            description=f"Generated from feedback: {feedback.comment}",
-            prerequisite="Review the linked requirement and feedback context before execution.",
-            priority=scenario.priority or "medium",
-            severity=scenario.severity or "major",
-            category=scenario.category or "functional",
-            type=scenario.type or "regression",
-            status="draft",
-        )
-        db.add(new_case)
-        await db.flush()
-        db.add(
-            TestCaseStepModel(
-                test_case_id=new_case.id,
-                step_number=1,
-                action="Execute the behavior requested by the feedback context.",
-                expected_result="The system satisfies the feedback without regressing the original requirement.",
-            )
-        )
-        result_snapshot = _test_case_snapshot(new_case)
-    elif action == "revise":
+        source_case: TestCase | None = None
         if feedback.target_level == "test_case":
             result = await db.execute(
                 select(TestCase).where(TestCase.id == feedback.target_id).options(selectinload(TestCase.steps))
             )
-            test_case = result.scalars().first()
-            if not test_case:
+            source_case = result.scalars().first()
+            if not source_case:
                 raise HTTPException(status_code=404, detail="Test case not found")
-            source_snapshot = _test_case_snapshot(test_case)
-            if test_case.locked:
-                revised_case = TestCase(
-                    scenario_id=test_case.scenario_id,
-                    requirement_id=test_case.requirement_id,
-                    title=f"{test_case.title} - revision",
-                    description=f"{test_case.description}\n\nRevision context: {feedback.comment}",
-                    prerequisite=test_case.prerequisite,
-                    priority=test_case.priority,
-                    severity=test_case.severity,
-                    category=test_case.category,
-                    type=test_case.type,
-                    status="draft",
-                    version=test_case.version + 1,
-                )
-                db.add(revised_case)
-                await db.flush()
-                for step in test_case.steps or []:
-                    db.add(
-                        TestCaseStepModel(
-                            test_case_id=revised_case.id,
-                            step_number=step.step_number,
-                            action=step.action,
-                            expected_result=step.expected_result,
-                        )
-                    )
-                result_snapshot = _test_case_snapshot(revised_case)
-            else:
-                test_case.description = f"{test_case.description}\n\nRevision context: {feedback.comment}"
-                test_case.status = "updated"
-                test_case.version += 1
-                result_snapshot = _test_case_snapshot(test_case)
+            scenario = await db.get(TestScenario, source_case.scenario_id)
+            requirement_id = source_case.requirement_id
+            source_snapshot = _test_case_snapshot(source_case)
+            target_context = jsonable_encoder(source_snapshot)
         elif feedback.target_level == "scenario":
-            result = await db.execute(select(TestScenario).where(TestScenario.id == feedback.target_id))
-            scenario = result.scalars().first()
+            scenario = await db.get(TestScenario, feedback.target_id)
             if not scenario:
                 raise HTTPException(status_code=404, detail="Scenario not found")
+            requirement_id = scenario.requirement_id
             source_snapshot = _scenario_snapshot(scenario)
-            scenario.description = f"{scenario.description}\n\nRevision context: {feedback.comment}"
+            target_context = jsonable_encoder(source_snapshot)
+        else:
+            requirement_id = feedback.target_id
+            target_context = {"target_level": "requirement", "target_id": str(feedback.target_id)}
+
+        requirement = await db.get(Requirement, requirement_id)
+        if not requirement:
+            raise HTTPException(status_code=404, detail="Requirement not found")
+        if source_snapshot is None:
+            source_snapshot = {
+                "id": str(requirement.id),
+                "title": requirement.title,
+                "description": requirement.description,
+            }
+            target_context = source_snapshot
+
+        try:
+            generation_result = await build_generation_service().generate_from_feedback(
+                requirement_id=str(requirement.id),
+                project_id=str(requirement.project_id) if requirement.project_id else None,
+                title=requirement.title,
+                description=requirement.description,
+                external_id=requirement.external_id,
+                feedback_text=feedback.comment,
+                target_context=str(target_context),
+                action=action,
+            )
+        except GenerationConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except GenerationProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        generated_scenario = generation_result.draft.scenarios[0]
+        if action == "generate_new" and scenario is not None:
+            _, result_snapshot = await _create_generated_test_case(
+                db,
+                requirement_id=requirement.id,
+                scenario_id=scenario.id,
+                generated_case=generated_scenario.test_cases[0],
+            )
+        elif action == "revise" and source_case is not None:
+            generated_case = generated_scenario.test_cases[0]
+            if source_case.locked:
+                _, result_snapshot = await _create_generated_test_case(
+                    db,
+                    requirement_id=requirement.id,
+                    scenario_id=source_case.scenario_id,
+                    generated_case=generated_case,
+                    version=source_case.version + 1,
+                )
+            else:
+                source_case.title = generated_case.title
+                source_case.description = generated_case.description
+                source_case.prerequisite = generated_case.prerequisite
+                source_case.priority = generated_case.priority
+                source_case.severity = generated_case.severity
+                source_case.category = generated_case.category
+                source_case.type = generated_case.type
+                source_case.status = "updated"
+                source_case.version += 1
+                await db.execute(delete(TestCaseStepModel).where(TestCaseStepModel.test_case_id == source_case.id))
+                for generated_step in generated_case.steps:
+                    db.add(
+                        TestCaseStepModel(
+                            test_case_id=source_case.id,
+                            step_number=generated_step.step_number,
+                            action=generated_step.action,
+                            expected_result=generated_step.expected_result,
+                        )
+                    )
+                result_snapshot = {
+                    "id": str(source_case.id),
+                    **generated_case.model_dump(),
+                    "status": source_case.status,
+                    "version": source_case.version,
+                }
+        elif action == "revise" and scenario is not None:
+            scenario.title = generated_scenario.title
+            scenario.description = generated_scenario.description
+            scenario.priority = generated_scenario.priority
+            scenario.severity = generated_scenario.severity
+            scenario.category = generated_scenario.category
+            scenario.type = generated_scenario.type
             scenario.status = "updated"
             scenario.version += 1
             result_snapshot = _scenario_snapshot(scenario)
         else:
-            result = await db.execute(select(Requirement).where(Requirement.id == feedback.target_id))
-            requirement = result.scalars().first()
-            if not requirement:
-                raise HTTPException(status_code=404, detail="Requirement not found")
-            source_snapshot = {"id": str(requirement.id), "title": requirement.title, "description": requirement.description}
-            requirement.status = "reviewed"
-            requirement.metadata_json = {
-                **(requirement.metadata_json or {}),
-                "latest_feedback_context": feedback.comment,
-            }
+            generated_snapshots = []
+            for item in generation_result.draft.scenarios:
+                generated_snapshots.append(await _create_generated_scenario(db, requirement.id, item))
+            requirement.status = "generated"
             result_snapshot = {
-                "id": str(requirement.id),
-                "status": requirement.status,
-                "latest_feedback_context": feedback.comment,
+                "requirement_id": str(requirement.id),
+                "generated_scenarios": generated_snapshots,
             }
+
+        result_snapshot = {
+            **(result_snapshot or {}),
+            "generation": {
+                "model": generation_result.model,
+                "retrieved_vector_ids": [item.id for item in generation_result.retrieved_context],
+            },
+        }
     elif action == "deprecate":
         if feedback.target_level == "test_case":
             result = await db.execute(
@@ -1075,7 +1527,7 @@ async def process_feedback_revision(
         target_id=feedback.target_id,
         action=action,
         status="completed",
-        created_by=payload.created_by,
+        created_by=actor,
         notes=payload.notes,
         source_snapshot=source_snapshot,
         result_snapshot=result_snapshot,
@@ -1087,7 +1539,7 @@ async def process_feedback_revision(
             entity_type=feedback.target_level,
             entity_id=feedback.target_id,
             action=f"feedback_{action}_processed",
-            actor=payload.created_by,
+            actor=actor,
             details={"feedback_id": str(feedback.id), "revision_id": str(revision.id)},
         )
     )
@@ -1107,6 +1559,10 @@ async def list_revisions(
     feedback_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[RevisionRecordSummary]:
+    if target_level and target_id:
+        await _require_target_access(db, target_level, target_id)
+    elif current_principal().role != "admin":
+        raise HTTPException(status_code=422, detail="target_level and target_id are required")
     stmt = select(RevisionRecord)
     if target_level:
         stmt = stmt.where(RevisionRecord.target_level == target_level)
@@ -1129,6 +1585,10 @@ async def list_approvals(
     target_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[ApprovalRecordSummary]:
+    if target_level and target_id:
+        await _require_target_access(db, target_level, target_id)
+    elif current_principal().role != "admin":
+        raise HTTPException(status_code=422, detail="target_level and target_id are required")
     stmt = select(ApprovalRecord)
     if target_level:
         stmt = stmt.where(ApprovalRecord.target_level == target_level)
@@ -1149,6 +1609,10 @@ async def list_audit_logs(
     entity_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[AuditLogSummary]:
+    if entity_type in TARGET_LEVELS and entity_id:
+        await _require_target_access(db, entity_type, entity_id)
+    elif current_principal().role != "admin":
+        raise HTTPException(status_code=422, detail="A requirement, scenario, or test_case target is required")
     stmt = select(AuditLog)
     if entity_type:
         stmt = stmt.where(AuditLog.entity_type == entity_type)
@@ -1173,6 +1637,8 @@ async def list_test_case_versions(
     except ValueError:
         raise HTTPException(status_code=404, detail="Test case not found")
 
+    await _require_target_access(db, "test_case", test_case_uuid)
+
     stmt = (
         select(TestCaseVersion)
         .where(TestCaseVersion.test_case_id == test_case_uuid)
@@ -1188,14 +1654,61 @@ async def list_test_case_versions(
     tags=["Repository"],
 )
 async def list_repository_test_cases(
-    status: str | None = Query("active"),
+    status: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[TestCaseSummary]:
+    principal = current_principal()
     stmt = select(TestCase).options(selectinload(TestCase.steps)).order_by(TestCase.repository_synced_at.desc())
+    if principal.role != "admin":
+        stmt = (
+            stmt.join(Requirement, Requirement.id == TestCase.requirement_id)
+            .join(ProjectMembership, ProjectMembership.project_id == Requirement.project_id)
+            .where(ProjectMembership.user_id == principal.user_id)
+        )
     if status:
         stmt = stmt.where(TestCase.repository_status == status)
     result = await db.execute(stmt)
     return result.scalars().all()
+
+
+@api_router.get(
+    "/search",
+    response_model=list[SemanticSearchResult],
+    tags=["Search"],
+)
+async def semantic_search(
+    project_id: uuid.UUID,
+    query: str = Query(..., min_length=2, max_length=500),
+    entity_type: str | None = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+) -> list[SemanticSearchResult]:
+    await _ensure_project(db, project_id)
+    if entity_type and entity_type not in {"requirement", "test_case", "feedback"}:
+        raise HTTPException(status_code=422, detail="Unsupported semantic search entity type")
+    try:
+        matches = await build_semantic_search_service().search(
+            query.strip(),
+            project_id=str(project_id),
+            entity_type=entity_type,
+            limit=limit,
+        )
+    except GenerationConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GenerationProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return [
+        SemanticSearchResult(
+            vector_id=match.vector_id,
+            entity_type=match.entity_type,
+            entity_id=match.entity_id,
+            title=match.title,
+            text=match.text,
+            score=round(match.score, 4),
+            metadata=match.metadata,
+        )
+        for match in matches
+    ]
 
 
 @api_router.get(
@@ -1212,13 +1725,23 @@ async def get_requirement_impact(
     except ValueError:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    await _require_requirement_access(db, requirement_uuid)
+
     result = await db.execute(select(Requirement).where(Requirement.id == requirement_uuid))
     requirement = result.scalars().first()
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
+    if not requirement.project_id:
+        raise HTTPException(status_code=422, detail="Requirement must belong to a project for semantic impact analysis")
 
     source_text = " ".join([requirement.title, requirement.description])
-    return await _run_impact_analysis(db, source_text, requirement.id)
+    return await _run_impact_analysis(
+        db,
+        source_text,
+        requirement.id,
+        requirement.project_id,
+        current_principal().username,
+    )
 
 
 @api_router.post(
@@ -1232,7 +1755,25 @@ async def analyze_impact(
 ) -> ImpactAnalysisSummary:
     if not payload.text.strip():
         raise HTTPException(status_code=422, detail="Impact analysis text is required")
-    return await _run_impact_analysis(db, payload.text, None, payload.created_by, payload.context_ids)
+    principal = current_principal()
+    if not payload.project_id:
+        raise HTTPException(status_code=422, detail="project_id is required for semantic impact analysis")
+    await _ensure_project(db, payload.project_id)
+    for requirement_id in payload.context_ids or []:
+        await _require_requirement_access(db, requirement_id)
+        context_project = await db.scalar(
+            select(Requirement.project_id).where(Requirement.id == requirement_id)
+        )
+        if context_project != payload.project_id:
+            raise HTTPException(status_code=422, detail="All context requirements must belong to the selected project")
+    return await _run_impact_analysis(
+        db,
+        payload.text,
+        None,
+        payload.project_id,
+        principal.username,
+        payload.context_ids,
+    )
 
 
 @api_router.get(
@@ -1244,6 +1785,10 @@ async def list_impact_analyses(
     requirement_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[ImpactAnalysisSummary]:
+    if requirement_id:
+        await _require_requirement_access(db, requirement_id)
+    elif current_principal().role != "admin":
+        raise HTTPException(status_code=422, detail="requirement_id is required")
     stmt = select(ImpactAnalysis)
     if requirement_id:
         stmt = stmt.where(ImpactAnalysis.requirement_id == requirement_id)
@@ -1289,6 +1834,9 @@ async def deprecate_impacted_test_case(
     if not test_case:
         raise HTTPException(status_code=404, detail="Test case not found")
 
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, test_case.requirement_id, {"approver", "admin"})
+
     test_case.status = "deprecated"
     test_case.repository_status = "deprecated"
     actor = _actor(payload)
@@ -1326,6 +1874,9 @@ async def flag_impacted_test_case_for_update(
     if not test_case:
         raise HTTPException(status_code=404, detail="Test case not found")
 
+    require_global_role("approver", "admin")
+    await _require_requirement_access(db, test_case.requirement_id, {"approver", "admin"})
+
     test_case.status = "updated"
     test_case.repository_status = "needs_update"
     actor = _actor(payload)
@@ -1344,6 +1895,117 @@ async def flag_impacted_test_case_for_update(
 
 
 @api_router.post(
+    "/requirements/import-file",
+    response_model=IntegrationRunSummary,
+    tags=["Requirements"],
+)
+async def import_requirement_file(
+    project_id: uuid.UUID = Form(...),
+    uploaded_file: UploadFile = File(..., alias="file"),
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationRunSummary:
+    await _ensure_project(db, project_id)
+    allowed_content_types = {
+        "text/plain",
+        "text/markdown",
+        "text/csv",
+        "application/csv",
+        "application/json",
+        "application/octet-stream",
+    }
+    if uploaded_file.content_type and uploaded_file.content_type.lower() not in allowed_content_types:
+        raise HTTPException(status_code=415, detail="Unsupported requirement file content type")
+    content = await uploaded_file.read(settings.upload_max_bytes + 1)
+    filename = uploaded_file.filename
+    await uploaded_file.close()
+    try:
+        parsed = parse_requirement_file(
+            filename,
+            content,
+            max_bytes=settings.upload_max_bytes,
+            max_requirements=settings.upload_max_requirements,
+        )
+    except FileIngestionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    actor = current_principal().username
+    created_count = 0
+    existing_count = 0
+    requirement_ids: list[str] = []
+    for item in parsed:
+        result = await db.execute(
+            select(Requirement).where(
+                Requirement.project_id == project_id,
+                Requirement.external_id == item.external_id,
+            )
+        )
+        requirement = result.scalars().first()
+        if requirement:
+            existing_count += 1
+        else:
+            cleaned_description, cleanup_issues = _clean_requirement_text(item.description)
+            requirement = Requirement(
+                project_id=project_id,
+                external_id=item.external_id,
+                title=item.title,
+                description=cleaned_description,
+                source="upload",
+                status="draft",
+                metadata_json={**item.metadata, "cleanup_issues": cleanup_issues},
+            )
+            db.add(requirement)
+            await db.flush()
+            enqueue_index_event(
+                db,
+                event_key=f"requirement.index:{requirement.id}:file-import",
+                event_type=REQUIREMENT_INDEX_REQUESTED,
+                aggregate_type="requirement",
+                aggregate_id=requirement.id,
+            )
+            created_count += 1
+        requirement_ids.append(str(requirement.id))
+
+    first_metadata = parsed[0].metadata
+    run = IntegrationRun(
+        integration_type="file_import",
+        status="completed",
+        requested_by=actor,
+        parameters={
+            "project_id": str(project_id),
+            "filename": first_metadata["upload_filename"],
+            "sha256": first_metadata["upload_sha256"],
+            "bytes": len(content),
+        },
+        result={
+            "parsed_count": len(parsed),
+            "created_count": created_count,
+            "existing_count": existing_count,
+            "requirement_ids": requirement_ids,
+        },
+        completed_at=datetime.utcnow(),
+    )
+    db.add(run)
+    await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="integration",
+            entity_id=run.id,
+            action="requirement_file_imported",
+            actor=actor,
+            details={
+                "project_id": str(project_id),
+                "sha256": first_metadata["upload_sha256"],
+                "created_count": created_count,
+                "existing_count": existing_count,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+@api_router.post(
     "/integrations/jira/import",
     response_model=IntegrationRunSummary,
     tags=["Integrations"],
@@ -1353,50 +2015,113 @@ async def import_jira_requirements(
     db: AsyncSession = Depends(get_db),
 ) -> IntegrationRunSummary:
     _require_role(payload.requested_by, {"admin", "system"})
-    folder_path = payload.folder_path.strip()
-    if not folder_path:
-        raise HTTPException(status_code=422, detail="Jira folder path is required")
-
-    raw_items = [item.strip() for item in re.split(r"[\n,]+", folder_path) if item.strip()]
-    if not raw_items:
-        raw_items = [folder_path]
-
-    imported_ids: list[str] = []
-    for item in raw_items:
-        external_id = item if re.match(r"^[A-Z][A-Z0-9]+-\d+$", item) else f"JIRA-{len(imported_ids) + 1}"
-        title = f"Imported Jira requirement {external_id}"
-        description = f"Imported from Jira folder abstraction: {item}"
-        cleaned_description, cleanup_issues = _clean_requirement_text(description)
-        requirement = Requirement(
-            external_id=external_id,
-            title=title,
-            description=cleaned_description,
-            source="jira",
-            status="draft",
-            metadata_json={"import_source": item, "cleanup_issues": cleanup_issues},
-            vector_id=f"requirement:{external_id}",
-        )
-        db.add(requirement)
-        await db.flush()
-        imported_ids.append(str(requirement.id))
-
+    actor = current_principal().username
+    await _ensure_project(db, payload.project_id)
+    jql = payload.jql.strip()
+    if not jql:
+        raise HTTPException(status_code=422, detail="JQL is required")
     run = IntegrationRun(
         integration_type="jira_import",
-        status="completed",
-        requested_by=payload.requested_by,
-        parameters={"folder_path": folder_path},
-        result={"imported_count": len(imported_ids), "requirement_ids": imported_ids},
-        completed_at=datetime.utcnow(),
+        status="running",
+        requested_by=actor,
+        parameters={
+            "project_id": str(payload.project_id),
+            "jql": jql,
+            "max_results": payload.max_results,
+        },
+        result={},
     )
     db.add(run)
-    await db.flush()
+    await db.commit()
+    await db.refresh(run)
+
+    try:
+        issues = await JiraCloudClient().search_issues(jql, payload.max_results)
+    except IntegrationConfigurationError as exc:
+        run.status = "failed"
+        run.result = {"error_type": "configuration"}
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except IntegrationProviderError as exc:
+        run.status = "failed"
+        run.result = {"error_type": "provider"}
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    imported_ids: list[str] = []
+    created_count = 0
+    updated_count = 0
+    for issue in issues:
+        existing = await db.execute(
+            select(Requirement).where(
+                Requirement.project_id == payload.project_id,
+                Requirement.external_id == issue.key,
+            )
+        )
+        requirement = existing.scalars().first()
+        cleaned_description, cleanup_issues = _clean_requirement_text(issue.description or issue.summary)
+        metadata = {
+            "jira_issue_type": issue.issue_type,
+            "jira_status": issue.status,
+            "jira_updated": issue.updated,
+            "cleanup_issues": cleanup_issues,
+        }
+        if requirement:
+            requirement.title = issue.summary
+            requirement.description = cleaned_description
+            requirement.metadata_json = metadata
+            requirement.status = "draft"
+            updated_count += 1
+        else:
+            requirement = Requirement(
+                project_id=payload.project_id,
+                external_id=issue.key,
+                title=issue.summary,
+                description=cleaned_description,
+                source="jira",
+                status="draft",
+                metadata_json=metadata,
+            )
+            db.add(requirement)
+            await db.flush()
+            created_count += 1
+        digest = hashlib.sha256(
+            f"{issue.updated or ''}\n{issue.summary}\n{cleaned_description}".encode("utf-8")
+        ).hexdigest()[:16]
+        event_key = f"requirement.index:{requirement.id}:{digest}"
+        event_exists = await db.scalar(select(OutboxEvent.id).where(OutboxEvent.event_key == event_key))
+        if event_exists is None:
+            enqueue_index_event(
+                db,
+                event_key=event_key,
+                event_type=REQUIREMENT_INDEX_REQUESTED,
+                aggregate_type="requirement",
+                aggregate_id=requirement.id,
+            )
+        imported_ids.append(str(requirement.id))
+
+    run.status = "completed"
+    run.result = {
+        "fetched_count": len(issues),
+        "created_count": created_count,
+        "updated_count": updated_count,
+        "requirement_ids": imported_ids,
+    }
+    run.completed_at = datetime.utcnow()
     db.add(
         AuditLog(
             entity_type="integration",
             entity_id=run.id,
             action="jira_import_completed",
-            actor=payload.requested_by,
-            details=run.result,
+            actor=actor,
+            details={
+                "project_id": str(payload.project_id),
+                "fetched_count": len(issues),
+                "created_count": created_count,
+                "updated_count": updated_count,
+            },
         )
     )
     await db.commit()
@@ -1414,45 +2139,65 @@ async def sync_test_repository(
     db: AsyncSession = Depends(get_db),
 ) -> RepositorySyncRunSummary:
     _require_role(payload.requested_by, {"admin", "approver", "system"})
+    actor = current_principal().username
+    await _ensure_project(db, payload.project_id)
+    await _require_project_access(db, payload.project_id, {"approver", "admin"})
+    if not payload.repository.strip():
+        raise HTTPException(status_code=422, detail="Repository name is required")
     result = await db.execute(
         select(TestCase)
-        .where(TestCase.repository_status.in_(["active", "needs_update"]))
+        .join(Requirement, Requirement.id == TestCase.requirement_id)
+        .where(
+            Requirement.project_id == payload.project_id,
+            TestCase.status == "approved",
+        )
         .options(selectinload(TestCase.steps))
     )
     test_cases = result.scalars().all()
-    synced_at = datetime.utcnow()
-    vector_synced = 0
-
-    for test_case in test_cases:
-        test_case.repository_synced_at = synced_at
-        test_case.repository_status = "active" if test_case.status == "approved" else test_case.repository_status
-        if not test_case.vector_id:
-            test_case.vector_id = f"test_case:{test_case.id}:v{test_case.version}"
-        vector_synced += 1
-
     run = RepositorySyncRun(
         repository=payload.repository,
         branch=payload.branch,
-        status="completed",
-        synced_count=len(test_cases),
-        vector_synced_count=vector_synced,
-        requested_by=payload.requested_by,
+        status="queued" if test_cases else "completed",
+        synced_count=0,
+        vector_synced_count=0,
+        requested_by=actor,
         details={
-            "mode": "metadata-and-vector-id-sync",
-            "pinecone_index": "configured",
+            "mode": "durable-http-repository-delivery",
+            "project_id": str(payload.project_id),
+            "queued_count": len(test_cases),
             "test_case_ids": [str(test_case.id) for test_case in test_cases],
         },
-        completed_at=synced_at,
+        completed_at=None if test_cases else datetime.utcnow(),
     )
     db.add(run)
     await db.flush()
+    repository_digest = hashlib.sha256(
+        f"{payload.repository.strip()}\n{payload.branch.strip()}".encode("utf-8")
+    ).hexdigest()[:16]
+    for test_case in test_cases:
+        delivery_key = f"test_case:{test_case.id}:v{test_case.version}:repo:{repository_digest}"
+        enqueue_outbox_event(
+            db,
+            event_key=f"repository.delivery:{run.id}:{test_case.id}",
+            event_type=TEST_CASE_REPOSITORY_SYNC_REQUESTED,
+            aggregate_type="test_case",
+            aggregate_id=test_case.id,
+            payload={"sync_run_id": str(run.id), "delivery_key": delivery_key},
+        )
+        test_case.repository_status = "pending_sync"
+        test_case.repository_synced_at = None
     db.add(
         AuditLog(
             entity_type="repository_sync",
             entity_id=run.id,
-            action="test_repository_sync_completed",
-            actor=payload.requested_by,
-            details=run.details,
+            action="test_repository_sync_queued",
+            actor=actor,
+            details={
+                "project_id": str(payload.project_id),
+                "repository": payload.repository,
+                "branch": payload.branch,
+                "queued_count": len(test_cases),
+            },
         )
     )
     await db.commit()
@@ -1469,6 +2214,7 @@ async def list_integration_runs(
     integration_type: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[IntegrationRunSummary]:
+    require_global_role("admin")
     stmt = select(IntegrationRun)
     if integration_type:
         stmt = stmt.where(IntegrationRun.integration_type == integration_type)
@@ -1485,8 +2231,148 @@ async def list_integration_runs(
 async def list_repository_sync_runs(
     db: AsyncSession = Depends(get_db),
 ) -> list[RepositorySyncRunSummary]:
+    require_global_role("admin")
     result = await db.execute(select(RepositorySyncRun).order_by(RepositorySyncRun.started_at.desc()))
     return result.scalars().all()
+
+
+@api_router.post(
+    "/executions",
+    response_model=list[TestExecutionRunSummary],
+    tags=["Execution"],
+)
+async def queue_test_executions(
+    payload: TestExecutionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> list[TestExecutionRunSummary]:
+    actor = current_principal().username
+    await _ensure_project(db, payload.project_id)
+    await _require_project_access(db, payload.project_id, {"approver", "admin"})
+    environment = payload.environment.strip()
+    if not environment:
+        raise HTTPException(status_code=422, detail="Execution environment is required")
+    test_case_ids = list(dict.fromkeys(payload.test_case_ids))
+    result = await db.execute(
+        select(TestCase)
+        .join(Requirement, Requirement.id == TestCase.requirement_id)
+        .where(
+            Requirement.project_id == payload.project_id,
+            TestCase.id.in_(test_case_ids),
+            TestCase.status == "approved",
+        )
+    )
+    test_cases = {test_case.id: test_case for test_case in result.scalars().all()}
+    if len(test_cases) != len(test_case_ids):
+        raise HTTPException(status_code=404, detail="One or more approved test cases were not found")
+
+    runs: list[TestExecutionRun] = []
+    for test_case_id in test_case_ids:
+        test_case = test_cases[test_case_id]
+        idempotency_key = f"execution:{payload.request_id}:{test_case.id}:v{test_case.version}"
+        existing = await db.scalar(
+            select(TestExecutionRun).where(TestExecutionRun.idempotency_key == idempotency_key)
+        )
+        if existing:
+            runs.append(existing)
+            continue
+        run = TestExecutionRun(
+            project_id=payload.project_id,
+            test_case_id=test_case.id,
+            test_case_version=test_case.version,
+            environment=environment,
+            runner="generic",
+            status="queued",
+            idempotency_key=idempotency_key,
+            result={},
+            requested_by=actor,
+        )
+        db.add(run)
+        await db.flush()
+        enqueue_outbox_event(
+            db,
+            event_key=f"execution.run:{run.id}",
+            event_type=TEST_CASE_EXECUTION_REQUESTED,
+            aggregate_type="test_execution_run",
+            aggregate_id=run.id,
+        )
+        runs.append(run)
+
+    db.add(
+        AuditLog(
+            entity_type="project",
+            entity_id=payload.project_id,
+            action="test_executions_queued",
+            actor=actor,
+            details={
+                "request_id": str(payload.request_id),
+                "environment": environment,
+                "run_ids": [str(run.id) for run in runs],
+            },
+        )
+    )
+    await db.commit()
+    for run in runs:
+        await db.refresh(run)
+    return runs
+
+
+@api_router.get(
+    "/executions",
+    response_model=list[TestExecutionRunSummary],
+    tags=["Execution"],
+)
+async def list_test_executions(
+    project_id: uuid.UUID,
+    status: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> list[TestExecutionRunSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    stmt = select(TestExecutionRun).where(TestExecutionRun.project_id == project_id)
+    if status:
+        if status not in {"queued", "running", "passed", "failed", "error", "cancelled"}:
+            raise HTTPException(status_code=422, detail="Unsupported execution status")
+        stmt = stmt.where(TestExecutionRun.status == status)
+    result = await db.execute(stmt.order_by(TestExecutionRun.created_at.desc()).limit(limit))
+    return result.scalars().all()
+
+
+@api_router.get(
+    "/executions/candidates",
+    response_model=list[TestCaseSummary],
+    tags=["Execution"],
+)
+async def list_execution_candidates(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[TestCaseSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    result = await db.execute(
+        select(TestCase)
+        .join(Requirement, Requirement.id == TestCase.requirement_id)
+        .where(Requirement.project_id == project_id, TestCase.status == "approved")
+        .options(selectinload(TestCase.steps))
+        .order_by(TestCase.title.asc())
+    )
+    return result.scalars().unique().all()
+
+
+@api_router.get(
+    "/executions/{run_id}",
+    response_model=TestExecutionRunSummary,
+    tags=["Execution"],
+)
+async def get_test_execution(
+    run_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> TestExecutionRunSummary:
+    run = await db.get(TestExecutionRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Execution run not found")
+    await _require_project_access(db, run.project_id)
+    return run
 
 
 @api_router.post(
@@ -1509,6 +2395,7 @@ async def run_quality_evaluation_suite(
     db: AsyncSession = Depends(get_db),
 ) -> EvaluationRunSummary:
     _require_role(payload.requested_by, {"admin", "approver", "system"})
+    actor = current_principal().username
     requirements_count = (await db.execute(select(func.count()).select_from(Requirement))).scalar_one()
     approved_cases_count = (
         await db.execute(select(func.count()).select_from(TestCase).where(TestCase.status == "approved"))
@@ -1537,7 +2424,7 @@ async def run_quality_evaluation_suite(
             "failed_quality_evaluations": failed_quality_count,
         },
         issues=issues,
-        requested_by=payload.requested_by,
+        requested_by=actor,
     )
     db.add(run)
     await db.flush()
@@ -1546,7 +2433,7 @@ async def run_quality_evaluation_suite(
             entity_type="evaluation",
             entity_id=run.id,
             action="evaluation_suite_completed",
-            actor=payload.requested_by,
+            actor=actor,
             details={"suite": payload.suite, "score": score, "status": status},
         )
     )
@@ -1563,6 +2450,7 @@ async def run_quality_evaluation_suite(
 async def list_evaluation_runs(
     db: AsyncSession = Depends(get_db),
 ) -> list[EvaluationRunSummary]:
+    require_global_role("admin")
     result = await db.execute(select(EvaluationRun).order_by(EvaluationRun.created_at.desc()))
     return result.scalars().all()
 
@@ -1575,6 +2463,7 @@ async def list_evaluation_runs(
 async def monitoring_summary(
     db: AsyncSession = Depends(get_db),
 ) -> MonitoringSummary:
+    require_global_role("admin")
     metrics = {
         "requirements": (await db.execute(select(func.count()).select_from(Requirement))).scalar_one(),
         "approved_test_cases": (
@@ -1590,11 +2479,90 @@ async def monitoring_summary(
         "integration_runs": (await db.execute(select(func.count()).select_from(IntegrationRun))).scalar_one(),
         "repository_sync_runs": (await db.execute(select(func.count()).select_from(RepositorySyncRun))).scalar_one(),
         "evaluation_runs": (await db.execute(select(func.count()).select_from(EvaluationRun))).scalar_one(),
+        "outbox_pending": (
+            await db.execute(select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "pending"))
+        ).scalar_one(),
+        "outbox_failed": (
+            await db.execute(select(func.count()).select_from(OutboxEvent).where(OutboxEvent.status == "failed"))
+        ).scalar_one(),
     }
     for name, value in metrics.items():
         db.add(OperationalMetric(metric_name=name, metric_value=int(value), dimensions={"source": "summary"}))
     await db.commit()
     return MonitoringSummary(status="ok", metrics=metrics, captured_at=datetime.utcnow())
+
+
+@api_router.get(
+    "/operations/dependencies",
+    response_model=DependencyHealthSummary,
+    tags=["Monitoring"],
+)
+async def dependency_health() -> DependencyHealthSummary:
+    require_global_role("admin")
+    probes = await probe_external_dependencies()
+    statuses = [
+        DependencyStatusSummary(name=probe.name, status=probe.status, configured=probe.configured)
+        for probe in probes
+    ]
+    overall = "healthy" if all(item.status == "healthy" for item in statuses) else "degraded"
+    return DependencyHealthSummary(status=overall, dependencies=statuses, checked_at=datetime.utcnow())
+
+
+@api_router.get(
+    "/operations/outbox",
+    response_model=list[OutboxEventSummary],
+    tags=["Monitoring"],
+)
+async def list_outbox_events(
+    status: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> list[OutboxEventSummary]:
+    require_global_role("admin")
+    stmt = select(OutboxEvent)
+    if status:
+        if status not in {"pending", "processing", "completed", "failed"}:
+            raise HTTPException(status_code=422, detail="Unsupported outbox status")
+        stmt = stmt.where(OutboxEvent.status == status)
+    result = await db.execute(stmt.order_by(OutboxEvent.created_at.desc()).limit(limit))
+    return result.scalars().all()
+
+
+@api_router.post(
+    "/operations/outbox/{event_id}/retry",
+    response_model=OutboxEventSummary,
+    tags=["Monitoring"],
+)
+async def retry_outbox_event(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> OutboxEventSummary:
+    principal = require_global_role("admin")
+    event = await db.get(OutboxEvent, event_id, with_for_update=True)
+    if not event:
+        raise HTTPException(status_code=404, detail="Outbox event not found")
+    if event.status in {"processing", "completed"}:
+        raise HTTPException(status_code=409, detail=f"A {event.status} event cannot be retried")
+    if event.status == "failed":
+        event.status = "pending"
+        event.attempts = 0
+        event.available_at = datetime.utcnow()
+        event.locked_at = None
+        event.locked_by = None
+        event.processed_at = None
+        event.last_error = None
+        db.add(
+            AuditLog(
+                entity_type="outbox_event",
+                entity_id=event.id,
+                action="outbox_event_retry_requested",
+                actor=principal.username,
+                details={"event_type": event.event_type, "aggregate_id": str(event.aggregate_id)},
+            )
+        )
+        await db.commit()
+        await db.refresh(event)
+    return event
 
 
 @api_router.post(
@@ -1607,6 +2575,7 @@ async def create_governance_policy(
     db: AsyncSession = Depends(get_db),
 ) -> GovernancePolicySummary:
     _require_role(payload.created_by, {"admin", "system"})
+    actor = current_principal().username
     result = await db.execute(select(GovernancePolicy).where(GovernancePolicy.name == payload.name))
     policy = result.scalars().first()
     if policy:
@@ -1619,7 +2588,7 @@ async def create_governance_policy(
             status=payload.status,
             policy_type=payload.policy_type,
             rules=payload.rules,
-            created_by=payload.created_by,
+            created_by=actor,
         )
         db.add(policy)
     await db.flush()
@@ -1628,7 +2597,7 @@ async def create_governance_policy(
             entity_type="governance_policy",
             entity_id=policy.id,
             action="governance_policy_created",
-            actor=payload.created_by,
+            actor=actor,
             details={"name": payload.name, "policy_type": payload.policy_type},
         )
     )
@@ -1646,6 +2615,7 @@ async def list_governance_policies(
     status: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[GovernancePolicySummary]:
+    require_global_role("admin")
     stmt = select(GovernancePolicy)
     if status:
         stmt = stmt.where(GovernancePolicy.status == status)
@@ -1670,6 +2640,8 @@ async def validate_target(
         target_uuid = uuid.UUID(target_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Target not found")
+
+    await _require_target_access(db, target_level, target_uuid)
 
     issues: list[ValidationIssue] = []
     if target_level == "requirement":
@@ -1762,8 +2734,15 @@ async def evaluate_quality(
     except ValueError:
         raise HTTPException(status_code=404, detail="Target not found")
 
+    await _require_target_access(db, target_level, target_uuid)
     issues = await _collect_validation_issues(db, target_level, target_uuid)
-    evaluation = await _record_quality_evaluation(db, target_level, target_uuid, issues)
+    evaluation = await _record_quality_evaluation(
+        db,
+        target_level,
+        target_uuid,
+        issues,
+        current_principal().username,
+    )
     await db.commit()
     await db.refresh(evaluation)
     return evaluation
@@ -1779,6 +2758,10 @@ async def list_quality_evaluations(
     target_id: uuid.UUID | None = Query(None),
     db: AsyncSession = Depends(get_db),
 ) -> list[QualityEvaluationSummary]:
+    if target_level and target_id:
+        await _require_target_access(db, target_level, target_id)
+    elif current_principal().role != "admin":
+        raise HTTPException(status_code=422, detail="target_level and target_id are required")
     stmt = select(QualityEvaluation)
     if target_level:
         stmt = stmt.where(QualityEvaluation.target_level == target_level)
@@ -1803,6 +2786,8 @@ async def create_scenario_for_requirement(
         requirement_uuid = uuid.UUID(requirement_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Requirement not found")
+
+    await _require_requirement_access(db, requirement_uuid)
 
     stmt = select(Requirement).where(Requirement.id == requirement_uuid)
     result = await db.execute(stmt)
@@ -1849,6 +2834,8 @@ async def create_test_case_for_scenario(
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
+    await _require_requirement_access(db, scenario.requirement_id)
+
     test_case = TestCase(
         scenario_id=scenario.id,
         requirement_id=scenario.requirement_id,
@@ -1894,6 +2881,8 @@ async def append_test_case_step(
     if not test_case:
         raise HTTPException(status_code=404, detail="Test case not found")
 
+    await _require_requirement_access(db, test_case.requirement_id)
+
     if test_case.locked:
         raise HTTPException(status_code=409, detail="Approved test cases are locked. Create a revision before changing steps.")
 
@@ -1923,6 +2912,8 @@ async def generate_requirement_draft(
     except ValueError:
         raise HTTPException(status_code=404, detail="Requirement not found")
 
+    await _require_requirement_access(db, requirement_uuid)
+
     stmt = (
         select(Requirement)
         .where(Requirement.id == requirement_uuid)
@@ -1937,43 +2928,75 @@ async def generate_requirement_draft(
     if requirement.scenarios:
         return requirement
 
-    scenario = TestScenario(
-        requirement_id=requirement.id,
-        title=f"Validate: {requirement.title}",
-        description=f"Generated scenario for requirement {requirement.external_id or requirement.title}.",
-        priority="medium",
-        severity="major",
-        category="functional",
-        type="regression",
-        status="draft",
-    )
-    db.add(scenario)
-    await db.flush()
+    try:
+        generation_service = build_generation_service()
+        generation_result = await generation_service.generate(
+            requirement_id=str(requirement.id),
+            project_id=str(requirement.project_id) if requirement.project_id else None,
+            title=requirement.title,
+            description=requirement.description,
+            external_id=requirement.external_id,
+        )
+    except GenerationConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except GenerationProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    test_case = TestCase(
-        scenario_id=scenario.id,
-        requirement_id=requirement.id,
-        title=f"Verify requirement: {requirement.title}",
-        description="Generated test case for the requirement.",
-        prerequisite="Requirement is defined and accessible.",
-        priority="medium",
-        severity="major",
-        category="functional",
-        type="regression",
-        status="draft",
-    )
-    db.add(test_case)
-    await db.flush()
+    for generated_scenario in generation_result.draft.scenarios:
+        scenario = TestScenario(
+            requirement_id=requirement.id,
+            title=generated_scenario.title,
+            description=generated_scenario.description,
+            priority=generated_scenario.priority,
+            severity=generated_scenario.severity,
+            category=generated_scenario.category,
+            type=generated_scenario.type,
+            status="draft",
+        )
+        db.add(scenario)
+        await db.flush()
 
-    test_step = TestCaseStepModel(
-        test_case_id=test_case.id,
-        step_number=1,
-        action="Execute the primary workflow described in the requirement.",
-        expected_result="The system should behave as described in the requirement.",
-    )
-    db.add(test_step)
+        for generated_case in generated_scenario.test_cases:
+            test_case = TestCase(
+                scenario_id=scenario.id,
+                requirement_id=requirement.id,
+                title=generated_case.title,
+                description=generated_case.description,
+                prerequisite=generated_case.prerequisite,
+                priority=generated_case.priority,
+                severity=generated_case.severity,
+                category=generated_case.category,
+                type=generated_case.type,
+                status="draft",
+            )
+            db.add(test_case)
+            await db.flush()
+
+            for generated_step in generated_case.steps:
+                db.add(
+                    TestCaseStepModel(
+                        test_case_id=test_case.id,
+                        step_number=generated_step.step_number,
+                        action=generated_step.action,
+                        expected_result=generated_step.expected_result,
+                    )
+                )
 
     requirement.status = "generated"
+    requirement.vector_id = generation_result.requirement_vector_id
+    db.add(
+        AuditLog(
+            entity_type="requirement",
+            entity_id=requirement.id,
+            action="rag_generation_completed",
+            actor=current_principal().username,
+            details={
+                "model": generation_result.model,
+                "scenario_count": len(generation_result.draft.scenarios),
+                "retrieved_vector_ids": [item.id for item in generation_result.retrieved_context],
+            },
+        )
+    )
     await db.commit()
     await db.refresh(requirement)
 

@@ -81,8 +81,8 @@ For a new requirement, the system should answer:
 Implementation:
 - compute embeddings for the new requirement and generated cases
 - search against approved test cases
-- apply similarity thresholds
-- use an LLM to classify candidates as duplicate / deprecated / update
+- apply embedding similarity thresholds
+- use a conservative keyword/score heuristic for deprecation and update candidates; require human review
 
 ## Implementation phases
 
@@ -114,7 +114,8 @@ See `design/development-phases.md` for a detailed enterprise-grade roadmap.
 - Completed: Integration with enterprise evaluation and governance tooling surfaces
 
 ### Phase 5: Integration and scale
-- Completed: Jira import automation and test repo synchronization
-- Completed: Enterprise NLP cleanup and validation
-- Completed: Performance, horizontal scale, and vector sync preparation
-- Completed: Security, compliance, and operational monitoring
+- Implemented: Jira Cloud JQL import and durable generic HTTP repository synchronization
+- Implemented: Deterministic NLP cleanup, validation, transactional outbox, authentication, and project RBAC
+- Prototype: Database metrics summary and governance-policy storage
+- Implemented: dependency health checks, generic OIDC federation, and generic/Xray Cloud/TestRail repository adapters.
+- Pending: alert routing, rate limiting, load/recovery evidence, tenant-specific compliance controls, and Zephyr delivery.

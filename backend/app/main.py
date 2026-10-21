@@ -1,7 +1,12 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.auth import auth_router
 from app.api.routes import api_router
+from app.core.security import authenticate_request
 from app.core.config import settings
 
 app = FastAPI(
@@ -12,15 +17,30 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[origin.strip() for origin in settings.auth_allowed_origins.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
-app.include_router(api_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(api_router, prefix="/api/v1", dependencies=[Depends(authenticate_request)])
 
 
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict[str, str]:
     return {"status": "ok", "environment": settings.environment}
+
+
+@app.get("/health/live", tags=["Health"])
+async def liveness_check() -> dict[str, str]:
+    return {"status": "alive"}
+
+
+@app.get("/health/ready", tags=["Health"])
+async def readiness_check(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable"})
+    return {"status": "ready", "database": "healthy"}

@@ -4,20 +4,31 @@ import {
   cleanupRequirementText,
   CleanupResult,
   createGovernancePolicy,
+  DependencyHealthSummary,
   EvaluationRunSummary,
   getGovernancePolicies,
+  getDependencyHealth,
   getMonitoringSummary,
+  getOutboxEvents,
   GovernancePolicySummary,
   importJiraRequirements,
+  importRequirementFile,
   IntegrationRunSummary,
   MonitoringSummary,
+  OutboxEventSummary,
   RepositorySyncRunSummary,
+  ProjectSummary,
   runEvaluationSuite,
+  retryOutboxEvent,
   syncTestRepository,
 } from '../api';
 
-export default function OperationsPage() {
-  const [jiraPath, setJiraPath] = useState('QA-101, QA-102');
+type OperationsPageProps = {
+  selectedProject: ProjectSummary | null;
+};
+
+export default function OperationsPage({ selectedProject }: OperationsPageProps) {
+  const [jiraJql, setJiraJql] = useState('ORDER BY updated DESC');
   const [repository, setRepository] = useState('enterprise-test-repository');
   const [branch, setBranch] = useState('main');
   const [cleanupText, setCleanupText] = useState('TBD user should validate checkout ASAP');
@@ -27,19 +38,27 @@ export default function OperationsPage() {
   const [monitoring, setMonitoring] = useState<MonitoringSummary | null>(null);
   const [importRun, setImportRun] = useState<IntegrationRunSummary | null>(null);
   const [syncRun, setSyncRun] = useState<RepositorySyncRunSummary | null>(null);
+  const [uploadRun, setUploadRun] = useState<IntegrationRunSummary | null>(null);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [cleanupResult, setCleanupResult] = useState<CleanupResult | null>(null);
   const [evaluationRun, setEvaluationRun] = useState<EvaluationRunSummary | null>(null);
   const [policies, setPolicies] = useState<GovernancePolicySummary[]>([]);
+  const [dependencies, setDependencies] = useState<DependencyHealthSummary | null>(null);
+  const [outboxEvents, setOutboxEvents] = useState<OutboxEventSummary[]>([]);
 
   const refreshOperations = async () => {
     try {
       setError(null);
-      const [monitoringData, policyData] = await Promise.all([
+      const [monitoringData, policyData, dependencyData, outboxData] = await Promise.all([
         getMonitoringSummary(),
         getGovernancePolicies(),
+        getDependencyHealth(),
+        getOutboxEvents(),
       ]);
       setMonitoring(monitoringData);
       setPolicies(policyData);
+      setDependencies(dependencyData);
+      setOutboxEvents(outboxData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load operations data');
     }
@@ -64,15 +83,41 @@ export default function OperationsPage() {
 
   const handleImport = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!selectedProject) {
+      setError('Select a project before importing Jira requirements.');
+      return;
+    }
     runAction('import', async () => {
-      setImportRun(await importJiraRequirements(jiraPath));
+      setImportRun(await importJiraRequirements(selectedProject.id, jiraJql));
+    });
+  };
+
+  const handleFileImport = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProject || !uploadFile) {
+      setError('Select a project and requirement file before importing.');
+      return;
+    }
+    runAction('file-import', async () => {
+      setUploadRun(await importRequirementFile(selectedProject.id, uploadFile));
+      setUploadFile(null);
+    });
+  };
+
+  const handleRetryOutbox = (eventId: string) => {
+    runAction(`retry-${eventId}`, async () => {
+      await retryOutboxEvent(eventId);
     });
   };
 
   const handleSync = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!selectedProject) {
+      setError('Select a project before syncing approved test cases.');
+      return;
+    }
     runAction('sync', async () => {
-      setSyncRun(await syncTestRepository(repository, branch));
+      setSyncRun(await syncTestRepository(selectedProject.id, repository, branch));
     });
   };
 
@@ -140,14 +185,60 @@ export default function OperationsPage() {
         </article>
 
         <article className="detail-card">
-          <h2>Jira import</h2>
-          <form onSubmit={handleImport}>
+          <h2>Dependency health</h2>
+          <p className="case-meta" role="status">
+            Overall: {dependencies?.status ?? 'checking'}
+          </p>
+          <div className="history-list">
+            {dependencies?.dependencies.map((dependency) => (
+              <div className="history-card" key={dependency.name}>
+                <strong>{dependency.name.replace(/_/g, ' ')}</strong>
+                <span className={`status-pill status-${dependency.status}`}>{dependency.status.replace(/_/g, ' ')}</span>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="detail-card">
+          <h2>File import</h2>
+          <p className="case-meta">UTF-8 TXT, Markdown, CSV, or JSON · Destination: {selectedProject?.name ?? 'Select a project'}</p>
+          <form onSubmit={handleFileImport}>
             <label>
-              Folder or issue keys
-              <textarea value={jiraPath} onChange={(event) => setJiraPath(event.target.value)} required />
+              Requirement file
+              <input
+                type="file"
+                accept=".txt,.md,.csv,.json,text/plain,text/markdown,text/csv,application/json"
+                onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)}
+                required
+              />
             </label>
             <div className="detail-actions">
-              <button className="primary-button" type="submit" disabled={busy === 'import'}>
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={busy === 'file-import' || !selectedProject || !uploadFile}
+              >
+                {busy === 'file-import' ? 'Importing...' : 'Import file'}
+              </button>
+            </div>
+          </form>
+          {uploadRun ? (
+            <p className="case-meta" role="status">
+              Created {String(uploadRun.result.created_count ?? 0)} · Existing {String(uploadRun.result.existing_count ?? 0)}
+            </p>
+          ) : null}
+        </article>
+
+        <article className="detail-card">
+          <h2>Jira import</h2>
+          <p className="case-meta">Destination: {selectedProject?.name ?? 'Select a project'}</p>
+          <form onSubmit={handleImport}>
+            <label>
+              JQL query
+              <textarea value={jiraJql} onChange={(event) => setJiraJql(event.target.value)} required />
+            </label>
+            <div className="detail-actions">
+              <button className="primary-button" type="submit" disabled={busy === 'import' || !selectedProject}>
                 {busy === 'import' ? 'Importing...' : 'Import Jira'}
               </button>
             </div>
@@ -157,6 +248,7 @@ export default function OperationsPage() {
 
         <article className="detail-card">
           <h2>Repository sync</h2>
+          <p className="case-meta">Project: {selectedProject?.name ?? 'Select a project'}</p>
           <form onSubmit={handleSync}>
             <label>
               Repository
@@ -167,14 +259,14 @@ export default function OperationsPage() {
               <input value={branch} onChange={(event) => setBranch(event.target.value)} required />
             </label>
             <div className="detail-actions">
-              <button className="primary-button" type="submit" disabled={busy === 'sync'}>
+              <button className="primary-button" type="submit" disabled={busy === 'sync' || !selectedProject}>
                 {busy === 'sync' ? 'Syncing...' : 'Sync repository'}
               </button>
             </div>
           </form>
           {syncRun ? (
             <p className="case-meta">
-              Synced {syncRun.synced_count} cases · vectors {syncRun.vector_synced_count}
+              {syncRun.status === 'queued' ? 'Queued' : 'Synced'} {String(syncRun.details.queued_count ?? syncRun.synced_count)} cases
             </p>
           ) : null}
         </article>
@@ -238,6 +330,30 @@ export default function OperationsPage() {
                 </p>
               </div>
             ))}
+          </div>
+        </article>
+
+        <article className="detail-card ops-span-full">
+          <h2>Outbox delivery</h2>
+          <p className="case-meta">Recent indexing and repository delivery events. Failed events can be safely requeued.</p>
+          <div className="history-list">
+            {outboxEvents.length ? outboxEvents.map((item) => (
+              <div className="history-card" key={item.id}>
+                <strong>{item.event_type}</strong>
+                <p className="case-meta">{item.status} · attempts {item.attempts} · {item.aggregate_type} {item.aggregate_id}</p>
+                {item.last_error ? <p className="status-message status-error">{item.last_error}</p> : null}
+                {item.status === 'failed' ? (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => handleRetryOutbox(item.id)}
+                    disabled={busy === `retry-${item.id}`}
+                  >
+                    {busy === `retry-${item.id}` ? 'Requeuing...' : 'Retry event'}
+                  </button>
+                ) : null}
+              </div>
+            )) : <p>No outbox events found.</p>}
           </div>
         </article>
       </section>

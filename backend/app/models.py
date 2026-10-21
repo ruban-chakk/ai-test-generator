@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Text,
     Boolean,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
@@ -17,10 +18,25 @@ from sqlalchemy.orm import declarative_base, relationship
 Base = declarative_base()
 
 
+class Project(Base):
+    __tablename__ = "projects"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False, unique=True)
+    description = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    requirements = relationship("Requirement", back_populates="project")
+    memberships = relationship("ProjectMembership", back_populates="project", cascade="all, delete-orphan")
+
+
 class Requirement(Base):
     __tablename__ = "requirements"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
     external_id = Column(String, index=True)
     title = Column(Text, nullable=False)
     description = Column(Text, nullable=False)
@@ -31,6 +47,7 @@ class Requirement(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
+    project = relationship("Project", back_populates="requirements")
     scenarios = relationship("TestScenario", back_populates="requirement", cascade="all, delete")
     test_cases = relationship("TestCase", back_populates="requirement", cascade="all, delete")
 
@@ -83,6 +100,7 @@ class TestCase(Base):
     requirement = relationship("Requirement", back_populates="test_cases")
     steps = relationship("TestCaseStep", back_populates="test_case", cascade="all, delete")
     versions = relationship("TestCaseVersion", back_populates="test_case", cascade="all, delete")
+    execution_runs = relationship("TestExecutionRun", back_populates="test_case", cascade="all, delete")
 
 
 class TestCaseStep(Base):
@@ -251,6 +269,29 @@ class GovernancePolicy(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class TestExecutionRun(Base):
+    __tablename__ = "test_execution_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    test_case_id = Column(
+        UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    test_case_version = Column(Integer, nullable=False)
+    environment = Column(String, nullable=False, default="default")
+    runner = Column(String, nullable=False, default="generic")
+    status = Column(String, nullable=False, default="queued", index=True)
+    idempotency_key = Column(String, nullable=False, unique=True)
+    external_run_id = Column(String, nullable=True)
+    result = Column(JSON, nullable=False, default=dict)
+    requested_by = Column(String, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    test_case = relationship("TestCase", back_populates="execution_runs")
+
+
 class ApprovalRecord(Base):
     __tablename__ = "approval_records"
 
@@ -271,8 +312,27 @@ class User(Base):
     username = Column(String, nullable=False, unique=True)
     email = Column(String, nullable=False, unique=True)
     role = Column(String, nullable=False)
+    password_hash = Column(String, nullable=False)
+    active = Column(Boolean, nullable=False, default=True)
+    token_version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    project_memberships = relationship("ProjectMembership", back_populates="user", cascade="all, delete-orphan")
+
+
+class ProjectMembership(Base):
+    __tablename__ = "project_memberships"
+    __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_membership"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String, nullable=False, default="reviewer")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    project = relationship("Project", back_populates="memberships")
+    user = relationship("User", back_populates="project_memberships")
 
 
 class AuditLog(Base):
@@ -284,4 +344,23 @@ class AuditLog(Base):
     action = Column(String, nullable=False)
     actor = Column(String, nullable=False)
     details = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_key = Column(String, nullable=False, unique=True)
+    event_type = Column(String, nullable=False, index=True)
+    aggregate_type = Column(String, nullable=False)
+    aggregate_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    payload = Column(JSON, nullable=False, default=dict)
+    status = Column(String, nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    available_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    locked_at = Column(DateTime, nullable=True)
+    locked_by = Column(String, nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+    last_error = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

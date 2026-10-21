@@ -62,6 +62,7 @@ export default function RequirementDetailPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   const [scenarioForm, setScenarioForm] = useState(defaultScenarioValues);
   const [scenarioSaving, setScenarioSaving] = useState(false);
@@ -140,7 +141,7 @@ export default function RequirementDetailPage() {
     targetLevel: 'requirement' | 'scenario' | 'test_case',
   ) => {
     try {
-      setError(null);
+      setHistoryError(null);
       const [feedbackData, approvalsData, auditData, versionData, revisionsData, qualityData] = await Promise.all([
         getFeedback(targetLevel, targetId),
         getApprovals(targetLevel, targetId),
@@ -156,7 +157,7 @@ export default function RequirementDetailPage() {
       setRevisionRecords(revisionsData);
       setQualityRecords(qualityData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to load review history');
+      setHistoryError(err instanceof Error ? err.message : 'Unable to load review history');
     }
   };
 
@@ -620,6 +621,11 @@ export default function RequirementDetailPage() {
 
           <article className="detail-card">
             <h2>Review history</h2>
+            {historyError ? (
+              <div className="status-message status-warning">
+                Review history is unavailable: {historyError}
+              </div>
+            ) : null}
             <div className="governance-strip">
               <div>
                 <span className="detail-label">Selected target</span>
@@ -844,7 +850,7 @@ export default function RequirementDetailPage() {
             </form>
           </article>
 
-          <article className="detail-card">
+          <article className="detail-card" id="test-cases">
             <h2>Scenarios</h2>
             {requirement.scenarios?.length ? (
               requirement.scenarios.map((scenario) => (
@@ -931,55 +937,92 @@ export default function RequirementDetailPage() {
                   )}
 
                   {scenario.test_cases?.length ? (
-                    <div className="case-list">
-                      {scenario.test_cases.map((testCase) => (
-                        <div key={testCase.id} className="case-card">
-                          <div className="case-card-header">
-                            <h4>{testCase.title}</h4>
-                            <div className="case-actions">
-                              <button
-                                className="secondary-button"
-                                type="button"
-                                onClick={() => handleTestCaseApproval(testCase.id, 'approve')}
-                                disabled={actionSaving}
-                              >
-                                Approve
-                              </button>
-                              <button
-                                className="secondary-button"
-                                type="button"
-                                onClick={() => handleTestCaseApproval(testCase.id, 'reject')}
-                                disabled={actionSaving}
-                              >
-                                Reject
-                              </button>
-                              <button
-                                className="secondary-button"
-                                type="button"
-                                onClick={() => handleSelectFeedbackTarget('test_case', testCase.id, true)}
-                              >
-                                Add Feedback
-                              </button>
-                            </div>
-                          </div>
-                          <p>{testCase.description}</p>
-                          <p className="case-meta">
-                            {testCase.type} · {testCase.severity} · {testCase.status} · v{testCase.version} ·{' '}
-                            {testCase.locked ? 'locked' : 'editable'} · {testCase.repository_status}
-                          </p>
-                          {testCase.repository_synced_at ? (
-                            <p className="case-meta">
-                              Repository sync: {new Date(testCase.repository_synced_at).toLocaleString()}
-                            </p>
-                          ) : null}
-                          {testCase.steps?.map((step) => (
-                            <div key={step.step_number} className="case-step">
-                              <strong>Step {step.step_number}:</strong> {step.action}
-                              <div className="expected-result">Expected: {step.expected_result}</div>
-                            </div>
+                    <div className="table-scroll case-table-wrap">
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Test Case</th>
+                            <th scope="col">Type</th>
+                            <th scope="col">Severity</th>
+                            <th scope="col">Status</th>
+                            <th scope="col">Repository</th>
+                            <th scope="col">Steps</th>
+                            <th scope="col" className="actions-column">
+                              Action
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scenario.test_cases.map((testCase) => (
+                            <tr key={testCase.id}>
+                              <td>
+                                <strong>{testCase.title}</strong>
+                                <span className="table-description">{testCase.description}</span>
+                                {testCase.prerequisite ? (
+                                  <span className="table-description">Prerequisite: {testCase.prerequisite}</span>
+                                ) : null}
+                              </td>
+                              <td>{testCase.type ?? '—'}</td>
+                              <td>{testCase.severity ?? '—'}</td>
+                              <td>
+                                <span className="status-pill">{testCase.status}</span>
+                                <span className="table-description">
+                                  v{testCase.version} · {testCase.locked ? 'locked' : 'editable'}
+                                </span>
+                              </td>
+                              <td>
+                                {testCase.repository_status}
+                                {testCase.repository_synced_at ? (
+                                  <span className="table-description">
+                                    Synced {new Date(testCase.repository_synced_at).toLocaleString()}
+                                  </span>
+                                ) : null}
+                              </td>
+                              <td>
+                                {testCase.steps?.length ? (
+                                  <ol className="step-list">
+                                    {testCase.steps.map((step) => (
+                                      <li key={step.step_number}>
+                                        <strong>{step.action}</strong>
+                                        <span>{step.expected_result}</span>
+                                      </li>
+                                    ))}
+                                  </ol>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                              <td>
+                                <div className="table-actions">
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => handleTestCaseApproval(testCase.id, 'approve')}
+                                    disabled={actionSaving}
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => handleTestCaseApproval(testCase.id, 'reject')}
+                                    disabled={actionSaving}
+                                  >
+                                    Reject
+                                  </button>
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => handleSelectFeedbackTarget('test_case', testCase.id, true)}
+                                  >
+                                    Add Feedback
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
                           ))}
-                        </div>
-                      ))}
+                        </tbody>
+                      </table>
                     </div>
                   ) : (
                     <p>No test cases created yet for this scenario.</p>

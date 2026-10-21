@@ -181,8 +181,8 @@ Indexes:
 ## Data consistency
 - Use PostgreSQL foreign keys to enforce relationships.
 - Keep `vector_id` in PostgreSQL to map entities to Pinecone vectors.
-- Use transactions when writing to both PostgreSQL and Pinecone to ensure sync.
-- On failure, retry Pinecone operations and log audit events.
+- Commit canonical state and an outbox intent in one PostgreSQL transaction; never attempt a database/Pinecone dual write.
+- Workers upsert stable vector IDs, recover stale claims, retry transient failures, and retain sanitized failure types.
 
 ## Example table DDL
 

@@ -25,7 +25,7 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 
 ## Scope
 ### In scope
-- Requirement ingestion from Jira folder/documents or manual upload.
+- Requirement ingestion from Jira Cloud JQL, validated UTF-8 files, or manual entry.
 - Generation of test plans, scenarios, and test cases with metadata tags.
 - Review UI with approval/rejection at requirement, scenario, and test case levels.
 - Feedback capture at requirement, scenario, and test case levels.
@@ -35,15 +35,14 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - Impact analysis for duplicates, deprecations, and updates.
 
 ### Out of scope
-- Full Jira API integration in initial phase (folder-based import only initially).
-- Automatic full test execution.
 - Domain-specific test automation code generation.
 - Advanced multi-tenant SaaS billing or tenant isolation beyond enterprise role-based access.
 
 ## Functional requirements
 
 ### Requirement ingestion
-- FR1: The system shall ingest requirement documents from a Jira folder or manual upload.
+- FR1: The system shall ingest Jira Cloud issues selected by JQL, accept manual requirements, or import bounded
+  UTF-8 TXT, Markdown, CSV, and JSON files.
 - FR2: The system shall normalize and clean requirement text for LLM processing.
 - FR3: The system shall store requirement metadata, including source, external ID, title, and description.
 
@@ -72,7 +71,7 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - FR19: The system shall present impact analysis results in the UI.
 
 ### Search and retrieval
-- FR20: The system shall store embeddings for requirements, scenarios, test cases, and feedback in Pinecone.
+- FR20: The system shall store embeddings for requirements, approved test cases, and feedback in Pinecone.
 - FR21: The system shall retrieve relevant historical requirements and approved test cases for generation context.
 - FR22: The system shall support similarity search for duplicate detection and impact analysis.
 
@@ -129,7 +128,7 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - LLM-generated content may hallucinate, so human review is required.
 - Similarity thresholds may require tuning for actual enterprise data.
 - Pinecone costs and indexing limits must be managed for scale.
-- Jira integration may need a later phase if folder import is insufficient.
+- Vendor APIs and tenant custom fields must be validated before each production rollout.
 
 ## Next steps
 - Review and validate requirements with stakeholders.

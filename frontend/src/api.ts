@@ -47,8 +47,26 @@ export type TestScenarioSummary = {
   test_cases?: TestCaseSummary[];
 };
 
+export type ProjectSummary = {
+  id: string;
+  name: string;
+  description?: string;
+  status: string;
+  requirement_count: number;
+  test_case_count: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ProjectCreatePayload = {
+  name: string;
+  description?: string;
+  status?: string;
+};
+
 export type RequirementSummary = {
   id: string;
+  project_id?: string;
   external_id?: string;
   title: string;
   description?: string;
@@ -64,6 +82,7 @@ export type RequirementDetail = RequirementSummary & {
 };
 
 export type RequirementCreatePayload = {
+  project_id?: string;
   external_id?: string;
   title: string;
   description: string;
@@ -186,9 +205,32 @@ export type ImpactAnalysisSummary = {
 
 export type ImpactAnalyzePayload = {
   text: string;
+  project_id?: string;
   context_ids?: string[];
   created_by: string;
 };
+
+export type SemanticSearchResult = {
+  vector_id: string;
+  entity_type: 'requirement' | 'test_case' | 'feedback';
+  entity_id: string;
+  title: string;
+  text: string;
+  score: number;
+  metadata: Record<string, unknown>;
+};
+
+export async function semanticSearch(
+  projectId: string,
+  query: string,
+  entityType?: SemanticSearchResult['entity_type'],
+): Promise<SemanticSearchResult[]> {
+  const params = new URLSearchParams({ project_id: projectId, query });
+  if (entityType) params.set('entity_type', entityType);
+  return request<SemanticSearchResult[]>(`${API_BASE_URL}/search?${params.toString()}`, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
 
 export type IntegrationRunSummary = {
   id: string;
@@ -214,6 +256,22 @@ export type RepositorySyncRunSummary = {
   completed_at?: string;
 };
 
+export type TestExecutionRunSummary = {
+  id: string;
+  project_id: string;
+  test_case_id: string;
+  test_case_version: number;
+  environment: string;
+  runner: string;
+  status: 'queued' | 'running' | 'passed' | 'failed' | 'error' | 'cancelled';
+  external_run_id?: string;
+  result: Record<string, unknown>;
+  requested_by: string;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+};
+
 export type CleanupResult = {
   original_text: string;
   cleaned_text: string;
@@ -235,6 +293,33 @@ export type MonitoringSummary = {
   status: string;
   metrics: Record<string, number>;
   captured_at: string;
+};
+
+export type DependencyStatusSummary = {
+  name: string;
+  status: 'healthy' | 'unhealthy' | 'unreachable' | 'not_configured';
+  configured: boolean;
+};
+
+export type DependencyHealthSummary = {
+  status: 'healthy' | 'degraded';
+  dependencies: DependencyStatusSummary[];
+  checked_at: string;
+};
+
+export type OutboxEventSummary = {
+  id: string;
+  event_type: string;
+  aggregate_type: string;
+  aggregate_id: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  attempts: number;
+  available_at: string;
+  locked_at?: string;
+  locked_by?: string;
+  processed_at?: string;
+  last_error?: string;
+  created_at: string;
 };
 
 export type GovernancePolicySummary = {
@@ -302,53 +387,130 @@ export type ValidationResult = {
   issues: ValidationIssue[];
 };
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000/api/v1';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '/api/v1';
+const browserFetch = globalThis.fetch.bind(globalThis);
+
+async function fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return browserFetch(input, { ...init, credentials: 'include' });
+}
+
+export type AuthenticatedUser = {
+  id: string;
+  username: string;
+  email: string;
+  role: 'reviewer' | 'approver' | 'admin';
+  active: boolean;
+};
+
+export type AuthConfiguration = {
+  oidc_enabled: boolean;
+  oidc_login_url?: string;
+};
+
+export async function getAuthConfiguration(): Promise<AuthConfiguration> {
+  return request<AuthConfiguration>(`${API_BASE_URL}/auth/config`);
+}
+
+export async function login(username: string, password: string): Promise<AuthenticatedUser> {
+  const body = new URLSearchParams({ username, password });
+  const response = await fetch(`${API_BASE_URL}/auth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  await handleResponse<{ access_token: string }>(response);
+  return getCurrentUser();
+}
+
+export async function getCurrentUser(): Promise<AuthenticatedUser> {
+  return request<AuthenticatedUser>(`${API_BASE_URL}/auth/me`);
+}
+
+export async function logout(): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/auth/logout`, { method: 'POST' });
+  if (!response.ok && response.status !== 401) {
+    await handleResponse<never>(response);
+  }
+}
+
+async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  try {
+    const response = await fetch(url, init);
+    return handleResponse<T>(response);
+  } catch (err) {
+    if (err instanceof TypeError) {
+      throw new Error(`Unable to reach API at ${API_BASE_URL}. Check that the backend is running and the dev proxy is active.`);
+    }
+    throw err;
+  }
+}
 
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const errorText = await response.text();
+    const prefix = `${response.status} ${response.statusText} for ${response.url}`;
     try {
       const parsed = JSON.parse(errorText);
       if (typeof parsed.detail === 'string') {
-        throw new Error(parsed.detail);
+        throw new Error(`${prefix}: ${parsed.detail}`);
       }
       if (parsed.detail?.message) {
-        throw new Error(parsed.detail.message);
+        throw new Error(`${prefix}: ${parsed.detail.message}`);
       }
-      throw new Error(JSON.stringify(parsed.detail ?? parsed));
+      throw new Error(`${prefix}: ${JSON.stringify(parsed.detail ?? parsed)}`);
     } catch (err) {
       if (err instanceof Error && err.name !== 'SyntaxError') {
         throw err;
       }
-      throw new Error(errorText || response.statusText);
+      throw new Error(`${prefix}${errorText ? `: ${errorText}` : ''}`);
     }
   }
   return response.json();
 }
 
-export async function getRequirements(search?: string, status?: string): Promise<RequirementSummary[]> {
+export async function getProjects(): Promise<ProjectSummary[]> {
+  return request<ProjectSummary[]>(`${API_BASE_URL}/projects`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
+export async function createProject(payload: ProjectCreatePayload): Promise<ProjectSummary> {
+  const response = await fetch(`${API_BASE_URL}/projects`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<ProjectSummary>(response);
+}
+
+export async function getRequirements(
+  search?: string,
+  status?: string,
+  projectId?: string,
+): Promise<RequirementSummary[]> {
   const params = new URLSearchParams();
   if (search) params.set('search', search);
   if (status) params.set('status', status);
+  if (projectId) params.set('project_id', projectId);
 
   const url = `${API_BASE_URL}/requirements${params.toString() ? `?${params.toString()}` : ''}`;
-  const response = await fetch(url, {
+  return request<RequirementSummary[]>(url, {
     headers: {
       'Content-Type': 'application/json',
     },
   });
-
-  return handleResponse<RequirementSummary[]>(response);
 }
 
 export async function getRequirement(id: string): Promise<RequirementDetail> {
-  const response = await fetch(`${API_BASE_URL}/requirements/${id}`, {
+  return request<RequirementDetail>(`${API_BASE_URL}/requirements/${id}`, {
     headers: {
       'Content-Type': 'application/json',
     },
   });
-
-  return handleResponse<RequirementDetail>(response);
 }
 
 export async function createRequirement(
@@ -366,14 +528,12 @@ export async function createRequirement(
 }
 
 export async function generateRequirementDraft(id: string): Promise<RequirementDetail> {
-  const response = await fetch(`${API_BASE_URL}/requirements/${id}/generate`, {
+  return request<RequirementDetail>(`${API_BASE_URL}/requirements/${id}/generate`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
   });
-
-  return handleResponse<RequirementDetail>(response);
 }
 
 export async function createScenarioForRequirement(
@@ -690,7 +850,9 @@ export async function flagImpactedTestCaseForUpdate(
 }
 
 export async function importJiraRequirements(
-  folderPath: string,
+  projectId: string,
+  jql: string,
+  maxResults = 100,
   requestedBy = 'system',
 ): Promise<IntegrationRunSummary> {
   const response = await fetch(`${API_BASE_URL}/integrations/jira/import`, {
@@ -698,12 +860,27 @@ export async function importJiraRequirements(
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ folder_path: folderPath, requested_by: requestedBy }),
+    body: JSON.stringify({ project_id: projectId, jql, max_results: maxResults, requested_by: requestedBy }),
+  });
+  return handleResponse<IntegrationRunSummary>(response);
+}
+
+export async function importRequirementFile(
+  projectId: string,
+  file: File,
+): Promise<IntegrationRunSummary> {
+  const body = new FormData();
+  body.set('project_id', projectId);
+  body.set('file', file);
+  const response = await fetch(`${API_BASE_URL}/requirements/import-file`, {
+    method: 'POST',
+    body,
   });
   return handleResponse<IntegrationRunSummary>(response);
 }
 
 export async function syncTestRepository(
+  projectId: string,
   repository: string,
   branch = 'main',
   requestedBy = 'system',
@@ -713,9 +890,37 @@ export async function syncTestRepository(
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ repository, branch, requested_by: requestedBy }),
+    body: JSON.stringify({ project_id: projectId, repository, branch, requested_by: requestedBy }),
   });
   return handleResponse<RepositorySyncRunSummary>(response);
+}
+
+export async function getExecutionCandidates(projectId: string): Promise<TestCaseSummary[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<TestCaseSummary[]>(`${API_BASE_URL}/executions/candidates?${params.toString()}`);
+}
+
+export async function getTestExecutions(projectId: string): Promise<TestExecutionRunSummary[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<TestExecutionRunSummary[]>(`${API_BASE_URL}/executions?${params.toString()}`);
+}
+
+export async function queueTestExecutions(
+  projectId: string,
+  testCaseIds: string[],
+  environment: string,
+): Promise<TestExecutionRunSummary[]> {
+  const response = await fetch(`${API_BASE_URL}/executions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      project_id: projectId,
+      test_case_ids: testCaseIds,
+      environment,
+      request_id: crypto.randomUUID(),
+    }),
+  });
+  return handleResponse<TestExecutionRunSummary[]>(response);
 }
 
 export async function cleanupRequirementText(text: string): Promise<CleanupResult> {
@@ -750,6 +955,26 @@ export async function getMonitoringSummary(): Promise<MonitoringSummary> {
     },
   });
   return handleResponse<MonitoringSummary>(response);
+}
+
+export async function getDependencyHealth(): Promise<DependencyHealthSummary> {
+  return request<DependencyHealthSummary>(`${API_BASE_URL}/operations/dependencies`, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export async function getOutboxEvents(status?: OutboxEventSummary['status']): Promise<OutboxEventSummary[]> {
+  const params = new URLSearchParams();
+  if (status) params.set('status', status);
+  return request<OutboxEventSummary[]>(
+    `${API_BASE_URL}/operations/outbox${params.toString() ? `?${params.toString()}` : ''}`,
+    { headers: { 'Content-Type': 'application/json' } },
+  );
+}
+
+export async function retryOutboxEvent(eventId: string): Promise<OutboxEventSummary> {
+  const response = await fetch(`${API_BASE_URL}/operations/outbox/${eventId}/retry`, { method: 'POST' });
+  return handleResponse<OutboxEventSummary>(response);
 }
 
 export async function createGovernancePolicy(

@@ -8,7 +8,7 @@ This project is an enterprise-grade AI test case generation platform built with:
 - PostgreSQL for structured metadata and audit data
 - Pinecone for embeddings-based retrieval and similarity search
 - LLM provider for embeddings and generation
-- Docker for local development of PostgreSQL and Pinecone
+- Docker for local PostgreSQL and application services; Pinecone is an externally provisioned data-plane service
 
 The architecture is designed for enterprise quality, auditability, and scalability.
 
@@ -29,7 +29,7 @@ The UI exposes a rich card-based experience with collapsible hierarchies, tag ch
 ### 2. Backend API
 
 The Python backend is responsible for:
-- ingesting requirements from Jira folder uploads or manual entry
+- ingesting requirements from Jira Cloud JQL or manual entry
 - storing metadata in PostgreSQL
 - coordinating LLM-driven generation and RAG retrieval
 - writing and updating Pinecone embeddings
@@ -73,9 +73,9 @@ The pipeline supports feedback-informed revision by including user feedback and 
 ### 5. Integrations
 
 The initial enterprise design includes:
-- Jira folder/document ingestion as the first integration point
+- Jira Cloud JQL ingestion through the REST API
 - Test case repository persistence for approved cases
-- Optional future Jira API and enterprise tool integration
+- Xray Cloud and TestRail adapters publish immutable approved versions; Zephyr remains a future integration
 
 ## Data flow
 
@@ -93,7 +93,7 @@ The initial enterprise design includes:
 
 A Docker Compose environment should provision:
 - `postgres` for metadata storage
-- `pinecone` for local vector search (Pinecone local emulator or compatible service)
+- an externally provisioned Pinecone index configured by data-plane host
 - optional backend and frontend services for development
 
 This keeps the enterprise stack reproducible in development and testing.

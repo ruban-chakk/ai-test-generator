@@ -1,305 +1,124 @@
-# API / Endpoints Specification
+# Implemented API specification
 
-## Base URL
+Base URL: `/api/v1`. JSON responses are returned directly rather than inside a resource envelope.
 
-- `/api/v1`
+## Authentication and authorization
 
-## Authentication
+- `GET /auth/config` advertises whether enterprise SSO is enabled.
+- `GET /auth/oidc/login` and `GET /auth/oidc/callback` implement generic OIDC authorization-code login with
+  signed state, nonce validation, issuer/audience/signature checks, and optional allowlisted auto-provisioning.
+- `POST /auth/token` accepts OAuth2 password-form fields and sets a revocable HttpOnly, SameSite session cookie.
+- `GET /auth/me` returns the authenticated database user.
+- `POST /auth/logout` revokes the current token version and clears the cookie.
+- Automation may use the returned JWT as a Bearer token.
+- Every endpoint below requires authentication. Global roles are `reviewer`, `approver`, and `admin`; project
+  memberships further restrict project resources. Browser state-changing cookie requests are Origin checked.
+- Client fields such as `created_by`, `requested_by`, and `approved_by` are compatibility inputs only. The server
+  always attributes state changes to the authenticated principal.
 
-- Bearer token or session-based auth
-- Role-based authorization for reviewer, approver, admin
+## Projects and requirements
 
-## Endpoints
+- `GET /projects` — list projects visible to the caller, with requirement/test-case counts.
+- `POST /projects` — create a project (global admin).
+- `GET /projects/{project_id}/members` — list memberships (project admin).
+- `PUT /projects/{project_id}/members` — add or update a membership (project admin).
+- `GET /requirements?project_id=&status=&source=&search=&limit=&offset=` — list visible requirements.
+- `POST /requirements` — create a project-scoped requirement.
+- `POST /requirements/import-file` — import bounded UTF-8 TXT, Markdown, CSV, or JSON requirements; file content
+  is treated as untrusted and raw documents are not retained.
+- `GET /requirements/{requirement_id}` — retrieve a requirement, nested scenarios, cases, and steps.
+- `POST /requirements/{requirement_id}/generate` — run configured OpenAI-compatible generation with
+  project-filtered Pinecone retrieval and persist a schema-validated draft. Returns `503` if unconfigured and `502`
+  on provider failure; it never substitutes canned output.
+- `POST /requirements/{requirement_id}/scenarios`, `POST /scenarios/{scenario_id}/test_cases`, and
+  `POST /test_cases/{test_case_id}/steps` — manually add draft artifacts.
 
-### Requirements
+## Review, feedback, and quality
 
-#### GET /api/v1/requirements
-- Description: List requirements with filters
-- Query params:
-  - `status` (draft, generated, reviewed, archived)
-  - `source` (jira, upload, manual)
-  - `search`
-  - `page`, `limit`
-- Response:
-  - `requirements: [RequirementSummary]`
+- `POST /requirements/{id}/approve|reject`
+- `POST /scenarios/{id}/approve|reject`
+- `POST /test_cases/{id}/approve|reject`
+- `GET /test_cases/{id}/versions`
+- `POST /feedback`, `GET /feedback?target_level=&target_id=`
+- `POST /feedback/revise` — resolve feedback. `revise` and `generate_new` call the configured structured generator
+  with the requirement, current target, feedback, and project-scoped retrieved context. Deprecation requires an
+  approver. Processing the same feedback again returns its existing resolution.
+- `GET /revisions`, `GET /approvals`, `GET /audit`
+- `GET /validate/{target_level}/{target_id}`, `POST /quality/{target_level}/{target_id}`, `GET /quality`
 
-#### POST /api/v1/requirements
-- Description: Create or ingest a requirement
-- Body:
-  - `external_id`: string
-  - `title`: string
-  - `description`: string
-  - `source`: string
-  - `metadata`: object
-- Response:
-  - `requirement: RequirementDetail`
+Approved cases are locked and versioned. Vector indexing is queued in the same PostgreSQL transaction through the
+outbox; it is not a synchronous database-plus-provider dual write.
 
-#### GET /api/v1/requirements/{requirement_id}
-- Description: Retrieve requirement details
-- Response:
-  - `requirement: RequirementDetail`
+## Semantic impact
 
-#### POST /api/v1/requirements/{requirement_id}/generate
-- Description: Generate scenarios and test cases for requirement
-- Body:
-  - `force`: boolean (optional)
-  - `feedback_context`: string (optional)
-- Response:
-  - `generation_id`: string
-  - `status`: string
+- `GET /search?project_id=&query=&entity_type=&limit=` — project-filtered semantic search over indexed artifacts.
 
-#### POST /api/v1/requirements/{requirement_id}/refresh
-- Description: Re-run generation with updated feedback or data
-- Body:
-  - `feedback_ids`: [uuid]
-- Response:
-  - `status`: string
+- `GET /requirements/{requirement_id}/impact`
+- `POST /impact/analyze` with `project_id`, `text`, and optional project-consistent `context_ids`.
+- `GET /impact`
+- `POST /impact/test_cases/{id}/deprecate|review-update`
 
-### Scenarios
+The service uses embedding cosine scores from Pinecone. Duplicate classification uses a `0.80` threshold; update
+and deprecation recommendations remain heuristics that require human review and dataset calibration.
 
-#### GET /api/v1/requirements/{requirement_id}/scenarios
-- Description: List scenarios for requirement
-- Response:
-  - `scenarios: [TestScenarioSummary]`
+## External integrations
 
-#### GET /api/v1/scenarios/{scenario_id}
-- Description: Retrieve scenario details
-- Response:
-  - `scenario: TestScenarioDetail`
+### `POST /integrations/jira/import`
 
-#### POST /api/v1/scenarios/{scenario_id}/approve
-- Description: Approve a scenario and optionally its cases
-- Body:
-  - `approve_cases`: boolean
-  - `notes`: string
-- Response:
-  - `approval_record: ApprovalRecord`
+Admin-only body:
 
-#### POST /api/v1/scenarios/{scenario_id}/reject
-- Description: Reject a scenario
-- Body:
-  - `reason`: string
-- Response:
-  - `status`: string
+```json
+{"project_id":"uuid","jql":"project = QA ORDER BY updated DESC","max_results":100}
+```
 
-### Test Cases
+The adapter calls Jira Cloud `POST /rest/api/3/search/jql`, follows `nextPageToken`, upserts by
+`(project_id, issue_key)`, and queues vector indexing. The response is an integration run with truthful
+`running`, `completed`, or `failed` state.
 
-#### GET /api/v1/scenarios/{scenario_id}/testcases
-- Description: List test cases for a scenario
-- Response:
-  - `test_cases: [TestCaseSummary]`
+### `POST /integrations/test-repo/sync`
 
-#### GET /api/v1/testcases/{test_case_id}
-- Description: Retrieve a test case
-- Response:
-  - `test_case: TestCaseDetail`
+Approver/admin body:
 
-#### PUT /api/v1/testcases/{test_case_id}
-- Description: Update test case content or metadata
-- Body:
-  - `title`: string
-  - `description`: string
-  - `prerequisite`: string
-  - `priority`: string
-  - `severity`: string
-  - `category`: string
-  - `type`: string
-  - `steps`: [TestCaseStepInput]
-- Response:
-  - `test_case: TestCaseDetail`
+```json
+{"project_id":"uuid","repository":"qa-cases","branch":"main"}
+```
 
-#### POST /api/v1/testcases/{test_case_id}/approve
-- Description: Approve a test case
-- Body:
-  - `notes`: string
-- Response:
-  - `approval_record: ApprovalRecord`
+The endpoint queues approved cases and returns a repository sync run. The outbox worker delivers through the
+configured generic HTTP, Xray Cloud, or TestRail adapter; completion is recorded only after all deliveries succeed.
 
-#### POST /api/v1/testcases/{test_case_id}/reject
-- Description: Reject a test case
-- Body:
-  - `reason`: string
-- Response:
-  - `status`: string
+- `GET /integrations/runs` and `GET /integrations/test-repo/sync` are admin-only run history endpoints.
 
-#### POST /api/v1/testcases/{test_case_id}/version
-- Description: Create a new version for a test case
-- Body:
-  - `changes`: object
-  - `notes`: string
-- Response:
-  - `test_case: TestCaseDetail`
+## Operations
 
-### Feedback
+- `POST /nlp/cleanup` — deterministic text cleanup.
+- `POST /evals/run`, `GET /evals` — rule-based quality suite and history.
+- `GET /monitoring/summary` — database counters.
+- `GET /operations/dependencies` — sanitized live provider probes.
+- `GET /operations/outbox`, `POST /operations/outbox/{id}/retry` — inspect and safely retry delivery failures.
+- `POST /governance/policies`, `GET /governance/policies` — governance policy storage.
+- `GET /repository/test_cases` — list cases visible to the caller.
 
-#### POST /api/v1/feedback
-- Description: Submit feedback on requirement, scenario, or test case
-- Body:
-  - `target_level`: requirement | scenario | test_case
-  - `target_id`: uuid
-  - `feedback_type`: revise | generate_new | deprecate | accept | reject
-  - `comment`: string
-  - `created_by`: string
-- Response:
-  - `feedback: FeedbackDetail`
+Outside the API prefix, `GET /health/live` is a process liveness check and `GET /health/ready` verifies database
+readiness.
 
-#### GET /api/v1/feedback?target_level=&target_id=
-- Description: List feedback entries for a target
-- Response:
-  - `feedback: [FeedbackDetail]`
+## Automated execution
 
-### Impact analysis
+- `GET /executions/candidates?project_id=` — approved test-case versions visible to the caller.
+- `POST /executions` — queue one or more approved cases for an environment using a caller-generated request UUID.
+- `GET /executions?project_id=&status=&limit=` and `GET /executions/{run_id}` — project-scoped run history.
 
-#### GET /api/v1/requirements/{requirement_id}/impact
-- Description: Compute impact analysis for a requirement
-- Response:
-  - `duplicates: [ImpactCandidate]`
-  - `deprecations: [ImpactCandidate]`
-  - `updates: [ImpactCandidate]`
-  - `similarity_threshold`: number
+Execution delivery is transactional-outbox backed. The configured runner receives a stable idempotency key and
+must return a terminal result; the application records passed, failed, or exhausted-provider-error state.
 
-#### POST /api/v1/impact/analyze
-- Description: Analyze a free-form requirement or requirement draft
-- Body:
-  - `text`: string
-  - `context_ids`: [uuid]
-- Response:
-  - `impact_result: ImpactAnalysisResult`
+## Error semantics
 
-### Search
+- `401`: missing, invalid, expired, or revoked authentication.
+- `403`: authenticated but insufficient global/project role or rejected Origin.
+- `404`: absent or non-visible resource (used to avoid project enumeration).
+- `409`: locked/conflicting state.
+- `422`: invalid input or governance validation failure.
+- `502`: configured external provider failed.
+- `503`: required external provider or secret is not configured.
 
-#### GET /api/v1/search
-- Description: Global search across requirements, scenarios, and test cases
-- Query params:
-  - `query`: string
-  - `entity_type`: requirement | scenario | test_case
-  - `status`:
-- Response:
-  - `results: [SearchResult]`
-
-### Admin / integration
-
-#### POST /api/v1/integrations/jira/import
-- Description: Import requirements from a Jira folder abstraction
-- Body:
-  - `folder_path`: string
-- Response:
-  - `imported_count`: number
-
-#### POST /api/v1/integrations/test-repo/sync
-- Description: Sync approved test cases to the repository
-- Body:
-  - `repository`: string
-  - `branch`: string
-- Response:
-  - `status`: string
-
-## Data contracts
-
-### RequirementSummary
-- `id`: uuid
-- `external_id`: string
-- `title`: string
-- `status`: string
-- `source`: string
-- `created_at`: datetime
-- `updated_at`: datetime
-
-### RequirementDetail
-- includes RequirementSummary plus:
-- `description`: string
-- `metadata`: object
-- `scenarios`: [TestScenarioSummary]
-- `feedback_count`: number
-- `approval_status`: string
-
-### TestScenarioSummary
-- `id`: uuid
-- `title`: string
-- `description`: string
-- `priority`: string
-- `severity`: string
-- `category`: string
-- `type`: string
-- `status`: string
-- `version`: number
-- `approved_at`: datetime | null
-
-### TestScenarioDetail
-- includes TestScenarioSummary plus:
-- `test_cases`: [TestCaseSummary]
-- `feedback_count`: number
-- `approval_records`: [ApprovalRecord]
-
-### TestCaseSummary
-- `id`: uuid
-- `title`: string
-- `status`: string
-- `version`: number
-- `priority`: string
-- `severity`: string
-- `category`: string
-- `type`: string
-- `approved_at`: datetime | null
-
-### TestCaseDetail
-- includes TestCaseSummary plus:
-- `description`: string
-- `prerequisite`: string
-- `steps`: [TestCaseStep]
-- `requirement_id`: uuid
-- `scenario_id`: uuid
-- `feedback_count`: number
-- `approval_records`: [ApprovalRecord]
-
-### TestCaseStepInput
-- `step_number`: integer
-- `action`: string
-- `expected_result`: string
-
-### FeedbackDetail
-- `id`: uuid
-- `target_level`: string
-- `target_id`: uuid
-- `feedback_type`: string
-- `comment`: string
-- `created_by`: string
-- `created_at`: datetime
-
-### ApprovalRecord
-- `id`: uuid
-- `target_level`: string
-- `target_id`: uuid
-- `approved_by`: string
-- `approved_at`: datetime
-- `version`: integer
-- `status`: string
-- `notes`: string
-
-### ImpactCandidate
-- `entity_id`: uuid
-- `entity_type`: requirement | scenario | test_case
-- `title`: string
-- `similarity`: number
-- `reason`: string
-
-### SearchResult
-- `entity_type`: string
-- `entity_id`: uuid
-- `title`: string
-- `snippet`: string
-- `status`: string
-
-## Error handling
-
-- 400 Bad Request: invalid payload
-- 401 Unauthorized: missing or invalid credentials
-- 403 Forbidden: insufficient permissions
-- 404 Not Found: missing entity
-- 500 Internal Server Error: unexpected failure
-
-## Notes
-
-- Every create/update/approve/reject action should be recorded in audit logs.
-- Generation and impact endpoints should return `status` and `request_id` for async processing if needed.
-- Feedback submissions should optionally support `context_id` to link to AI revision history.
+Not implemented: Zephyr Cloud delivery, alert routing, distributed rate limiting,
+tenant-specific compliance exports, semantic threshold calibration, load certification, and disaster-recovery drills.
