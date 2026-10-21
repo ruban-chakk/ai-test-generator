@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     pinecone_namespace: str = "ai-test-generator"
     pinecone_control_plane_url: str = "https://api.pinecone.io"
     pinecone_api_version: str = "2026-07"
+    vector_maintenance_interval_seconds: int = 21_600
+    vector_maintenance_repair_missing: bool = True
+    vector_maintenance_delete_orphans: bool = False
     outbox_batch_size: int = 25
     outbox_max_attempts: int = 8
     outbox_lock_timeout_seconds: int = 300

@@ -112,6 +112,7 @@ class MappedImportJob(Base):
     updated_record_count = Column(Integer, nullable=False, default=0)
     existing_record_count = Column(Integer, nullable=False, default=0)
     skipped_record_count = Column(Integer, nullable=False, default=0)
+    unresolved_record_count = Column(Integer, nullable=False, default=0)
     warning_count = Column(Integer, nullable=False, default=0)
     error_count = Column(Integer, nullable=False, default=0)
     result = Column(JSON, nullable=False, default=dict)
@@ -122,6 +123,32 @@ class MappedImportJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
+
+
+class UnresolvedImportRecord(Base):
+    __tablename__ = "unresolved_import_records"
+    __table_args__ = (UniqueConstraint("dedupe_sha256", name="uq_unresolved_import_dedupe"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    profile_id = Column(
+        UUID(as_uuid=True), ForeignKey("import_mapping_profiles.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    import_job_id = Column(
+        UUID(as_uuid=True), ForeignKey("mapped_import_jobs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    entity_type = Column(String(32), nullable=False, default="test_case")
+    external_id = Column(String(255), nullable=False)
+    missing_reference = Column(String(255), nullable=False, index=True)
+    canonical_payload = Column(JSON, nullable=False)
+    dedupe_sha256 = Column(String(64), nullable=False, unique=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    retry_count = Column(Integer, nullable=False, default=0)
+    last_error_type = Column(String(255), nullable=True)
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
 
 
 class Requirement(Base):
@@ -345,6 +372,27 @@ class IntegrationRun(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
+class IntegrationSchedule(Base):
+    __tablename__ = "integration_schedules"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    integration_type = Column(String(32), nullable=False, default="jira")
+    configuration = Column(JSON, nullable=False, default=dict)
+    interval_seconds = Column(Integer, nullable=False, default=3600)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    next_run_at = Column(DateTime, nullable=False, index=True)
+    last_run_at = Column(DateTime, nullable=True)
+    last_status = Column(String(32), nullable=True)
+    last_error_type = Column(String(255), nullable=True)
+    locked_at = Column(DateTime, nullable=True)
+    locked_by = Column(String(255), nullable=True)
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class RepositorySyncRun(Base):
     __tablename__ = "repository_sync_runs"
 
@@ -461,6 +509,57 @@ class SemanticCalibrationRun(Base):
     requested_by = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     applied_at = Column(DateTime, nullable=True)
+
+
+class SearchEvent(Base):
+    __tablename__ = "search_events"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    query = Column(Text, nullable=False)
+    mode = Column(String(32), nullable=False)
+    entity_type = Column(String(32), nullable=True)
+    result_count = Column(Integer, nullable=False, default=0)
+    offset = Column(Integer, nullable=False, default=0)
+    latency_ms = Column(Integer, nullable=False, default=0)
+    semantic_fallback = Column(Boolean, nullable=False, default=False)
+    requested_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class SearchJudgment(Base):
+    __tablename__ = "search_judgments"
+    __table_args__ = (
+        UniqueConstraint("search_event_id", "entity_type", "entity_id", name="uq_search_judgment_result"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    search_event_id = Column(
+        UUID(as_uuid=True), ForeignKey("search_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    entity_type = Column(String(32), nullable=False)
+    entity_id = Column(String(255), nullable=False)
+    rank = Column(Integer, nullable=False)
+    judgment = Column(String(32), nullable=False)
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class SavedSearch(Base):
+    __tablename__ = "saved_searches"
+    __table_args__ = (
+        UniqueConstraint("project_id", "created_by", "name", name="uq_saved_search_owner_name"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    query = Column(Text, nullable=False)
+    mode = Column(String(32), nullable=False, default="hybrid")
+    entity_type = Column(String(32), nullable=True)
+    created_by = Column(String(255), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class ApprovalRecord(Base):

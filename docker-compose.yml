@@ -34,6 +34,9 @@ services:
       - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
       - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
       - PINECONE_API_VERSION=${PINECONE_API_VERSION:-2026-07}
+      - VECTOR_MAINTENANCE_INTERVAL_SECONDS=${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
+      - VECTOR_MAINTENANCE_REPAIR_MISSING=${VECTOR_MAINTENANCE_REPAIR_MISSING:-true}
+      - VECTOR_MAINTENANCE_DELETE_ORPHANS=${VECTOR_MAINTENANCE_DELETE_ORPHANS:-false}
       - VECTOR_CHUNKING_ENABLED=${VECTOR_CHUNKING_ENABLED:-true}
       - VECTOR_CHUNK_TARGET_TOKENS=${VECTOR_CHUNK_TARGET_TOKENS:-700}
       - VECTOR_CHUNK_MAX_TOKENS=${VECTOR_CHUNK_MAX_TOKENS:-1000}
@@ -176,6 +179,43 @@ services:
     restart: on-failure
     volumes:
       - import_spool:/var/lib/ai-test-generator/imports
+
+  vector-maintenance:
+    build:
+      context: ./backend
+    container_name: ai-testgen-vector-maintenance
+    command: ["python", "scripts/maintain_vectors.py", "--interval-seconds", "${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_HOST=${PINECONE_HOST:-}
+      - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
+      - VECTOR_MAINTENANCE_INTERVAL_SECONDS=${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
+      - VECTOR_MAINTENANCE_REPAIR_MISSING=${VECTOR_MAINTENANCE_REPAIR_MISSING:-true}
+      - VECTOR_MAINTENANCE_DELETE_ORPHANS=${VECTOR_MAINTENANCE_DELETE_ORPHANS:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
+  integration-scheduler:
+    build:
+      context: ./backend
+    container_name: ai-testgen-integration-scheduler
+    command: ["python", "scripts/process_integration_schedules.py"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - JIRA_BASE_URL=${JIRA_BASE_URL:-}
+      - JIRA_EMAIL=${JIRA_EMAIL:-}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+      - JIRA_TIMEOUT_SECONDS=${JIRA_TIMEOUT_SECONDS:-30}
+      - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
 
 volumes:
   postgres_data:

@@ -6,14 +6,27 @@ import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.api.routes import (
+    get_search_analytics,
+    get_custom_field_facets,
+    list_saved_searches,
+    record_search_judgment,
+    save_search,
+    semantic_search,
+)
+from app.core.security import Principal, _principal_context
 from app.models import (
     Feedback,
     Project,
     Requirement,
+    SavedSearch,
+    SearchEvent,
+    SearchJudgment,
     TestCase as CaseModel,
     TestCaseStep as StepModel,
     TestScenario as ScenarioModel,
 )
+from app.schemas import SavedSearchCreate, SearchJudgmentCreate
 from app.services.search import KeywordSearchService
 
 
@@ -43,6 +56,7 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                     description="An expired reset token must never change credentials.",
                     source="manual",
                     status="approved",
+                    metadata_json={"custom_fields": {"risk": "high"}},
                 )
                 hidden_requirement = Requirement(
                     project_id=other_project.id,
@@ -119,6 +133,16 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                 )
                 assert [match.entity_id for match in scenario_matches] == [str(test_case.id)]
                 assert "scenario" in scenario_matches[0].matched_fields
+
+                custom_matches = await service.search(
+                    "expired token",
+                    project_id=str(project.id),
+                    entity_type="requirement",
+                    custom_field="risk",
+                    custom_value="high",
+                    limit=10,
+                )
+                assert [match.entity_id for match in custom_matches] == [str(requirement.id)]
         finally:
             if project_id or other_project_id:
                 async with session_factory() as db:
@@ -164,6 +188,103 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                     if other_project_id:
                         await db.execute(delete(Requirement).where(Requirement.project_id == other_project_id))
                     await db.execute(delete(Project).where(Project.id.in_([project_id, other_project_id])))
+                    await db.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_search_pagination_saved_searches_and_relevance_analytics() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(TEST_DSN)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        project_id: uuid.UUID | None = None
+        token = _principal_context.set(
+            Principal(user_id=uuid.uuid4(), username="search-admin", role="admin", token_version=1)
+        )
+        try:
+            async with session_factory() as db:
+                project = Project(name=f"search-learning-{uuid.uuid4()}", status="active")
+                db.add(project)
+                await db.flush()
+                project_id = project.id
+                db.add_all(
+                    [
+                        Requirement(
+                            project_id=project.id,
+                            external_id=f"SEARCH-{index}",
+                            title=f"Token validation case {index}",
+                            description="Validate expiring authentication tokens safely.",
+                            source="manual",
+                            status="approved",
+                            metadata_json={"custom_fields": {"risk": "high"}},
+                        )
+                        for index in range(3)
+                    ]
+                )
+                await db.commit()
+
+                first_page = await semantic_search(
+                    project_id=project.id,
+                    query="validating tokens",
+                    entity_type="requirement",
+                    limit=2,
+                    offset=0,
+                    mode="keyword",
+                    db=db,
+                )
+                second_page = await semantic_search(
+                    project_id=project.id,
+                    query="validating tokens",
+                    entity_type="requirement",
+                    limit=2,
+                    offset=2,
+                    mode="keyword",
+                    db=db,
+                )
+                assert len(first_page) == 2
+                assert len(second_page) == 1
+                assert {item.entity_id for item in first_page}.isdisjoint(
+                    {item.entity_id for item in second_page}
+                )
+
+                event_id = uuid.UUID(first_page[0].metadata["search_event_id"])
+                await record_search_judgment(
+                    SearchJudgmentCreate(
+                        search_event_id=event_id,
+                        entity_type="requirement",
+                        entity_id=first_page[0].entity_id,
+                        rank=1,
+                        judgment="relevant",
+                    ),
+                    db,
+                )
+                await save_search(
+                    SavedSearchCreate(
+                        project_id=project.id,
+                        name="Token checks",
+                        query="validating tokens",
+                        mode="keyword",
+                        entity_type="requirement",
+                    ),
+                    db,
+                )
+                assert len(await list_saved_searches(project.id, db)) == 1
+                analytics = await get_search_analytics(project.id, db)
+                assert analytics.query_count == 2
+                assert analytics.judgments == {"relevant": 1}
+                facets = await get_custom_field_facets(project.id, "risk", db)
+                assert facets.values == [{"value": "high", "count": 3}]
+        finally:
+            _principal_context.reset(token)
+            if project_id:
+                async with session_factory() as db:
+                    event_ids = select(SearchEvent.id).where(SearchEvent.project_id == project_id)
+                    await db.execute(delete(SearchJudgment).where(SearchJudgment.search_event_id.in_(event_ids)))
+                    await db.execute(delete(SearchEvent).where(SearchEvent.project_id == project_id))
+                    await db.execute(delete(SavedSearch).where(SavedSearch.project_id == project_id))
+                    await db.execute(delete(Requirement).where(Requirement.project_id == project_id))
+                    await db.execute(delete(Project).where(Project.id == project_id))
                     await db.commit()
             await engine.dispose()
 

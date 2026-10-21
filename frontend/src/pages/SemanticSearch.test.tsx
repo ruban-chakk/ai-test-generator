@@ -1,14 +1,17 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { searchArtifacts } from '../api';
+import { getSavedSearches, searchArtifacts } from '../api';
 import SemanticSearchPage from './SemanticSearch';
 
 
 vi.mock('../api', () => ({
   searchArtifacts: vi.fn(),
+  getSavedSearches: vi.fn(),
+  saveArtifactSearch: vi.fn(),
+  recordSearchJudgment: vi.fn(),
 }));
 
 const project = {
@@ -20,6 +23,9 @@ const project = {
 };
 
 describe('Search page', () => {
+  beforeEach(() => {
+    vi.mocked(getSavedSearches).mockResolvedValue([]);
+  });
   it('runs hybrid search by default and displays ranking evidence', async () => {
     const user = userEvent.setup();
     vi.mocked(searchArtifacts).mockResolvedValue([

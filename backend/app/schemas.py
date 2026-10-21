@@ -110,6 +110,7 @@ class MappedImportJobSummary(APIModel):
     updated_record_count: int
     existing_record_count: int
     skipped_record_count: int
+    unresolved_record_count: int
     warning_count: int
     error_count: int
     result: dict = Field(default_factory=dict)
@@ -118,6 +119,23 @@ class MappedImportJobSummary(APIModel):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+
+
+class UnresolvedImportRecordSummary(APIModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    profile_id: uuid.UUID
+    import_job_id: Optional[uuid.UUID] = None
+    entity_type: str
+    external_id: str
+    missing_reference: str
+    status: str
+    retry_count: int
+    last_error_type: Optional[str] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: Optional[datetime] = None
 
 
 
@@ -201,6 +219,50 @@ class SemanticSearchResult(APIModel):
     matched_fields: List[str] = Field(default_factory=list)
 
 
+class SearchJudgmentCreate(APIModel):
+    search_event_id: uuid.UUID
+    entity_type: Literal["requirement", "test_case", "feedback"]
+    entity_id: str = Field(min_length=1, max_length=255)
+    rank: int = Field(ge=1, le=1000)
+    judgment: Literal["clicked", "relevant", "not_relevant"]
+
+
+class SearchJudgmentSummary(SearchJudgmentCreate):
+    id: uuid.UUID
+    created_by: str
+    created_at: datetime
+
+
+class SavedSearchCreate(APIModel):
+    project_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=255)
+    query: str = Field(min_length=2, max_length=500)
+    mode: Literal["semantic", "keyword", "hybrid"] = "hybrid"
+    entity_type: Optional[Literal["requirement", "test_case", "feedback"]] = None
+
+
+class SavedSearchSummary(SavedSearchCreate):
+    id: uuid.UUID
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class SearchAnalyticsSummary(APIModel):
+    project_id: uuid.UUID
+    query_count: int
+    zero_result_count: int
+    fallback_count: int
+    average_latency_ms: float
+    judgments: dict[str, int] = Field(default_factory=dict)
+    top_queries: List[dict] = Field(default_factory=list)
+
+
+class CustomFieldFacetSummary(APIModel):
+    field: str
+    values: List[dict] = Field(default_factory=list)
+
+
 class ImpactCandidate(APIModel):
     test_case_id: uuid.UUID
     requirement_id: uuid.UUID
@@ -281,6 +343,26 @@ class IntegrationRunSummary(APIModel):
     result: dict
     started_at: datetime
     completed_at: Optional[datetime] = None
+
+
+class IntegrationScheduleCreate(APIModel):
+    project_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=255)
+    integration_type: Literal["jira"] = "jira"
+    configuration: dict[str, Any]
+    interval_seconds: int = Field(default=3600, ge=300, le=2_592_000)
+    enabled: bool = True
+
+
+class IntegrationScheduleSummary(IntegrationScheduleCreate):
+    id: uuid.UUID
+    next_run_at: datetime
+    last_run_at: Optional[datetime] = None
+    last_status: Optional[str] = None
+    last_error_type: Optional[str] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
 
 
 

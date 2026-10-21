@@ -90,8 +90,11 @@ outbox event atomically. Provider calls remain asynchronous.
 The project Search page supports `hybrid`, `semantic`, and `keyword` modes through `GET /api/v1/search`.
 Semantic mode uses project-filtered Pinecone retrieval. Keyword mode uses PostgreSQL full-text search over
 requirements, approved test cases, and feedback. Hybrid mode combines both ranked lists with reciprocal-rank
-fusion and returns the semantic score, keyword score, and matched fields as ranking evidence. Apply the latest
-Alembic migration to install the supporting GIN indexes.
+fusion and returns the semantic score, keyword score, and matched fields as ranking evidence. Keyword retrieval
+uses English stemming and typo-tolerant trigram matching. Search supports offset pagination, project synonym/RRF
+policies, typed custom-field filters and facets, saved searches, click/relevance judgments, analytics, and automatic
+keyword fallback when the semantic provider is unavailable. Apply the latest Alembic migration to install the
+supporting GIN indexes and `pg_trgm` extension.
 
 Approved test cases and submitted feedback are indexed through a transactional outbox. Run one batch locally:
 
@@ -125,12 +128,27 @@ python scripts/process_outbox.py --once
 The command only commits canonical vector identifiers, audit evidence, and outbox intents. Provider calls remain in
 the worker, so a database transaction is never coupled to a Pinecone request.
 
+Logical requirement sections and test steps are embedded as bounded parent/child chunks. The durable
+`vector_chunks` inventory reconciles stale children whenever content shrinks. Run a one-off namespace audit or the
+scheduled worker to detect missing/orphan vectors and capture Pinecone vector-count/storage estimates:
+
+```bash
+python scripts/maintain_vectors.py --no-repair-missing
+python scripts/maintain_vectors.py --repair-missing
+# Only for a namespace exclusively owned by this app:
+python scripts/maintain_vectors.py --repair-missing --delete-orphans
+```
+
+Compose's `vector-maintenance` worker repeats this audit using `VECTOR_MAINTENANCE_INTERVAL_SECONDS`. Orphan
+deletion defaults off and is rejected for project-scoped audits.
+
 ## External integrations
 
 Jira Cloud import uses the enhanced `POST /rest/api/3/search/jql` API with JQL pagination. Configure
 `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`; imported issues are upserted by project and Jira issue key,
 then queued for vector indexing. Jira text is treated as untrusted content and credentials are never persisted in
-run, audit, or outbox records.
+run, audit, or outbox records. The Operations page can create durable Jira delta schedules; run the
+`integration-scheduler` Compose worker to process them.
 
 Repository delivery is asynchronous and uses the same outbox worker. Configure `TEST_REPOSITORY_BASE_URL` and
 `TEST_REPOSITORY_TOKEN`, leaving `TEST_REPOSITORY_PROVIDER=generic`. The adapter sends an authenticated
@@ -294,3 +312,13 @@ and their text is included in the immutable embedding artifact sent through the 
 
 Mapped imports default to a 10 MB source limit and 20,000 mapped records. Configure these with
 `MAPPED_UPLOAD_MAX_BYTES` and `MAPPED_IMPORT_MAX_RECORDS`.
+
+For larger top-level JSON arrays, JSONL/NDJSON, or CSV files, queue a resumable import job. Files are streamed into a
+private spool, processed transactionally in checkpointed batches, and removed only after completion. Defaults are
+250 MB, 1,000,000 records, and 250 records per transaction (`MAPPED_JOB_*`). Mapping profiles are immutable,
+versioned, and rollbackable; a job freezes the selected revision. Typed custom fields support required/default,
+enum, regex, length, index, and semantic-weight policies.
+
+Set test-case `options.unresolved_reference_policy` to `stage` to preserve records whose story key is not yet
+present. They appear in Operations and automatically reconcile when a later mapped or Jira requirement delta
+introduces that key. `skip` remains available when intentional data loss is acceptable; `reject` fails the import.

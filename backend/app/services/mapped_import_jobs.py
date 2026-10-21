@@ -21,6 +21,7 @@ from app.services.historical_import import import_historical_test_cases
 from app.services.historical_ingestion import ParsedHistoricalTestCase
 from app.services.mapped_ingestion import MappedIngestionError, iter_source_records, map_import_records
 from app.services.outbox import REQUIREMENT_VERSION_INDEX_REQUESTED, enqueue_index_event
+from app.services.unresolved_imports import resolve_unresolved_records, stage_unresolved_test_cases
 from app.services.versioning import snapshot_requirement
 
 
@@ -34,6 +35,7 @@ class PersistedBatch:
     updated: int = 0
     existing: int = 0
     skipped: int = 0
+    unresolved: int = 0
 
 
 class MappedImportJobProcessor:
@@ -84,6 +86,7 @@ class MappedImportJobProcessor:
                     job.updated_record_count += persisted.updated
                     job.existing_record_count += persisted.existing
                     job.skipped_record_count += persisted.skipped
+                    job.unresolved_record_count += persisted.unresolved
                     job.warning_count += sum(
                         issue.get("severity") == "warning" for issue in batch.issues
                     )
@@ -163,8 +166,8 @@ class MappedImportJobProcessor:
             return await self._persist_requirements(db, job, items)
         test_cases = [item for item in items if isinstance(item, ParsedHistoricalTestCase)]
         policy = job.mapping_snapshot.get("options", {}).get("unresolved_reference_policy", "reject")
-        skipped = 0
-        if policy == "skip":
+        skipped = unresolved = 0
+        if policy in {"skip", "stage"}:
             refs = {item.requirement_external_id for item in test_cases}
             available = set(
                 (
@@ -177,10 +180,24 @@ class MappedImportJobProcessor:
                 ).scalars().all()
             )
             filtered = [item for item in test_cases if item.requirement_external_id in available]
-            skipped = len(test_cases) - len(filtered)
+            missing = [item for item in test_cases if item.requirement_external_id not in available]
+            if policy == "stage" and missing:
+                unresolved = await stage_unresolved_test_cases(
+                    db,
+                    project_id=job.project_id,
+                    profile_id=job.profile_id,
+                    import_job_id=job.id,
+                    items=missing,
+                    actor=job.requested_by,
+                    existing_record_strategy=job.mapping_snapshot.get("options", {}).get(
+                        "existing_record_strategy", "new_version"
+                    ),
+                )
+            else:
+                skipped = len(missing)
             test_cases = filtered
         if not test_cases:
-            return PersistedBatch(skipped=skipped)
+            return PersistedBatch(skipped=skipped, unresolved=unresolved)
         result = await import_historical_test_cases(
             db,
             project_id=job.project_id,
@@ -197,6 +214,7 @@ class MappedImportJobProcessor:
             updated=result.updated_test_case_count,
             existing=result.existing_test_case_count,
             skipped=skipped,
+            unresolved=unresolved,
         )
 
     async def _persist_requirements(
@@ -207,9 +225,11 @@ class MappedImportJobProcessor:
     ) -> PersistedBatch:
         created = updated = existing = 0
         strategy = job.mapping_snapshot.get("options", {}).get("existing_record_strategy", "skip")
+        imported_references: set[str] = set()
         for item in items:
             if not isinstance(item, ParsedRequirement):
                 continue
+            imported_references.add(item.external_id)
             requirement = (
                 await db.execute(
                     select(Requirement)
@@ -254,6 +274,23 @@ class MappedImportJobProcessor:
                 updated += 1
             else:
                 existing += 1
+        if imported_references:
+            resolved, failed = await resolve_unresolved_records(
+                db,
+                project_id=job.project_id,
+                actor=job.requested_by,
+                references=imported_references,
+            )
+            if resolved or failed:
+                db.add(
+                    AuditLog(
+                        entity_type="mapped_import_job",
+                        entity_id=job.id,
+                        action="unresolved_imports_reconciled",
+                        actor=job.requested_by,
+                        details={"resolved": resolved, "still_pending": failed},
+                    )
+                )
         return PersistedBatch(created=created, updated=updated, existing=existing)
 
     async def _snapshot_and_enqueue(self, db: AsyncSession, requirement: Requirement) -> None:
@@ -279,6 +316,7 @@ class MappedImportJobProcessor:
             "updated_record_count": job.updated_record_count,
             "existing_record_count": job.existing_record_count,
             "skipped_record_count": job.skipped_record_count,
+            "unresolved_record_count": job.unresolved_record_count,
             "warning_count": job.warning_count,
         }
         run = IntegrationRun(

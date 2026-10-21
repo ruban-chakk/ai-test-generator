@@ -2,6 +2,8 @@ import uuid
 import re
 import hashlib
 import json
+from difflib import SequenceMatcher
+from time import perf_counter
 from pathlib import Path
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -25,6 +27,7 @@ from app.models import (
     GovernancePolicy,
     ImpactAnalysis,
     IntegrationRun,
+    IntegrationSchedule,
     ImportMappingProfile,
     MappedImportJob,
     OperationalMetric,
@@ -33,6 +36,9 @@ from app.models import (
     ProjectMembership,
     QualityEvaluation,
     Requirement,
+    SavedSearch,
+    SearchEvent,
+    SearchJudgment,
     RepositorySyncRun,
     RevisionRecord,
     SemanticCalibrationRun,
@@ -41,6 +47,7 @@ from app.models import (
     TestCaseVersion,
     TestExecutionRun,
     TestScenario,
+    UnresolvedImportRecord,
     User,
     RequirementVersion,
 )
@@ -65,11 +72,14 @@ from app.schemas import (
     ImpactAnalysisSummary,
     ImpactCandidate,
     IntegrationRunSummary,
+    IntegrationScheduleCreate,
+    IntegrationScheduleSummary,
     ImportMappingProfileCreate,
     ImportMappingProfileUpdate,
     ImportMappingProfileSummary,
     MappedImportPreview,
     MappedImportJobSummary,
+    UnresolvedImportRecordSummary,
     JiraImportRequest,
     MonitoringSummary,
     DependencyHealthSummary,
@@ -83,6 +93,12 @@ from app.schemas import (
     RepositorySyncRequest,
     RepositorySyncRunSummary,
     SemanticSearchResult,
+    SavedSearchCreate,
+    SavedSearchSummary,
+    SearchAnalyticsSummary,
+    CustomFieldFacetSummary,
+    SearchJudgmentCreate,
+    SearchJudgmentSummary,
     SemanticCalibrationRequest,
     SemanticCalibrationSummary,
     RequirementCreate,
@@ -120,8 +136,8 @@ from app.services.impact import build_semantic_impact_service
 from app.services.integrations import (
     IntegrationConfigurationError,
     IntegrationProviderError,
-    JiraCloudClient,
 )
+from app.services.jira_sync import clean_requirement_text, sync_jira_requirements
 from app.services.file_ingestion import FileIngestionError, parse_requirement_file
 from app.services.historical_ingestion import (
     HistoricalIngestionError,
@@ -140,6 +156,7 @@ from app.services.health import probe_external_dependencies
 from app.services.search import KeywordSearchService, build_semantic_search_service, fuse_search_matches
 from app.services.calibration import CalibrationSample, calibrate_thresholds
 from app.services.versioning import snapshot_requirement
+from app.services.unresolved_imports import resolve_unresolved_records, stage_unresolved_test_cases
 
 api_router = APIRouter()
 
@@ -283,18 +300,7 @@ def _require_role(actor: str, allowed_roles: set[str] | None = None) -> None:
 
 
 def _clean_requirement_text(text: str) -> tuple[str, list[dict]]:
-    original = text
-    cleaned = re.sub(r"\s+", " ", text).strip()
-    cleaned = re.sub(r"(?i)\b(asap|tbd|todo|fixme)\b", "", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    issues: list[dict] = []
-    if len(cleaned) < 20:
-        issues.append({"field": "text", "severity": "error", "message": "Requirement text is too short after cleanup."})
-    if original != cleaned:
-        issues.append({"field": "text", "severity": "info", "message": "Whitespace and placeholder language were normalized."})
-    if not re.search(r"\b(shall|should|must|can|when|then|verify|validate)\b", cleaned.lower()):
-        issues.append({"field": "intent", "severity": "warning", "message": "Requirement intent is not explicit."})
-    return cleaned, issues
+    return clean_requirement_text(text)
 
 
 def _step_snapshot(test_case: TestCase) -> list[dict]:
@@ -402,6 +408,8 @@ async def _run_impact_analysis(
     context_ids: list[uuid.UUID] | None = None,
 ) -> ImpactAnalysisSummary:
     duplicate_threshold, update_threshold = await _impact_thresholds(db, project_id)
+    scoring_rules = await _impact_scoring_rules(db, project_id)
+    change_evidence = await _requirement_change_evidence(db, requirement_id)
     try:
         semantic_service = build_semantic_impact_service()
         matches = await semantic_service.search(source_text, project_id=str(project_id))
@@ -421,10 +429,15 @@ async def _run_impact_analysis(
     deprecations: list[ImpactCandidate] = []
     updates: list[ImpactCandidate] = []
     source_tokens = _tokens(source_text)
+    deprecation_keywords = {
+        str(item).strip().lower()
+        for item in scoring_rules["deprecation_keywords"]
+        if str(item).strip()
+    }
 
     for match in matches:
         score = match.score
-        keyword_overlap = source_tokens & DEPRECATION_KEYWORDS
+        keyword_overlap = source_tokens & deprecation_keywords
         try:
             if score >= duplicate_threshold:
                 duplicates.append(
@@ -460,13 +473,12 @@ async def _run_impact_analysis(
     deprecations.sort(key=lambda item: item.similarity, reverse=True)
     updates.sort(key=lambda item: item.similarity, reverse=True)
 
-    coverage_score = min(100, (len(duplicates) * 35) + (len(updates) * 20) + (len(deprecations) * 10))
-    risk_score = min(
-        100,
-        (len(deprecations) * 25)
-        + (len(updates) * 15)
-        + (20 if not duplicates and not updates else 0)
-        + (10 if any(item.severity == "critical" for item in updates + deprecations) else 0),
+    coverage_score, risk_score, score_evidence = _evidence_scores(
+        duplicates,
+        deprecations,
+        updates,
+        change_evidence=change_evidence,
+        rules=scoring_rules,
     )
     summary = {
         "approved_cases_scanned": len(matches),
@@ -476,6 +488,9 @@ async def _run_impact_analysis(
         "manual_review_recommended": bool(deprecations or updates or risk_score >= 40),
         "thresholds": {"duplicate": duplicate_threshold, "update": update_threshold},
         "similarity_mode": "embedding_cosine",
+        "requirement_change": change_evidence,
+        "score_evidence": score_evidence,
+        "scoring_policy": scoring_rules,
     }
 
     analysis = ImpactAnalysis(
@@ -536,6 +551,135 @@ async def _impact_thresholds(db: AsyncSession, project_id: uuid.UUID) -> tuple[f
     if not 0 <= update < duplicate <= 1:
         return DUPLICATE_THRESHOLD, UPDATE_THRESHOLD
     return duplicate, update
+
+
+DEFAULT_IMPACT_SCORING_RULES = {
+    "duplicate_coverage_weight": 1.0,
+    "update_coverage_weight": 0.65,
+    "deprecation_coverage_weight": 0.35,
+    "uncovered_risk": 40.0,
+    "update_risk_weight": 18.0,
+    "deprecation_risk_weight": 28.0,
+    "critical_severity_risk": 12.0,
+    "change_magnitude_risk": 20.0,
+    "deprecation_keywords": sorted(DEPRECATION_KEYWORDS),
+}
+
+
+async def _impact_scoring_rules(db: AsyncSession, project_id: uuid.UUID) -> dict:
+    policy = await db.scalar(
+        select(GovernancePolicy).where(
+            GovernancePolicy.name == f"impact-scoring:{project_id}",
+            GovernancePolicy.status == "active",
+        )
+    )
+    supplied = policy.rules if policy and isinstance(policy.rules, dict) else {}
+    rules = {**DEFAULT_IMPACT_SCORING_RULES}
+    for key, default in DEFAULT_IMPACT_SCORING_RULES.items():
+        value = supplied.get(key, default)
+        if key == "deprecation_keywords":
+            if isinstance(value, list) and value:
+                rules[key] = [str(item) for item in value[:100]]
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= numeric <= 100:
+            rules[key] = numeric
+    return rules
+
+
+async def _requirement_change_evidence(
+    db: AsyncSession,
+    requirement_id: uuid.UUID | None,
+) -> dict:
+    if requirement_id is None:
+        return {"available": False, "reason": "ad_hoc_text"}
+    versions = list(
+        (
+            await db.execute(
+                select(RequirementVersion)
+                .where(RequirementVersion.requirement_id == requirement_id)
+                .order_by(RequirementVersion.version.desc())
+                .limit(2)
+            )
+        ).scalars()
+    )
+    if len(versions) < 2:
+        return {
+            "available": False,
+            "reason": "no_previous_version",
+            "current_version": versions[0].version if versions else None,
+        }
+    current, previous = versions[0], versions[1]
+    previous_text = f"{previous.title}\n{previous.description}".strip()
+    current_text = f"{current.title}\n{current.description}".strip()
+    previous_tokens = _tokens(previous_text)
+    current_tokens = _tokens(current_text)
+    added = sorted(current_tokens - previous_tokens)
+    removed = sorted(previous_tokens - current_tokens)
+    similarity = SequenceMatcher(None, previous_text.lower(), current_text.lower()).ratio()
+    return {
+        "available": True,
+        "previous_version": previous.version,
+        "current_version": current.version,
+        "text_similarity": round(similarity, 4),
+        "change_magnitude": round(1.0 - similarity, 4),
+        "added_token_count": len(added),
+        "removed_token_count": len(removed),
+        "added_token_sample": added[:25],
+        "removed_token_sample": removed[:25],
+        "deprecation_terms_added": sorted((current_tokens - previous_tokens) & DEPRECATION_KEYWORDS),
+    }
+
+
+def _evidence_scores(
+    duplicates: list[ImpactCandidate],
+    deprecations: list[ImpactCandidate],
+    updates: list[ImpactCandidate],
+    *,
+    change_evidence: dict,
+    rules: dict,
+) -> tuple[int, int, dict]:
+    weighted_coverage = [
+        *(item.similarity * rules["duplicate_coverage_weight"] for item in duplicates),
+        *(item.similarity * rules["update_coverage_weight"] for item in updates),
+        *(item.similarity * rules["deprecation_coverage_weight"] for item in deprecations),
+    ]
+    best_coverage = max(weighted_coverage, default=0.0)
+    breadth_bonus = min(0.15, max(0, len(weighted_coverage) - 1) * 0.03)
+    coverage_score = round(min(1.0, best_coverage + breadth_bonus) * 100)
+
+    uncovered = rules["uncovered_risk"] if not weighted_coverage else 0.0
+    update_risk = sum(item.similarity for item in updates) * rules["update_risk_weight"]
+    deprecation_risk = sum(item.similarity for item in deprecations) * rules["deprecation_risk_weight"]
+    critical = (
+        rules["critical_severity_risk"]
+        if any((item.severity or "").lower() == "critical" for item in updates + deprecations)
+        else 0.0
+    )
+    historical_change_risk = (
+        float(change_evidence.get("change_magnitude", 0.0) or 0.0)
+        * rules["change_magnitude_risk"]
+    )
+    risk_score = round(
+        min(100.0, uncovered + update_risk + deprecation_risk + critical + historical_change_risk)
+    )
+    return coverage_score, risk_score, {
+        "coverage": {
+            "best_weighted_similarity": round(best_coverage, 4),
+            "breadth_bonus": round(breadth_bonus, 4),
+            "candidate_count": len(weighted_coverage),
+        },
+        "risk": {
+            "uncovered": round(uncovered, 2),
+            "updates": round(update_risk, 2),
+            "deprecations": round(deprecation_risk, 2),
+            "critical_severity": round(critical, 2),
+            "historical_change": round(historical_change_risk, 2),
+        },
+    }
 
 
 def _test_case_snapshot(test_case: TestCase) -> dict:
@@ -714,6 +858,29 @@ async def _snapshot_requirement_and_enqueue(
             payload={"requirement_id": str(requirement.id), "version": requirement.version},
         )
     return version
+
+
+async def _search_tuning(db: AsyncSession, project_id: uuid.UUID, query: str) -> tuple[list[str], int]:
+    policy = await db.scalar(
+        select(GovernancePolicy).where(
+            GovernancePolicy.name == f"search-tuning:{project_id}",
+            GovernancePolicy.status == "active",
+        )
+    )
+    rules = policy.rules if policy and isinstance(policy.rules, dict) else {}
+    synonym_map = rules.get("synonyms", {})
+    aliases: list[str] = []
+    if isinstance(synonym_map, dict):
+        query_tokens = _tokens(query)
+        for key, values in synonym_map.items():
+            if str(key).lower() not in query_tokens or not isinstance(values, list):
+                continue
+            aliases.extend(str(item).strip() for item in values if str(item).strip())
+    try:
+        rank_constant = int(rules.get("rrf_rank_constant", 60))
+    except (TypeError, ValueError):
+        rank_constant = 60
+    return list(dict.fromkeys(aliases))[:20], min(200, max(1, rank_constant))
 
 
 @api_router.get(
@@ -1870,13 +2037,25 @@ async def semantic_search(
     query: str = Query(..., min_length=2, max_length=500),
     entity_type: str | None = Query(None),
     limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0, le=5000),
+    custom_field: str | None = Query(None, min_length=1, max_length=100),
+    custom_value: str | None = Query(None, max_length=500),
     mode: Literal["semantic", "keyword", "hybrid"] = Query("semantic"),
     db: AsyncSession = Depends(get_db),
 ) -> list[SemanticSearchResult]:
     await _ensure_project(db, project_id)
+    custom_field = custom_field if isinstance(custom_field, str) else None
+    custom_value = custom_value if isinstance(custom_value, str) else None
     if entity_type and entity_type not in {"requirement", "test_case", "feedback"}:
         raise HTTPException(status_code=422, detail="Unsupported semantic search entity type")
-    candidate_limit = min(limit * 4, 100) if mode == "hybrid" else limit
+    if bool(custom_field) != (custom_value is not None):
+        raise HTTPException(status_code=422, detail="custom_field and custom_value must be supplied together")
+    if custom_field and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,99}", custom_field):
+        raise HTTPException(status_code=422, detail="custom_field contains unsupported characters")
+    started = perf_counter()
+    aliases, rank_constant = await _search_tuning(db, project_id, query)
+    page_end = offset + limit
+    candidate_limit = min(page_end * 4, 400) if mode == "hybrid" else limit
     keyword_matches = []
     if mode in {"keyword", "hybrid"}:
         keyword_matches = await KeywordSearchService(db).search(
@@ -1884,6 +2063,10 @@ async def semantic_search(
             project_id=str(project_id),
             entity_type=entity_type,
             limit=candidate_limit,
+            offset=0 if mode == "hybrid" else offset,
+            aliases=aliases,
+            custom_field=custom_field,
+            custom_value=custom_value,
         )
     semantic_matches = []
     semantic_fallback = False
@@ -1894,6 +2077,9 @@ async def semantic_search(
                 project_id=str(project_id),
                 entity_type=entity_type,
                 limit=candidate_limit,
+                offset=0 if mode == "hybrid" else offset,
+                custom_field=custom_field,
+                custom_value=custom_value,
             )
         except GenerationConfigurationError as exc:
             if mode == "hybrid":
@@ -1906,15 +2092,35 @@ async def semantic_search(
             else:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
     if mode == "hybrid":
-        matches = (
-            keyword_matches[:limit]
+        all_matches = (
+            keyword_matches
             if semantic_fallback
-            else fuse_search_matches(semantic_matches, keyword_matches, limit=limit)
+            else fuse_search_matches(
+                semantic_matches,
+                keyword_matches,
+                limit=page_end,
+                rank_constant=rank_constant,
+            )
         )
+        matches = all_matches[offset:page_end]
     elif mode == "keyword":
         matches = keyword_matches[:limit]
     else:
         matches = semantic_matches[:limit]
+    event = SearchEvent(
+        project_id=project_id,
+        query=query.strip(),
+        mode=mode,
+        entity_type=entity_type,
+        result_count=len(matches),
+        offset=offset,
+        latency_ms=max(0, round((perf_counter() - started) * 1000)),
+        semantic_fallback=semantic_fallback,
+        requested_by=current_principal().username,
+    )
+    db.add(event)
+    await db.commit()
+    await db.refresh(event)
     return [
         SemanticSearchResult(
             vector_id=match.vector_id,
@@ -1923,14 +2129,217 @@ async def semantic_search(
             title=match.title,
             text=match.text,
             score=round(match.score, 4),
-            metadata={**match.metadata, **({"semantic_fallback": True} if semantic_fallback else {})},
+            metadata={
+                **match.metadata,
+                "search_event_id": str(event.id),
+                "result_rank": offset + index,
+                "offset": offset,
+                **({"custom_field": custom_field, "custom_value": custom_value} if custom_field else {}),
+                **({"semantic_fallback": True} if semantic_fallback else {}),
+            },
             search_mode="keyword" if semantic_fallback else mode,
             semantic_score=round(match.semantic_score, 4) if match.semantic_score is not None else None,
             keyword_score=round(match.keyword_score, 4) if match.keyword_score is not None else None,
             matched_fields=list(match.matched_fields),
         )
-        for match in matches
+        for index, match in enumerate(matches, start=1)
     ]
+
+
+@api_router.post(
+    "/search/judgments",
+    response_model=SearchJudgmentSummary,
+    tags=["Search"],
+)
+async def record_search_judgment(
+    payload: SearchJudgmentCreate,
+    db: AsyncSession = Depends(get_db),
+) -> SearchJudgmentSummary:
+    event = await db.get(SearchEvent, payload.search_event_id)
+    if event is None:
+        raise HTTPException(status_code=404, detail="Search event not found")
+    await _require_project_access(db, event.project_id)
+    actor = current_principal().username
+    judgment = await db.scalar(
+        select(SearchJudgment).where(
+            SearchJudgment.search_event_id == payload.search_event_id,
+            SearchJudgment.entity_type == payload.entity_type,
+            SearchJudgment.entity_id == payload.entity_id,
+        )
+    )
+    if judgment is None:
+        judgment = SearchJudgment(
+            **payload.model_dump(),
+            created_by=actor,
+        )
+        db.add(judgment)
+    else:
+        judgment.rank = payload.rank
+        judgment.judgment = payload.judgment
+        judgment.created_by = actor
+    await db.commit()
+    await db.refresh(judgment)
+    return judgment
+
+
+@api_router.post(
+    "/search/saved",
+    response_model=SavedSearchSummary,
+    tags=["Search"],
+)
+async def save_search(
+    payload: SavedSearchCreate,
+    db: AsyncSession = Depends(get_db),
+) -> SavedSearchSummary:
+    await _ensure_project(db, payload.project_id)
+    await _require_project_access(db, payload.project_id)
+    actor = current_principal().username
+    saved = await db.scalar(
+        select(SavedSearch).where(
+            SavedSearch.project_id == payload.project_id,
+            SavedSearch.created_by == actor,
+            SavedSearch.name == payload.name.strip(),
+        )
+    )
+    if saved is None:
+        saved = SavedSearch(created_by=actor, **payload.model_dump())
+        db.add(saved)
+    else:
+        saved.query = payload.query.strip()
+        saved.mode = payload.mode
+        saved.entity_type = payload.entity_type
+        saved.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(saved)
+    return saved
+
+
+@api_router.get(
+    "/search/saved",
+    response_model=list[SavedSearchSummary],
+    tags=["Search"],
+)
+async def list_saved_searches(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[SavedSearchSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    result = await db.execute(
+        select(SavedSearch)
+        .where(
+            SavedSearch.project_id == project_id,
+            SavedSearch.created_by == current_principal().username,
+        )
+        .order_by(SavedSearch.name.asc())
+    )
+    return list(result.scalars())
+
+
+@api_router.delete("/search/saved/{saved_search_id}", status_code=204, tags=["Search"])
+async def delete_saved_search(
+    saved_search_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    saved = await db.get(SavedSearch, saved_search_id)
+    if saved is None or saved.created_by != current_principal().username:
+        raise HTTPException(status_code=404, detail="Saved search not found")
+    await _require_project_access(db, saved.project_id)
+    await db.delete(saved)
+    await db.commit()
+
+
+@api_router.get(
+    "/search/analytics",
+    response_model=SearchAnalyticsSummary,
+    tags=["Search"],
+)
+async def get_search_analytics(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> SearchAnalyticsSummary:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"approver", "admin"})
+    query_count, zero_count, fallback_count, average_latency = (
+        await db.execute(
+            select(
+                func.count(SearchEvent.id),
+                func.count(SearchEvent.id).filter(SearchEvent.result_count == 0),
+                func.count(SearchEvent.id).filter(SearchEvent.semantic_fallback.is_(True)),
+                func.coalesce(func.avg(SearchEvent.latency_ms), 0),
+            ).where(SearchEvent.project_id == project_id)
+        )
+    ).one()
+    judgment_rows = (
+        await db.execute(
+            select(SearchJudgment.judgment, func.count(SearchJudgment.id))
+            .join(SearchEvent, SearchEvent.id == SearchJudgment.search_event_id)
+            .where(SearchEvent.project_id == project_id)
+            .group_by(SearchJudgment.judgment)
+        )
+    ).all()
+    top_rows = (
+        await db.execute(
+            select(SearchEvent.query, func.count(SearchEvent.id).label("count"))
+            .where(SearchEvent.project_id == project_id)
+            .group_by(SearchEvent.query)
+            .order_by(text("count DESC"), SearchEvent.query.asc())
+            .limit(10)
+        )
+    ).all()
+    return SearchAnalyticsSummary(
+        project_id=project_id,
+        query_count=int(query_count or 0),
+        zero_result_count=int(zero_count or 0),
+        fallback_count=int(fallback_count or 0),
+        average_latency_ms=round(float(average_latency or 0), 2),
+        judgments={name: count for name, count in judgment_rows},
+        top_queries=[{"query": query, "count": count} for query, count in top_rows],
+    )
+
+
+@api_router.get(
+    "/search/custom-field-facets",
+    response_model=CustomFieldFacetSummary,
+    tags=["Search"],
+)
+async def get_custom_field_facets(
+    project_id: uuid.UUID,
+    field: str = Query(..., min_length=1, max_length=100),
+    db: AsyncSession = Depends(get_db),
+) -> CustomFieldFacetSummary:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,99}", field):
+        raise HTTPException(status_code=422, detail="field contains unsupported characters")
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT value, count(*) AS count
+                FROM (
+                  SELECT metadata -> 'custom_fields' ->> :field AS value
+                  FROM requirements
+                  WHERE project_id = :project_id
+                  UNION ALL
+                  SELECT tc.custom_fields ->> :field AS value
+                  FROM test_cases tc
+                  JOIN requirements r ON r.id = tc.requirement_id
+                  WHERE r.project_id = :project_id
+                ) values
+                WHERE value IS NOT NULL AND value <> ''
+                GROUP BY value
+                ORDER BY count DESC, value ASC
+                LIMIT 100
+                """
+            ),
+            {"project_id": project_id, "field": field},
+        )
+    ).all()
+    return CustomFieldFacetSummary(
+        field=field,
+        values=[{"value": value, "count": count} for value, count in rows],
+    )
 
 
 @api_router.get(
@@ -2817,6 +3226,86 @@ async def retry_mapped_import_job(
     return job
 
 
+@api_router.get(
+    "/imports/unresolved",
+    response_model=list[UnresolvedImportRecordSummary],
+    tags=["Integrations"],
+)
+async def list_unresolved_imports(
+    project_id: uuid.UUID,
+    status: Literal["pending", "resolved", "dismissed"] = Query("pending"),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> list[UnresolvedImportRecordSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"approver", "admin"})
+    result = await db.execute(
+        select(UnresolvedImportRecord)
+        .where(
+            UnresolvedImportRecord.project_id == project_id,
+            UnresolvedImportRecord.status == status,
+        )
+        .order_by(UnresolvedImportRecord.created_at.asc())
+        .limit(limit)
+    )
+    return list(result.scalars())
+
+
+@api_router.post(
+    "/imports/unresolved/{record_id}/retry",
+    response_model=UnresolvedImportRecordSummary,
+    tags=["Integrations"],
+)
+async def retry_unresolved_import(
+    record_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> UnresolvedImportRecordSummary:
+    require_global_role("approver", "admin")
+    record = await db.get(UnresolvedImportRecord, record_id)
+    if record is None or record.status != "pending":
+        raise HTTPException(status_code=404, detail="Pending unresolved import not found")
+    await _require_project_access(db, record.project_id, {"approver", "admin"})
+    await resolve_unresolved_records(
+        db,
+        project_id=record.project_id,
+        actor=current_principal().username,
+        record_ids={record.id},
+    )
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
+@api_router.post(
+    "/imports/unresolved/{record_id}/dismiss",
+    response_model=UnresolvedImportRecordSummary,
+    tags=["Integrations"],
+)
+async def dismiss_unresolved_import(
+    record_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> UnresolvedImportRecordSummary:
+    require_global_role("approver", "admin")
+    record = await db.get(UnresolvedImportRecord, record_id, with_for_update=True)
+    if record is None or record.status != "pending":
+        raise HTTPException(status_code=404, detail="Pending unresolved import not found")
+    await _require_project_access(db, record.project_id, {"approver", "admin"})
+    record.status = "dismissed"
+    record.updated_at = datetime.utcnow()
+    db.add(
+        AuditLog(
+            entity_type="unresolved_import",
+            entity_id=record.id,
+            action="unresolved_import_dismissed",
+            actor=current_principal().username,
+            details={"missing_reference": record.missing_reference},
+        )
+    )
+    await db.commit()
+    await db.refresh(record)
+    return record
+
+
 @api_router.post(
     "/imports/mapped/preview",
     response_model=MappedImportPreview,
@@ -2847,11 +3336,10 @@ async def preview_mapped_import(
         eligible = [item for item in preview_items if item.requirement_external_id in available]
         missing_count = len(preview_items) - len(eligible)
         if missing_count:
-            severity = (
-                "warning"
-                if profile.configuration.get("options", {}).get("unresolved_reference_policy") == "skip"
-                else "error"
+            unresolved_policy = profile.configuration.get("options", {}).get(
+                "unresolved_reference_policy"
             )
+            severity = "warning" if unresolved_policy in {"skip", "stage"} else "error"
             issues.append({
                 "severity": severity,
                 "message": f"{missing_count} mapped test-case links reference requirements absent from this project",
@@ -2893,7 +3381,8 @@ async def execute_mapped_import(
         items = list(batch.items)
         policy = profile.configuration.get("options", {}).get("unresolved_reference_policy", "reject")
         skipped_missing = 0
-        if policy == "skip":
+        staged_missing = 0
+        if policy in {"skip", "stage"}:
             refs = {item.requirement_external_id for item in items}
             available = set(
                 (
@@ -2906,10 +3395,46 @@ async def execute_mapped_import(
                 ).scalars().all()
             )
             filtered = [item for item in items if item.requirement_external_id in available]
-            skipped_missing = len(items) - len(filtered)
+            missing = [item for item in items if item.requirement_external_id not in available]
+            if policy == "stage" and missing:
+                staged_missing = await stage_unresolved_test_cases(
+                    db,
+                    project_id=profile.project_id,
+                    profile_id=profile.id,
+                    items=missing,
+                    actor=actor,
+                    existing_record_strategy=profile.configuration.get("options", {}).get(
+                        "existing_record_strategy", "new_version"
+                    ),
+                )
+            else:
+                skipped_missing = len(missing)
             items = filtered
         if not items:
-            raise HTTPException(status_code=422, detail="No mapped test cases reference requirements in this project")
+            if not staged_missing:
+                raise HTTPException(status_code=422, detail="No mapped test cases reference requirements in this project")
+            run = IntegrationRun(
+                integration_type="mapped_test_case_import",
+                status="completed",
+                requested_by=actor,
+                parameters={
+                    "project_id": str(profile.project_id),
+                    "mapping_profile_id": str(profile.id),
+                    "filename": uploaded_file.filename,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                },
+                result={
+                    "source_record_count": batch.source_record_count,
+                    "created_test_case_count": 0,
+                    "staged_missing_requirement_count": staged_missing,
+                    "skipped_missing_requirement_count": skipped_missing,
+                },
+                completed_at=datetime.utcnow(),
+            )
+            db.add(run)
+            await db.commit()
+            await db.refresh(run)
+            return run
         try:
             result = await import_historical_test_cases(
                 db,
@@ -2931,6 +3456,7 @@ async def execute_mapped_import(
             "source_record_count": batch.source_record_count,
             "mapping_warning_count": len(batch.issues),
             "skipped_missing_requirement_count": skipped_missing,
+            "staged_missing_requirement_count": staged_missing,
         }
         await db.commit()
         await db.refresh(run)
@@ -2940,7 +3466,9 @@ async def execute_mapped_import(
     updated_count = 0
     existing_count = 0
     requirement_ids: list[str] = []
+    imported_external_ids: set[str] = set()
     for item in batch.items:
+        imported_external_ids.add(item.external_id)
         requirement = (
             await db.execute(
                 select(Requirement).where(
@@ -2988,6 +3516,12 @@ async def execute_mapped_import(
             await _snapshot_requirement_and_enqueue(db, requirement)
             created_count += 1
         requirement_ids.append(str(requirement.id))
+    resolved_unresolved, still_unresolved = await resolve_unresolved_records(
+        db,
+        project_id=profile.project_id,
+        actor=actor,
+        references=imported_external_ids,
+    )
     run = IntegrationRun(
         integration_type="mapped_requirement_import",
         status="completed",
@@ -3006,6 +3540,8 @@ async def execute_mapped_import(
             "existing_count": existing_count,
             "requirement_ids": requirement_ids,
             "mapping_warning_count": len(batch.issues),
+            "resolved_unresolved_count": resolved_unresolved,
+            "still_unresolved_count": still_unresolved,
         },
         completed_at=datetime.utcnow(),
     )
@@ -3029,6 +3565,114 @@ async def execute_mapped_import(
     return run
 
 
+def _validate_integration_schedule(payload: IntegrationScheduleCreate) -> None:
+    if payload.integration_type == "jira":
+        jql = str(payload.configuration.get("jql") or "").strip()
+        if not jql:
+            raise HTTPException(status_code=422, detail="A Jira schedule requires configuration.jql")
+        try:
+            max_results = int(payload.configuration.get("max_results", 100))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="configuration.max_results must be an integer") from exc
+        if not 1 <= max_results <= 1000:
+            raise HTTPException(status_code=422, detail="configuration.max_results must be between 1 and 1000")
+
+
+@api_router.post(
+    "/integrations/schedules",
+    response_model=IntegrationScheduleSummary,
+    tags=["Integrations"],
+)
+async def create_integration_schedule(
+    payload: IntegrationScheduleCreate,
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationScheduleSummary:
+    require_global_role("approver", "admin")
+    await _ensure_project(db, payload.project_id)
+    await _require_project_access(db, payload.project_id, {"approver", "admin"})
+    _validate_integration_schedule(payload)
+    schedule = IntegrationSchedule(
+        **payload.model_dump(),
+        next_run_at=datetime.utcnow() + timedelta(seconds=payload.interval_seconds),
+        created_by=current_principal().username,
+    )
+    db.add(schedule)
+    await db.commit()
+    await db.refresh(schedule)
+    return schedule
+
+
+@api_router.get(
+    "/integrations/schedules",
+    response_model=list[IntegrationScheduleSummary],
+    tags=["Integrations"],
+)
+async def list_integration_schedules(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[IntegrationScheduleSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"approver", "admin"})
+    result = await db.execute(
+        select(IntegrationSchedule)
+        .where(IntegrationSchedule.project_id == project_id)
+        .order_by(IntegrationSchedule.name.asc())
+    )
+    return list(result.scalars())
+
+
+@api_router.put(
+    "/integrations/schedules/{schedule_id}",
+    response_model=IntegrationScheduleSummary,
+    tags=["Integrations"],
+)
+async def update_integration_schedule(
+    schedule_id: uuid.UUID,
+    payload: IntegrationScheduleCreate,
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationScheduleSummary:
+    require_global_role("approver", "admin")
+    schedule = await db.get(IntegrationSchedule, schedule_id, with_for_update=True)
+    if schedule is None or schedule.project_id != payload.project_id:
+        raise HTTPException(status_code=404, detail="Integration schedule not found")
+    await _require_project_access(db, schedule.project_id, {"approver", "admin"})
+    _validate_integration_schedule(payload)
+    schedule.name = payload.name
+    schedule.integration_type = payload.integration_type
+    schedule.configuration = payload.configuration
+    schedule.interval_seconds = payload.interval_seconds
+    schedule.enabled = payload.enabled
+    schedule.next_run_at = datetime.utcnow() + timedelta(seconds=payload.interval_seconds)
+    schedule.locked_at = None
+    schedule.locked_by = None
+    await db.commit()
+    await db.refresh(schedule)
+    return schedule
+
+
+@api_router.post(
+    "/integrations/schedules/{schedule_id}/run",
+    response_model=IntegrationScheduleSummary,
+    tags=["Integrations"],
+)
+async def trigger_integration_schedule(
+    schedule_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationScheduleSummary:
+    require_global_role("approver", "admin")
+    schedule = await db.get(IntegrationSchedule, schedule_id, with_for_update=True)
+    if schedule is None:
+        raise HTTPException(status_code=404, detail="Integration schedule not found")
+    await _require_project_access(db, schedule.project_id, {"approver", "admin"})
+    schedule.enabled = True
+    schedule.next_run_at = datetime.utcnow()
+    schedule.locked_at = None
+    schedule.locked_by = None
+    await db.commit()
+    await db.refresh(schedule)
+    return schedule
+
+
 @api_router.post(
     "/integrations/jira/import",
     response_model=IntegrationRunSummary,
@@ -3044,113 +3688,18 @@ async def import_jira_requirements(
     jql = payload.jql.strip()
     if not jql:
         raise HTTPException(status_code=422, detail="JQL is required")
-    run = IntegrationRun(
-        integration_type="jira_import",
-        status="running",
-        requested_by=actor,
-        parameters={
-            "project_id": str(payload.project_id),
-            "jql": jql,
-            "max_results": payload.max_results,
-        },
-        result={},
-    )
-    db.add(run)
-    await db.commit()
-    await db.refresh(run)
-
     try:
-        issues = await JiraCloudClient().search_issues(jql, payload.max_results)
+        return await sync_jira_requirements(
+            db,
+            project_id=payload.project_id,
+            jql=jql,
+            max_results=payload.max_results,
+            actor=actor,
+        )
     except IntegrationConfigurationError as exc:
-        run.status = "failed"
-        run.result = {"error_type": "configuration"}
-        run.completed_at = datetime.utcnow()
-        await db.commit()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except IntegrationProviderError as exc:
-        run.status = "failed"
-        run.result = {"error_type": "provider"}
-        run.completed_at = datetime.utcnow()
-        await db.commit()
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    imported_ids: list[str] = []
-    created_count = 0
-    updated_count = 0
-    unchanged_count = 0
-    for issue in issues:
-        existing = await db.execute(
-            select(Requirement).where(
-                Requirement.project_id == payload.project_id,
-                Requirement.external_id == issue.key,
-            )
-        )
-        requirement = existing.scalars().first()
-        cleaned_description, cleanup_issues = _clean_requirement_text(issue.description or issue.summary)
-        metadata = {
-            "jira_issue_type": issue.issue_type,
-            "jira_status": issue.status,
-            "jira_updated": issue.updated,
-            "cleanup_issues": cleanup_issues,
-        }
-        if requirement:
-            changed = (
-                requirement.title != issue.summary
-                or requirement.description != cleaned_description
-                or requirement.metadata_json != metadata
-            )
-            if changed:
-                requirement.version += 1
-                requirement.title = issue.summary
-                requirement.description = cleaned_description
-                requirement.metadata_json = metadata
-                requirement.status = "draft"
-                await _snapshot_requirement_and_enqueue(db, requirement)
-                updated_count += 1
-            else:
-                unchanged_count += 1
-        else:
-            requirement = Requirement(
-                project_id=payload.project_id,
-                external_id=issue.key,
-                title=issue.summary,
-                description=cleaned_description,
-                source="jira",
-                status="draft",
-                metadata_json=metadata,
-            )
-            db.add(requirement)
-            await db.flush()
-            await _snapshot_requirement_and_enqueue(db, requirement)
-            created_count += 1
-        imported_ids.append(str(requirement.id))
-
-    run.status = "completed"
-    run.result = {
-        "fetched_count": len(issues),
-        "created_count": created_count,
-        "updated_count": updated_count,
-        "unchanged_count": unchanged_count,
-        "requirement_ids": imported_ids,
-    }
-    run.completed_at = datetime.utcnow()
-    db.add(
-        AuditLog(
-            entity_type="integration",
-            entity_id=run.id,
-            action="jira_import_completed",
-            actor=actor,
-            details={
-                "project_id": str(payload.project_id),
-                "fetched_count": len(issues),
-                "created_count": created_count,
-                "updated_count": updated_count,
-            },
-        )
-    )
-    await db.commit()
-    await db.refresh(run)
-    return run
 
 
 @api_router.post(

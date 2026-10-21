@@ -71,6 +71,25 @@ def _custom_field_segments(custom_fields: dict, schema: dict | None = None) -> t
     return tuple(segments)
 
 
+def _custom_field_metadata(custom_fields: dict, schema: dict | None = None) -> dict:
+    metadata: dict = {}
+    schema = schema or {}
+    for key, value in custom_fields.items():
+        policy = schema.get(key, {}) if isinstance(schema.get(key, {}), dict) else {}
+        if policy.get("index", True) is False:
+            continue
+        safe_key = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")[:80]
+        if not safe_key:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            metadata[f"custom__{safe_key}"] = value
+        elif isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+            metadata[f"custom__{safe_key}"] = value[:100]
+        else:
+            metadata[f"custom__{safe_key}"] = json.dumps(value, ensure_ascii=False, default=str)[:1000]
+    return metadata
+
+
 def enqueue_outbox_event(
     db: AsyncSession,
     *,
@@ -379,6 +398,7 @@ class OutboxProcessor:
                     "external_id": requirement.external_id or "",
                     "source": requirement.source,
                     "status": requirement.status,
+                    **_custom_field_metadata(custom_fields, custom_schema),
                 },
             ))
 
@@ -413,6 +433,7 @@ class OutboxProcessor:
                     "version": version.version,
                     "created_at": version.created_at.isoformat(),
                     "immutable_version": True,
+                    **_custom_field_metadata(custom_fields, custom_schema),
                 },
             ))
 
@@ -477,6 +498,9 @@ class OutboxProcessor:
                     "severity": test_case.severity or "",
                     "category": test_case.category or "",
                     "type": test_case.type or "",
+                    **_custom_field_metadata(
+                        test_case.custom_fields_json or {}, test_case.custom_field_schema_json or {}
+                    ),
                 },
             ))
 
@@ -549,6 +573,9 @@ class OutboxProcessor:
                     "type": version.type or "",
                     "approved_at": version.approved_at.isoformat(),
                     "immutable_version": True,
+                    **_custom_field_metadata(
+                        version.custom_fields_json or {}, version.custom_field_schema_json or {}
+                    ),
                 },
             ))
 

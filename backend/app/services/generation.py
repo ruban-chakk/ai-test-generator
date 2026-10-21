@@ -20,6 +20,21 @@ class GenerationProviderError(RuntimeError):
     """Raised when a configured external provider cannot complete a request."""
 
 
+def _strict_json_schema(value: Any) -> Any:
+    """Normalize Pydantic JSON Schema for OpenAI strict structured outputs."""
+
+    if isinstance(value, list):
+        return [_strict_json_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    normalized = {key: _strict_json_schema(item) for key, item in value.items()}
+    if normalized.get("type") == "object" or "properties" in normalized:
+        properties = normalized.get("properties") or {}
+        normalized["additionalProperties"] = False
+        normalized["required"] = list(properties)
+    return normalized
+
+
 class GeneratedStep(BaseModel):
     step_number: int = Field(ge=1)
     action: str = Field(min_length=8)
@@ -242,7 +257,7 @@ class OpenAICompatibleLanguageModel:
             raise GenerationProviderError("Embedding provider returned an invalid response") from exc
 
     async def generate(self, system_prompt: str, user_prompt: str) -> GeneratedDraft:
-        schema = GeneratedDraft.model_json_schema()
+        schema = _strict_json_schema(GeneratedDraft.model_json_schema())
         payload = await self._post(
             "/chat/completions",
             {
@@ -308,6 +323,23 @@ class PineconeVectorStore:
             if owns_client:
                 await client.aclose()
 
+    async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=self._timeout)
+        try:
+            response = await client.get(
+                f"{self._host}{path}",
+                headers={"Api-Key": self._api_key, "Content-Type": "application/json"},
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json() if response.content else {}
+        except (httpx.HTTPError, ValueError) as exc:
+            raise GenerationProviderError("Pinecone request failed") from exc
+        finally:
+            if owns_client:
+                await client.aclose()
+
     async def upsert(self, vector_id: str, values: list[float], metadata: dict[str, Any]) -> None:
         await self._post(
             "/vectors/upsert",
@@ -324,6 +356,28 @@ class PineconeVectorStore:
             "/vectors/delete",
             {"namespace": self._namespace, "ids": vector_ids},
         )
+
+    async def list_vector_ids(self, *, page_size: int = 100) -> list[str]:
+        vector_ids: list[str] = []
+        token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "namespace": self._namespace,
+                "limit": min(max(1, page_size), 100),
+            }
+            if token:
+                params["paginationToken"] = token
+            payload = await self._get("/vectors/list", params)
+            for item in payload.get("vectors", []):
+                if isinstance(item, dict) and item.get("id"):
+                    vector_ids.append(str(item["id"]))
+            pagination = payload.get("pagination") or {}
+            token = pagination.get("next") if isinstance(pagination, dict) else None
+            if not token:
+                return vector_ids
+
+    async def describe_stats(self) -> dict[str, Any]:
+        return await self._post("/describe_index_stats", {"filter": {}})
 
     async def query(
         self,
@@ -382,18 +436,6 @@ class GenerationService:
         source_text = f"Title: {title}\nDescription: {description}"
         embedding = await self._language_model.embed(source_text)
         vector_id = f"requirement:{requirement_id}:v{requirement_version}"
-        await self._vector_store.upsert(
-            vector_id,
-            embedding,
-            {
-                "entity_type": "requirement",
-                "requirement_id": requirement_id,
-                "project_id": project_id or "unassigned",
-                "external_id": external_id or "",
-                "version": requirement_version,
-                "text": source_text,
-            },
-        )
         semantic_contexts = await self._vector_store.query(
             embedding,
             top_k=self._config.rag_candidate_limit,

@@ -7,6 +7,7 @@ from typing import Any, Iterable
 from sqlalchemy import Text, and_, case, cast, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.core.config import Settings, settings
 from app.models import Feedback, Requirement, TestCase, TestCaseStep, TestScenario
@@ -44,11 +45,14 @@ class SemanticSearchService:
         project_id: str,
         entity_type: str | None = None,
         limit: int = 20,
+        offset: int = 0,
+        custom_field: str | None = None,
+        custom_value: str | None = None,
     ) -> list[SearchMatch]:
         embedding = await self._language_model.embed(query)
         contexts = await self._vector_store.query(
             embedding,
-            top_k=min(max(limit * 4, 20), 200),
+            top_k=min(max((limit + offset) * 4, 20), 400),
             project_id=project_id,
         )
         matches_by_entity: dict[tuple[str, str], SearchMatch] = {}
@@ -58,6 +62,12 @@ class SemanticSearchService:
             current_id = str(metadata.get("entity_id") or metadata.get("requirement_id") or "")
             if not current_type or not current_id or (entity_type and current_type != entity_type):
                 continue
+            if custom_field and custom_value is not None:
+                safe_key = re.sub(r"[^a-z0-9]+", "_", custom_field.lower()).strip("_")[:80]
+                stored = metadata.get(f"custom__{safe_key}")
+                values = stored if isinstance(stored, list) else [stored]
+                if not any(str(value).lower() == custom_value.lower() for value in values if value is not None):
+                    continue
             title = str(metadata.get("title") or metadata.get("external_id") or current_type.replace("_", " ").title())
             key = (current_type, current_id)
             candidate = SearchMatch(
@@ -78,7 +88,7 @@ class SemanticSearchService:
             if current is None or candidate.score > current.score:
                 matches_by_entity[key] = candidate
         matches = sorted(matches_by_entity.values(), key=lambda item: (-item.score, item.entity_type, item.entity_id))
-        return matches[:limit]
+        return matches[offset : offset + limit]
 
 
 def _search_vector(*fields):
@@ -87,11 +97,19 @@ def _search_vector(*fields):
     document = func.coalesce(fields[0], empty)
     for field in fields[1:]:
         document = document + separator + func.coalesce(field, empty)
-    return func.to_tsvector(literal_column("'simple'::regconfig"), document)
+    return func.to_tsvector(literal_column("'english'::regconfig"), document)
 
 
-def _query_expression(query: str):
-    return func.plainto_tsquery(literal_column("'simple'::regconfig"), query)
+def _query_expression(query: str, aliases: Iterable[str] = ()):
+    terms = [query, *(item for item in aliases if item.strip())]
+    expression = " OR ".join(f'"{item.replace(chr(34), " ")}"' for item in terms)
+    return func.websearch_to_tsquery(literal_column("'english'::regconfig"), expression)
+
+
+def _fuzzy_score(query: str, *fields):
+    return func.greatest(
+        *(func.word_similarity(query.lower(), func.lower(func.coalesce(field, ""))) for field in fields)
+    )
 
 
 def _escaped_contains(field, query: str):
@@ -137,19 +155,31 @@ class KeywordSearchService:
         project_id: str,
         entity_type: str | None = None,
         limit: int = 20,
+        offset: int = 0,
+        aliases: Iterable[str] = (),
+        custom_field: str | None = None,
+        custom_value: str | None = None,
     ) -> list[SearchMatch]:
-        candidate_limit = min(max(limit * 2, 20), 100)
+        candidate_limit = min(max((limit + offset) * 2, 20), 200)
+        alias_list = tuple(aliases)
         matches: list[SearchMatch] = []
         if entity_type in {None, "requirement"}:
-            matches.extend(await self._requirements(query, project_id, candidate_limit))
+            matches.extend(await self._requirements(
+                query, project_id, candidate_limit, alias_list, custom_field, custom_value
+            ))
         if entity_type in {None, "test_case"}:
-            matches.extend(await self._test_cases(query, project_id, candidate_limit))
-        if entity_type in {None, "feedback"}:
-            matches.extend(await self._feedback(query, project_id, candidate_limit))
+            matches.extend(await self._test_cases(
+                query, project_id, candidate_limit, alias_list, custom_field, custom_value
+            ))
+        if entity_type in {None, "feedback"} and not custom_field:
+            matches.extend(await self._feedback(query, project_id, candidate_limit, alias_list))
         matches.sort(key=lambda item: (-item.score, item.entity_type, item.entity_id))
-        return matches[:limit]
+        return matches[offset : offset + limit]
 
-    async def _requirements(self, query: str, project_id: str, limit: int) -> list[SearchMatch]:
+    async def _requirements(
+        self, query: str, project_id: str, limit: int, aliases: tuple[str, ...],
+        custom_field: str | None, custom_value: str | None,
+    ) -> list[SearchMatch]:
         custom_fields = cast(Requirement.metadata_json, Text)
         vector = _search_vector(
             Requirement.external_id,
@@ -157,24 +187,36 @@ class KeywordSearchService:
             Requirement.description,
             custom_fields,
         )
-        query_expression = _query_expression(query)
-        rank = _rank_score(
+        query_expression = _query_expression(query, aliases)
+        fuzzy = _fuzzy_score(query, Requirement.external_id, Requirement.title, Requirement.description)
+        rank = (_rank_score(
             vector,
             query_expression,
             exact_field=Requirement.external_id,
             title_field=Requirement.title,
             query=query,
-        ).label("keyword_rank")
+        ) + (fuzzy * 0.4)).label("keyword_rank")
+        filters = [Requirement.project_id == project_id]
+        if custom_field and custom_value is not None:
+            filters.append(
+                func.lower(
+                    func.jsonb_extract_path_text(
+                        cast(Requirement.metadata_json, JSONB), "custom_fields", custom_field
+                    )
+                )
+                == custom_value.lower()
+            )
         statement = (
             select(Requirement, rank)
             .where(
-                Requirement.project_id == project_id,
+                *filters,
                 or_(
                     vector.op("@@")(query_expression),
                     _escaped_contains(Requirement.external_id, query),
                     _escaped_contains(Requirement.title, query),
                     _escaped_contains(Requirement.description, query),
                     _escaped_contains(custom_fields, query),
+                    fuzzy >= 0.35,
                 ),
             )
             .order_by(rank.desc(), Requirement.updated_at.desc())
@@ -209,7 +251,10 @@ class KeywordSearchService:
             for requirement, raw_score in rows
         ]
 
-    async def _test_cases(self, query: str, project_id: str, limit: int) -> list[SearchMatch]:
+    async def _test_cases(
+        self, query: str, project_id: str, limit: int, aliases: tuple[str, ...],
+        custom_field: str | None, custom_value: str | None,
+    ) -> list[SearchMatch]:
         custom_fields = cast(TestCase.custom_fields_json, Text)
         vector = _search_vector(
             TestCase.title,
@@ -223,7 +268,14 @@ class KeywordSearchService:
             TestScenario.description,
             custom_fields,
         )
-        query_expression = _query_expression(query)
+        query_expression = _query_expression(query, aliases)
+        fuzzy = _fuzzy_score(
+            query,
+            TestCase.title,
+            TestCase.description,
+            TestScenario.title,
+            TestScenario.description,
+        )
         step_match = (
             select(TestCaseStep.id)
             .where(
@@ -238,15 +290,22 @@ class KeywordSearchService:
         rank = (
             _rank_score(vector, query_expression, title_field=TestCase.title, query=query)
             + case((step_match, 0.75), else_=0.0)
+            + (fuzzy * 0.4)
         ).label("keyword_rank")
+        filters = [Requirement.project_id == project_id, TestCase.status == "approved"]
+        if custom_field and custom_value is not None:
+            filters.append(
+                func.lower(
+                    func.jsonb_extract_path_text(cast(TestCase.custom_fields_json, JSONB), custom_field)
+                ) == custom_value.lower()
+            )
         statement = (
             select(TestCase, TestScenario, rank)
             .join(Requirement, Requirement.id == TestCase.requirement_id)
             .join(TestScenario, TestScenario.id == TestCase.scenario_id)
             .options(selectinload(TestCase.steps))
             .where(
-                Requirement.project_id == project_id,
-                TestCase.status == "approved",
+                *filters,
                 or_(
                     vector.op("@@")(query_expression),
                     _escaped_contains(TestCase.title, query),
@@ -256,6 +315,7 @@ class KeywordSearchService:
                     _escaped_contains(TestScenario.description, query),
                     _escaped_contains(custom_fields, query),
                     step_match,
+                    fuzzy >= 0.35,
                 ),
             )
             .order_by(rank.desc(), TestCase.updated_at.desc())
@@ -316,10 +376,13 @@ class KeywordSearchService:
             for test_case, scenario, raw_score in rows
         ]
 
-    async def _feedback(self, query: str, project_id: str, limit: int) -> list[SearchMatch]:
+    async def _feedback(
+        self, query: str, project_id: str, limit: int, aliases: tuple[str, ...]
+    ) -> list[SearchMatch]:
         vector = _search_vector(Feedback.comment, Feedback.feedback_type, Feedback.status)
-        query_expression = _query_expression(query)
-        rank = _rank_score(vector, query_expression, query=query).label("keyword_rank")
+        query_expression = _query_expression(query, aliases)
+        fuzzy = _fuzzy_score(query, Feedback.comment, Feedback.feedback_type)
+        rank = (_rank_score(vector, query_expression, query=query) + (fuzzy * 0.4)).label("keyword_rank")
         project_requirement_ids = select(Requirement.id).where(Requirement.project_id == project_id)
         project_scenario_ids = (
             select(TestScenario.id)
@@ -343,6 +406,7 @@ class KeywordSearchService:
                     vector.op("@@")(query_expression),
                     _escaped_contains(Feedback.comment, query),
                     _escaped_contains(Feedback.feedback_type, query),
+                    fuzzy >= 0.35,
                 ),
             )
             .order_by(rank.desc(), Feedback.created_at.desc())

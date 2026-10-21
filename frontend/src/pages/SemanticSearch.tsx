@@ -3,6 +3,10 @@ import { Link, useSearchParams } from 'react-router-dom';
 
 import {
   ProjectSummary,
+  getSavedSearches,
+  recordSearchJudgment,
+  SavedSearch,
+  saveArtifactSearch,
   searchArtifacts,
   SearchMode,
   SemanticSearchResult,
@@ -48,19 +52,36 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
   const activeQuery = searchParams.get('q')?.trim() ?? '';
   const activeMode = validMode(searchParams.get('mode'));
   const activeEntityType = validEntityType(searchParams.get('type'));
+  const activeCustomField = searchParams.get('field')?.trim() ?? '';
+  const activeCustomValue = searchParams.get('value') ?? '';
   const [query, setQuery] = useState(activeQuery);
   const [mode, setMode] = useState<SearchMode>(activeMode);
   const [entityType, setEntityType] = useState<SemanticSearchResult['entity_type'] | ''>(activeEntityType);
+  const [customField, setCustomField] = useState(activeCustomField);
+  const [customValue, setCustomValue] = useState(activeCustomValue);
   const [results, setResults] = useState<SemanticSearchResult[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [savedSearches, setSavedSearches] = useState<SavedSearch[]>([]);
+  const [savedName, setSavedName] = useState('');
 
   useEffect(() => {
     setQuery(activeQuery);
     setMode(activeMode);
     setEntityType(activeEntityType);
-  }, [activeEntityType, activeMode, activeQuery]);
+    setCustomField(activeCustomField);
+    setCustomValue(activeCustomValue);
+  }, [activeCustomField, activeCustomValue, activeEntityType, activeMode, activeQuery]);
+
+  useEffect(() => {
+    if (!selectedProject) {
+      setSavedSearches([]);
+      return;
+    }
+    getSavedSearches(selectedProject.id).then(setSavedSearches).catch(() => setSavedSearches([]));
+  }, [selectedProject]);
 
   useEffect(() => {
     let active = true;
@@ -71,9 +92,23 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
     }
     setBusy(true);
     setError(null);
-    searchArtifacts(selectedProject.id, activeQuery, activeMode, activeEntityType || undefined)
+    const searchRequest = activeCustomField
+      ? searchArtifacts(
+        selectedProject.id,
+        activeQuery,
+        activeMode,
+        activeEntityType || undefined,
+        0,
+        activeCustomField,
+        activeCustomValue,
+      )
+      : searchArtifacts(selectedProject.id, activeQuery, activeMode, activeEntityType || undefined);
+    searchRequest
       .then((data) => {
-        if (active) setResults(data);
+        if (active) {
+          setResults(data);
+          setHasMore(data.length === 20);
+        }
       })
       .catch((err: unknown) => {
         if (active) {
@@ -85,7 +120,7 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
         if (active) setBusy(false);
       });
     return () => { active = false; };
-  }, [activeEntityType, activeMode, activeQuery, refreshToken, selectedProject]);
+  }, [activeCustomField, activeCustomValue, activeEntityType, activeMode, activeQuery, refreshToken, selectedProject]);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -97,9 +132,73 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
     if (normalizedQuery.length < 2) return;
     const next = new URLSearchParams({ q: normalizedQuery, mode });
     if (entityType) next.set('type', entityType);
+    if (customField.trim()) {
+      next.set('field', customField.trim());
+      next.set('value', customValue);
+    }
     const unchanged = next.toString() === searchParams.toString();
     setSearchParams(next, { replace: true });
     if (unchanged) setRefreshToken((value) => value + 1);
+  }
+
+  async function handleLoadMore() {
+    if (!selectedProject || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const next = await searchArtifacts(
+        selectedProject.id,
+        activeQuery,
+        activeMode,
+        activeEntityType || undefined,
+        results.length,
+        activeCustomField || undefined,
+        activeCustomField ? activeCustomValue : undefined,
+      );
+      setResults((current) => [...current, ...next]);
+      setHasMore(next.length === 20);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load more results');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveSearch() {
+    if (!selectedProject || activeQuery.length < 2 || !savedName.trim()) return;
+    try {
+      const saved = await saveArtifactSearch({
+        project_id: selectedProject.id,
+        name: savedName.trim(),
+        query: activeQuery,
+        mode: activeMode,
+        entity_type: activeEntityType || undefined,
+      });
+      setSavedSearches((current) => [...current.filter((item) => item.id !== saved.id), saved]
+        .sort((left, right) => left.name.localeCompare(right.name)));
+      setSavedName('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to save search');
+    }
+  }
+
+  function applySavedSearch(saved: SavedSearch) {
+    const next = new URLSearchParams({ q: saved.query, mode: saved.mode });
+    if (saved.entity_type) next.set('type', saved.entity_type);
+    setSearchParams(next, { replace: true });
+  }
+
+  function submitJudgment(result: SemanticSearchResult, judgment: 'clicked' | 'relevant' | 'not_relevant') {
+    const eventId = result.metadata.search_event_id;
+    const rank = Number(result.metadata.result_rank);
+    if (typeof eventId !== 'string' || !Number.isFinite(rank)) return;
+    void recordSearchJudgment({
+      search_event_id: eventId,
+      entity_type: result.entity_type,
+      entity_id: result.entity_id,
+      rank,
+      judgment,
+    });
   }
 
   return (
@@ -160,12 +259,55 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
                 <option value="feedback">Feedback</option>
               </select>
             </label>
+            <label>
+              Custom field
+              <input
+                value={customField}
+                onChange={(event) => setCustomField(event.target.value)}
+                placeholder="risk"
+                maxLength={100}
+              />
+            </label>
+            <label>
+              Custom value
+              <input
+                value={customValue}
+                onChange={(event) => setCustomValue(event.target.value)}
+                placeholder="high"
+                maxLength={500}
+                disabled={!customField.trim()}
+              />
+            </label>
             <button className="primary-button" type="submit" disabled={busy || !selectedProject || query.trim().length < 2}>
               {busy ? 'Searching...' : 'Search'}
             </button>
           </div>
         </form>
       </section>
+
+      {activeQuery.length >= 2 ? (
+        <section className="detail-card saved-search-panel">
+          <label>
+            Save this search
+            <input
+              value={savedName}
+              onChange={(event) => setSavedName(event.target.value)}
+              maxLength={255}
+              placeholder="Regression candidates"
+            />
+          </label>
+          <button type="button" className="secondary-button" onClick={handleSaveSearch} disabled={!savedName.trim()}>
+            Save
+          </button>
+        </section>
+      ) : null}
+      {savedSearches.length ? (
+        <nav className="saved-searches" aria-label="Saved searches">
+          {savedSearches.map((saved) => (
+            <button type="button" key={saved.id} onClick={() => applySavedSearch(saved)}>{saved.name}</button>
+          ))}
+        </nav>
+      ) : null}
 
       <section className="history-list" aria-live="polite" aria-busy={busy}>
         {results.map((result) => {
@@ -194,7 +336,15 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
                 ) : null}
                 {result.matched_fields.map((field) => <span key={field}>Matched {field}</span>)}
               </div>
-              {requirementId ? <Link to={`/requirements/${requirementId}`}>Open requirement</Link> : null}
+              <div className="search-result-actions">
+                {requirementId ? (
+                  <Link onClick={() => submitJudgment(result, 'clicked')} to={`/requirements/${requirementId}`}>
+                    Open requirement
+                  </Link>
+                ) : null}
+                <button type="button" onClick={() => submitJudgment(result, 'relevant')}>Relevant</button>
+                <button type="button" onClick={() => submitJudgment(result, 'not_relevant')}>Not relevant</button>
+              </div>
             </article>
           );
         })}
@@ -202,6 +352,11 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
           <p>No {activeMode} results found for “{activeQuery}”.</p>
         ) : null}
         {!busy && activeQuery.length < 2 ? <p>Enter at least two characters to search.</p> : null}
+        {hasMore ? (
+          <button type="button" className="secondary-button" onClick={handleLoadMore} disabled={busy}>
+            {busy ? 'Loading...' : 'Load more'}
+          </button>
+        ) : null}
       </section>
     </main>
   );

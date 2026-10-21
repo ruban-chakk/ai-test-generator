@@ -13,8 +13,10 @@ import {
   getDependencyHealth,
   getGovernancePolicies,
   getImportMappingProfileHistory,
+  getIntegrationSchedules,
   getImportMappingProfiles,
   getMappedImportJobs,
+  getUnresolvedImports,
   getMonitoringSummary,
   getOutboxEvents,
   getSemanticCalibrations,
@@ -44,11 +46,17 @@ vi.mock('../api', () => ({
   getImportMappingProfiles: vi.fn(),
   getImportMappingProfileHistory: vi.fn(),
   getMappedImportJobs: vi.fn(),
+  getUnresolvedImports: vi.fn(),
+  getIntegrationSchedules: vi.fn(),
+  createJiraSchedule: vi.fn(),
+  triggerIntegrationSchedule: vi.fn(),
   createImportMappingProfile: vi.fn(),
   createMappedImportJob: vi.fn(),
   updateImportMappingProfile: vi.fn(),
   rollbackImportMappingProfile: vi.fn(),
   retryMappedImportJob: vi.fn(),
+  retryUnresolvedImport: vi.fn(),
+  dismissUnresolvedImport: vi.fn(),
   previewMappedImport: vi.fn(),
   executeMappedImport: vi.fn(),
   retryOutboxEvent: vi.fn(),
@@ -68,6 +76,8 @@ function mockRefresh() {
   vi.mocked(getImportMappingProfiles).mockResolvedValue([]);
   vi.mocked(getImportMappingProfileHistory).mockResolvedValue([]);
   vi.mocked(getMappedImportJobs).mockResolvedValue([]);
+  vi.mocked(getUnresolvedImports).mockResolvedValue([]);
+  vi.mocked(getIntegrationSchedules).mockResolvedValue([]);
   vi.mocked(getMonitoringSummary).mockResolvedValue({
     status: 'ok',
     metrics: { requirements: 2 },

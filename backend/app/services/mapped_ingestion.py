@@ -87,8 +87,8 @@ def validate_mapping_configuration(entity_type: str, configuration: dict[str, An
         raise MappedIngestionError("configuration.options must be an object")
     if options.get("multi_requirement_strategy", "reject") not in {"reject", "first", "duplicate"}:
         raise MappedIngestionError("multi_requirement_strategy must be reject, first, or duplicate")
-    if options.get("unresolved_reference_policy", "reject") not in {"reject", "skip"}:
-        raise MappedIngestionError("unresolved_reference_policy must be reject or skip")
+    if options.get("unresolved_reference_policy", "reject") not in {"reject", "skip", "stage"}:
+        raise MappedIngestionError("unresolved_reference_policy must be reject, skip, or stage")
     existing_strategy = options.get("existing_record_strategy", "skip")
     allowed_existing = {"skip", "update", "reject"} if entity_type == "requirement" else {
         "skip", "new_version", "reject"

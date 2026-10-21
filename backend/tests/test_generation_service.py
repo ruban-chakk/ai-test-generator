@@ -15,6 +15,7 @@ from app.services.generation import (
     RetrievedContext,
     build_generation_service,
     rerank_generation_contexts,
+    _strict_json_schema,
 )
 
 
@@ -107,7 +108,7 @@ def test_generation_service_embeds_retrieves_and_generates_structured_draft() ->
     assert result.requirement_vector_id == "requirement:requirement-1:v1"
     assert result.model == "test-model"
     assert result.draft.scenarios[0].test_cases[0].steps[0].step_number == 1
-    assert vector_store.upserts[0][2]["project_id"] == "project-1"
+    assert vector_store.upserts == []
     system_prompt, user_prompt = language_model.generated_prompts[0]
     assert "untrusted data" in system_prompt
     assert "Approved reset-link expiry coverage" in user_prompt
@@ -130,6 +131,16 @@ def test_generated_test_case_rejects_non_contiguous_steps() -> None:
                 )
             ],
         )
+
+
+def test_structured_output_schema_is_strict_for_every_nested_object() -> None:
+    schema = _strict_json_schema(GeneratedDraft.model_json_schema())
+
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["scenarios"]
+    for definition in schema["$defs"].values():
+        assert definition["additionalProperties"] is False
+        assert set(definition["required"]) == set(definition["properties"])
 
 
 def test_generation_contexts_fuse_keyword_evidence_and_collapse_chunks() -> None:

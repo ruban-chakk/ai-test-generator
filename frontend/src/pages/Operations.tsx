@@ -9,6 +9,7 @@ import {
   ComplianceProfile,
   createSemanticCalibration,
   createGovernancePolicy,
+  createJiraSchedule,
   DependencyHealthSummary,
   EvaluationRunSummary,
   getGovernancePolicies,
@@ -25,15 +26,19 @@ import {
   createMappedImportJob,
   executeMappedImport,
   getImportMappingProfileHistory,
+  getIntegrationSchedules,
   getImportMappingProfiles,
   getMappedImportJobs,
+  getUnresolvedImports,
   previewMappedImport,
   rollbackImportMappingProfile,
   ImportMappingProfile,
   MappedImportJob,
   MappedImportPreview,
+  UnresolvedImportRecord,
   importRequirementFile,
   IntegrationRunSummary,
+  IntegrationSchedule,
   MonitoringSummary,
   OutboxEventSummary,
   RepositorySyncRunSummary,
@@ -43,7 +48,10 @@ import {
   runEvaluationSuite,
   retryOutboxEvent,
   retryMappedImportJob,
+  retryUnresolvedImport,
+  dismissUnresolvedImport,
   syncTestRepository,
+  triggerIntegrationSchedule,
   updateComplianceProfile,
   updateImportMappingProfile,
   exportComplianceEvidence,
@@ -92,7 +100,7 @@ const TEST_CASE_MAPPING = {
   options: {
     expected_result_source: 'expectedResults',
     multi_requirement_strategy: 'duplicate',
-    unresolved_reference_policy: 'skip',
+    unresolved_reference_policy: 'stage',
     existing_record_strategy: 'new_version',
   },
 };
@@ -121,6 +129,8 @@ const EMPTY_CUSTOM_FIELD: CustomFieldDraft = {
 
 export default function OperationsPage({ selectedProject }: OperationsPageProps) {
   const [jiraJql, setJiraJql] = useState('ORDER BY updated DESC');
+  const [jiraScheduleHours, setJiraScheduleHours] = useState(6);
+  const [integrationSchedules, setIntegrationSchedules] = useState<IntegrationSchedule[]>([]);
   const [repository, setRepository] = useState('enterprise-test-repository');
   const [branch, setBranch] = useState('main');
   const [cleanupText, setCleanupText] = useState('TBD user should validate checkout ASAP');
@@ -146,6 +156,7 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
   const [mappedPreview, setMappedPreview] = useState<MappedImportPreview | null>(null);
   const [mappedRun, setMappedRun] = useState<IntegrationRunSummary | null>(null);
   const [mappedJobs, setMappedJobs] = useState<MappedImportJob[]>([]);
+  const [unresolvedImports, setUnresolvedImports] = useState<UnresolvedImportRecord[]>([]);
   const [cleanupResult, setCleanupResult] = useState<CleanupResult | null>(null);
   const [evaluationRun, setEvaluationRun] = useState<EvaluationRunSummary | null>(null);
   const [policies, setPolicies] = useState<GovernancePolicySummary[]>([]);
@@ -207,19 +218,27 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
         getImportMappingProfiles(selectedProject.id),
         getImportMappingProfileHistory(selectedProject.id),
         getMappedImportJobs(selectedProject.id),
-      ]).then(([active, history, jobs]) => {
+        getUnresolvedImports(selectedProject.id),
+        getIntegrationSchedules(selectedProject.id),
+      ]).then(([active, history, jobs, unresolved, schedules]) => {
         setMappingProfiles(active);
         setMappingHistory(history);
         setMappedJobs(jobs);
+        setUnresolvedImports(unresolved);
+        setIntegrationSchedules(schedules);
       }).catch(() => {
         setMappingProfiles([]);
         setMappingHistory([]);
         setMappedJobs([]);
+        setUnresolvedImports([]);
+        setIntegrationSchedules([]);
       });
     } else {
       setMappingProfiles([]);
       setMappingHistory([]);
       setMappedJobs([]);
+      setUnresolvedImports([]);
+      setIntegrationSchedules([]);
     }
   }, [selectedProject?.id]);
 
@@ -357,6 +376,24 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
     });
   };
 
+  const refreshUnresolved = async () => {
+    if (selectedProject) setUnresolvedImports(await getUnresolvedImports(selectedProject.id));
+  };
+
+  const handleRetryUnresolved = (recordId: string) => {
+    runAction(`retry-unresolved-${recordId}`, async () => {
+      await retryUnresolvedImport(recordId);
+      await refreshUnresolved();
+    });
+  };
+
+  const handleDismissUnresolved = (recordId: string) => {
+    runAction(`dismiss-unresolved-${recordId}`, async () => {
+      await dismissUnresolvedImport(recordId);
+      await refreshUnresolved();
+    });
+  };
+
   const runAction = async (name: string, action: () => Promise<void>) => {
     try {
       setBusy(name);
@@ -378,6 +415,27 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
     }
     runAction('import', async () => {
       setImportRun(await importJiraRequirements(selectedProject.id, jiraJql));
+    });
+  };
+
+  const handleCreateJiraSchedule = () => {
+    if (!selectedProject) return;
+    runAction('jira-schedule', async () => {
+      await createJiraSchedule({
+        project_id: selectedProject.id,
+        name: `Jira delta sync every ${jiraScheduleHours}h`,
+        jql: jiraJql,
+        interval_seconds: jiraScheduleHours * 3600,
+      });
+      setIntegrationSchedules(await getIntegrationSchedules(selectedProject.id));
+    });
+  };
+
+  const handleRunSchedule = (scheduleId: string) => {
+    if (!selectedProject) return;
+    runAction(`run-schedule-${scheduleId}`, async () => {
+      await triggerIntegrationSchedule(scheduleId);
+      setIntegrationSchedules(await getIntegrationSchedules(selectedProject.id));
     });
   };
 
@@ -675,7 +733,7 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
                   </div>
                   <p className="case-meta">
                     Mapping v{job.profile_version} · Processed {job.source_record_count} · Created {job.created_record_count} ·{' '}
-                    Updated {job.updated_record_count} · Skipped {job.skipped_record_count}
+                    Updated {job.updated_record_count} · Staged {job.unresolved_record_count} · Skipped {job.skipped_record_count}
                   </p>
                   {job.last_error_type ? <p className="status-message status-error">{job.last_error_type}</p> : null}
                   {job.status === 'failed' ? (
@@ -688,6 +746,41 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
                       Retry from checkpoint
                     </button>
                   ) : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {unresolvedImports.length ? (
+            <div className="history-list" aria-live="polite">
+              <h3>Unresolved test-case links</h3>
+              <p className="case-meta">
+                These records are preserved and will reconcile automatically when their user story is imported.
+              </p>
+              {unresolvedImports.slice(0, 20).map((record) => (
+                <div className="history-card" key={record.id}>
+                  <strong>{record.external_id}</strong>
+                  <p className="case-meta">
+                    Missing story {record.missing_reference} · Retries {record.retry_count}
+                  </p>
+                  {record.last_error_type ? <p className="status-message status-error">{record.last_error_type}</p> : null}
+                  <div className="detail-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => handleRetryUnresolved(record.id)}
+                      disabled={busy === `retry-unresolved-${record.id}`}
+                    >
+                      Retry link
+                    </button>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => handleDismissUnresolved(record.id)}
+                      disabled={busy === `dismiss-unresolved-${record.id}`}
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -804,9 +897,49 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
               <button className="primary-button" type="submit" disabled={busy === 'import' || !selectedProject}>
                 {busy === 'import' ? 'Importing...' : 'Import Jira'}
               </button>
+              <label>
+                Schedule every (hours)
+                <input
+                  type="number"
+                  min={1}
+                  max={720}
+                  value={jiraScheduleHours}
+                  onChange={(event) => setJiraScheduleHours(Number(event.target.value))}
+                />
+              </label>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={handleCreateJiraSchedule}
+                disabled={busy === 'jira-schedule' || !selectedProject || jiraScheduleHours < 1}
+              >
+                Schedule delta sync
+              </button>
             </div>
           </form>
-          {importRun ? <p className="case-meta">Imported: {String(importRun.result.imported_count ?? 0)}</p> : null}
+          {importRun ? (
+            <p className="case-meta">
+              Created {String(importRun.result.created_count ?? 0)} · Updated {String(importRun.result.updated_count ?? 0)} ·{' '}
+              Unchanged {String(importRun.result.unchanged_count ?? 0)}
+            </p>
+          ) : null}
+          {integrationSchedules.map((schedule) => (
+            <div className="history-card" key={schedule.id}>
+              <strong>{schedule.name}</strong>
+              <p className="case-meta">
+                Next {new Date(schedule.next_run_at).toLocaleString()} · Last {schedule.last_status ?? 'not run'}
+              </p>
+              {schedule.last_error_type ? <p className="status-message status-error">{schedule.last_error_type}</p> : null}
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => handleRunSchedule(schedule.id)}
+                disabled={busy === `run-schedule-${schedule.id}`}
+              >
+                Run now
+              </button>
+            </div>
+          ))}
         </article>
 
         <article className="detail-card">

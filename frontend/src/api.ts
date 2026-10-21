@@ -295,11 +295,64 @@ export async function searchArtifacts(
   query: string,
   mode: SearchMode,
   entityType?: SemanticSearchResult['entity_type'],
+  offset = 0,
+  customField?: string,
+  customValue?: string,
 ): Promise<SemanticSearchResult[]> {
   const params = new URLSearchParams({ project_id: projectId, query, mode });
   if (entityType) params.set('entity_type', entityType);
+  if (offset) params.set('offset', String(offset));
+  if (customField && customValue !== undefined) {
+    params.set('custom_field', customField);
+    params.set('custom_value', customValue);
+  }
   return request<SemanticSearchResult[]>(`${API_BASE_URL}/search?${params.toString()}`, {
     headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export type SavedSearch = {
+  id: string;
+  project_id: string;
+  name: string;
+  query: string;
+  mode: SearchMode;
+  entity_type?: SemanticSearchResult['entity_type'];
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function getSavedSearches(projectId: string): Promise<SavedSearch[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<SavedSearch[]>(`${API_BASE_URL}/search/saved?${params.toString()}`);
+}
+
+export async function saveArtifactSearch(payload: {
+  project_id: string;
+  name: string;
+  query: string;
+  mode: SearchMode;
+  entity_type?: SemanticSearchResult['entity_type'];
+}): Promise<SavedSearch> {
+  return request<SavedSearch>(`${API_BASE_URL}/search/saved`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function recordSearchJudgment(payload: {
+  search_event_id: string;
+  entity_type: SemanticSearchResult['entity_type'];
+  entity_id: string;
+  rank: number;
+  judgment: 'clicked' | 'relevant' | 'not_relevant';
+}): Promise<void> {
+  await request(`${API_BASE_URL}/search/judgments`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
 }
 
@@ -312,6 +365,23 @@ export type IntegrationRunSummary = {
   result: Record<string, unknown>;
   started_at: string;
   completed_at?: string;
+};
+
+export type IntegrationSchedule = {
+  id: string;
+  project_id: string;
+  name: string;
+  integration_type: 'jira';
+  configuration: Record<string, unknown>;
+  interval_seconds: number;
+  enabled: boolean;
+  next_run_at: string;
+  last_run_at?: string;
+  last_status?: string;
+  last_error_type?: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
 };
 
 export type ImportMappingProfile = {
@@ -341,6 +411,23 @@ export type MappedImportPreview = {
   samples: Array<Record<string, unknown>>;
 };
 
+export type UnresolvedImportRecord = {
+  id: string;
+  project_id: string;
+  profile_id: string;
+  import_job_id?: string;
+  entity_type: string;
+  external_id: string;
+  missing_reference: string;
+  status: 'pending' | 'resolved' | 'dismissed';
+  retry_count: number;
+  last_error_type?: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  resolved_at?: string;
+};
+
 export type MappedImportJob = {
   id: string;
   project_id: string;
@@ -358,6 +445,7 @@ export type MappedImportJob = {
   updated_record_count: number;
   existing_record_count: number;
   skipped_record_count: number;
+  unresolved_record_count: number;
   warning_count: number;
   error_count: number;
   result: Record<string, unknown>;
@@ -1055,6 +1143,37 @@ export async function importJiraRequirements(
   return handleResponse<IntegrationRunSummary>(response);
 }
 
+export function getIntegrationSchedules(projectId: string): Promise<IntegrationSchedule[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<IntegrationSchedule[]>(`${API_BASE_URL}/integrations/schedules?${params.toString()}`);
+}
+
+export function createJiraSchedule(payload: {
+  project_id: string;
+  name: string;
+  jql: string;
+  interval_seconds: number;
+}): Promise<IntegrationSchedule> {
+  return request<IntegrationSchedule>(`${API_BASE_URL}/integrations/schedules`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      project_id: payload.project_id,
+      name: payload.name,
+      integration_type: 'jira',
+      configuration: { jql: payload.jql, max_results: 1000 },
+      interval_seconds: payload.interval_seconds,
+      enabled: true,
+    }),
+  });
+}
+
+export function triggerIntegrationSchedule(scheduleId: string): Promise<IntegrationSchedule> {
+  return request<IntegrationSchedule>(`${API_BASE_URL}/integrations/schedules/${scheduleId}/run`, {
+    method: 'POST',
+  });
+}
+
 export async function importRequirementFile(
   projectId: string,
   file: File,
@@ -1153,6 +1272,23 @@ export function getMappedImportJobs(projectId: string): Promise<MappedImportJob[
 export async function retryMappedImportJob(jobId: string): Promise<MappedImportJob> {
   const response = await fetch(`${API_BASE_URL}/imports/mapped/jobs/${jobId}/retry`, { method: 'POST' });
   return handleResponse<MappedImportJob>(response);
+}
+
+export function getUnresolvedImports(projectId: string): Promise<UnresolvedImportRecord[]> {
+  const params = new URLSearchParams({ project_id: projectId, status: 'pending' });
+  return request<UnresolvedImportRecord[]>(`${API_BASE_URL}/imports/unresolved?${params.toString()}`);
+}
+
+export function retryUnresolvedImport(recordId: string): Promise<UnresolvedImportRecord> {
+  return request<UnresolvedImportRecord>(`${API_BASE_URL}/imports/unresolved/${recordId}/retry`, {
+    method: 'POST',
+  });
+}
+
+export function dismissUnresolvedImport(recordId: string): Promise<UnresolvedImportRecord> {
+  return request<UnresolvedImportRecord>(`${API_BASE_URL}/imports/unresolved/${recordId}/dismiss`, {
+    method: 'POST',
+  });
 }
 
 export async function syncTestRepository(
