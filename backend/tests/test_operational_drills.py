@@ -56,6 +56,12 @@ def test_acceptance_probe_reports_all_configured_dependencies_without_exposing_s
         jira_api_token="jira-secret",
         test_repository_base_url="https://repository.example",
         test_repository_token="repo-secret",
+        xray_client_id="xray-client",
+        xray_client_secret="xray-secret",
+        testrail_username="testrail-user",
+        testrail_api_key="testrail-secret",
+        testrail_project_id=42,
+        zephyr_api_token="zephyr-secret",
         oidc_enabled=True,
         oidc_jwks_uri="https://identity.example/jwks",
         execution_runner_base_url="https://runner.example",
@@ -68,7 +74,7 @@ def test_acceptance_probe_reports_all_configured_dependencies_without_exposing_s
 
     probes = asyncio.run(scenario())
     assert {probe.name for probe in probes} == {
-        "llm", "pinecone", "jira", "test_repository", "oidc", "execution_runner"
+        "llm", "pinecone", "jira", "xray", "testrail", "zephyr", "oidc", "execution_runner"
     }
     assert all(probe.status == "healthy" for probe in probes)
     assert "secret" not in repr(probes)

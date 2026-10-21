@@ -203,5 +203,5 @@ DR_SOURCE_DSN='postgresql://...' DR_TARGET_DSN='postgresql://.../ai_test_gen_dri
 With tenant credentials present in the normal environment, run the sanitized provider gate:
 
 ```bash
-python scripts/acceptance_probe.py --require llm,pinecone,jira,test_repository,oidc
+python scripts/acceptance_probe.py --require llm,pinecone,jira,xray,testrail,zephyr,oidc,execution_runner
 ```
