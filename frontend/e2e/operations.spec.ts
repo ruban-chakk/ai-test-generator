@@ -31,6 +31,28 @@ test('admin can inspect operations and import a requirement file', async ({ page
         aggregate_id: 'case-1', status: 'failed', attempts: 8, last_error: 'GenerationProviderError',
         available_at: now, created_at: now,
       }];
+    } else if (path.endsWith('/operations/alerts')) {
+      body = [{
+        id: 'alert-1', project_id: 'project-1', category: 'outbox_exhausted', severity: 'critical',
+        title: 'Delivery exhausted', details: { event_id: 'event-1' }, status: 'open',
+        delivery_status: 'not_configured', created_at: now,
+      }];
+    } else if (path.endsWith('/compliance/projects/project-1/profile')) {
+      body = {
+        project_id: 'project-1', frameworks: ['SOC2'], evidence_retention_days: 365,
+        evidence_export_enabled: true, pseudonymize_actors: true, approval_notes_required: false,
+      };
+    } else if (path.endsWith('/impact/calibrations') && request.method() === 'GET') {
+      body = [];
+    } else if (path.endsWith('/impact/calibrations') && request.method() === 'POST') {
+      body = {
+        id: 'calibration-1', project_id: 'project-1', dataset_digest: 'digest', sample_count: 10,
+        label_distribution: { duplicate: 3, update: 3, unrelated: 4 },
+        previous_thresholds: { duplicate: 0.8, update: 0.45 },
+        proposed_thresholds: { duplicate: 0.86, update: 0.57 },
+        metrics: { accuracy: 1, macro_f1: 1, confusion: {} }, status: 'applied',
+        requested_by: 'admin', created_at: now, applied_at: now,
+      };
     } else if (path.endsWith('/requirements/import-file') && request.method() === 'POST') {
       body = {
         id: 'run-1', integration_type: 'file_import', status: 'completed', requested_by: 'admin',
@@ -46,6 +68,8 @@ test('admin can inspect operations and import a requirement file', async ({ page
   await expect(page.getByRole('heading', { name: 'Integrations and governance' })).toBeVisible();
   await expect(page.getByText('Overall: degraded')).toBeVisible();
   await expect(page.getByText('GenerationProviderError')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Project compliance' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Semantic calibration' })).toBeVisible();
 
   await page.getByLabel('Requirement file').setInputFiles({
     name: 'refunds.md',
@@ -101,4 +125,46 @@ test('approver can queue an approved test case for automated execution', async (
   await page.getByRole('checkbox').check();
   await page.getByRole('button', { name: 'Run selected (1)' }).click();
   await expect(page.getByText('queued')).toBeVisible();
+});
+
+test('reviewer can run project-scoped semantic search and open a linked requirement', async ({ page }) => {
+  await page.route('**/api/v1/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    let body: unknown;
+    if (path.endsWith('/auth/config')) {
+      body = { oidc_enabled: false };
+    } else if (path.endsWith('/auth/me')) {
+      body = { id: 'user-3', username: 'reviewer', email: 'reviewer@example.com', role: 'reviewer', active: true };
+    } else if (path.endsWith('/projects')) {
+      body = [{ id: 'project-1', name: 'Payments', status: 'active', requirement_count: 1, test_case_count: 1 }];
+    } else if (path.endsWith('/search')) {
+      expect(url.searchParams.get('project_id')).toBe('project-1');
+      expect(url.searchParams.get('query')).toBe('expired reset token');
+      expect(url.searchParams.get('entity_type')).toBe('test_case');
+      body = [{
+        vector_id: 'test_case:case-1:v2', entity_type: 'test_case', entity_id: 'case-1',
+        title: 'Reject expired reset token', text: 'Expired reset links are rejected.', score: 0.92,
+        metadata: { requirement_id: 'requirement-1' },
+      }];
+    } else if (path.endsWith('/requirements/requirement-1')) {
+      body = {
+        id: 'requirement-1', project_id: 'project-1', title: 'Secure password reset',
+        description: 'Reset links expire and cannot be reused.', source: 'manual', status: 'approved', scenarios: [],
+      };
+    } else {
+      return route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ detail: path }) });
+    }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  });
+
+  await page.goto('/search');
+  await page.getByRole('searchbox').fill('expired reset token');
+  await page.getByLabel('Artifact type').selectOption('test_case');
+  await page.getByRole('button', { name: 'Search' }).click();
+  await expect(page.getByRole('heading', { name: 'Reject expired reset token' })).toBeVisible();
+  await expect(page.getByText('92%')).toBeVisible();
+  await page.getByRole('link', { name: 'Open requirement' }).click();
+  await expect(page.getByRole('heading', { name: 'Secure password reset' })).toBeVisible();
 });

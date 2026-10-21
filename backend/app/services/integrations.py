@@ -458,6 +458,139 @@ class XrayCloudRepositoryClient:
         return parsed
 
 
+class ZephyrCloudRepositoryClient:
+    """Publishes immutable approved versions to Zephyr Cloud with retry-safe references."""
+
+    def __init__(self, config: Settings = settings, client: httpx.AsyncClient | None = None) -> None:
+        if not config.zephyr_base_url or not config.zephyr_api_token:
+            raise IntegrationConfigurationError("ZEPHYR_BASE_URL and ZEPHYR_API_TOKEN are required")
+        self._base_url = config.zephyr_base_url.rstrip("/")
+        self._token = config.zephyr_api_token
+        self._timeout = config.test_repository_timeout_seconds
+        self._client = client
+
+    async def upsert(
+        self,
+        test_case: RepositoryTestCase,
+        *,
+        repository: str,
+        branch: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        del branch, idempotency_key
+        project_key = repository.strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,31}", project_key):
+            raise IntegrationConfigurationError("Zephyr delivery requires a valid project key as repository")
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=self._timeout)
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        reference = _delivery_reference(test_case)
+        name = f"[{reference}] {test_case.title}"
+        payload: dict[str, Any] = {
+            "projectKey": project_key,
+            "name": name,
+            "objective": test_case.description,
+            "precondition": test_case.prerequisite or "",
+            "labels": ["ai-test-generator", reference.lower()],
+        }
+        try:
+            existing = await self._find_by_name(client, headers, project_key, name)
+            if existing:
+                key = str(existing.get("key") or "")
+                if not key:
+                    raise IntegrationProviderError("Zephyr returned a test case without a key")
+                response = await _request_with_retry(
+                    client,
+                    "PUT",
+                    f"{self._base_url}/testcases/{quote(key, safe='')}",
+                    provider="Zephyr",
+                    headers=headers,
+                    json=payload,
+                )
+                created = False
+            else:
+                response = await _request_with_retry(
+                    client,
+                    "POST",
+                    f"{self._base_url}/testcases",
+                    provider="Zephyr",
+                    headers=headers,
+                    json=payload,
+                )
+                created = True
+            result = response.json() if response.content else {}
+            if not isinstance(result, dict):
+                raise IntegrationProviderError("Zephyr returned an invalid response")
+            key = str(result.get("key") or (existing or {}).get("key") or "")
+            if not key:
+                raise IntegrationProviderError("Zephyr returned no test case key")
+            steps = {
+                "mode": "OVERWRITE",
+                "items": [
+                    {
+                        "inline": {
+                            "description": str(step.get("action") or ""),
+                            "testData": "",
+                            "expectedResult": str(step.get("expected_result") or ""),
+                        }
+                    }
+                    for step in test_case.steps
+                ],
+            }
+            await _request_with_retry(
+                client,
+                "POST",
+                f"{self._base_url}/testcases/{quote(key, safe='')}/teststeps",
+                provider="Zephyr",
+                headers=headers,
+                json=steps,
+            )
+            return {"created": created, "key": key, "reference": reference}
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise IntegrationProviderError("Zephyr returned an invalid response") from exc
+        finally:
+            if owns_client:
+                await client.aclose()
+
+    async def _find_by_name(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        project_key: str,
+        name: str,
+    ) -> dict[str, Any] | None:
+        start_at = 0
+        for _ in range(20):
+            response = await _request_with_retry(
+                client,
+                "GET",
+                f"{self._base_url}/testcases",
+                provider="Zephyr",
+                headers=headers,
+                params={"projectKey": project_key, "startAt": start_at, "maxResults": 100},
+            )
+            parsed = response.json()
+            if not isinstance(parsed, dict):
+                raise IntegrationProviderError("Zephyr returned an invalid search response")
+            values = parsed.get("values") or []
+            matches = [item for item in values if isinstance(item, dict) and item.get("name") == name]
+            if len(matches) > 1:
+                raise IntegrationProviderError("Zephyr returned duplicate delivery references")
+            if matches:
+                return matches[0]
+            if parsed.get("isLast") is True or not values:
+                return None
+            next_url = parsed.get("next")
+            start_at += len(values)
+            if not next_url and start_at >= int(parsed.get("total") or 0):
+                return None
+        raise IntegrationProviderError("Zephyr lookup exceeded the pagination safety limit")
+
+
 def build_test_repository_client(
     config: Settings = settings,
     client: httpx.AsyncClient | None = None,
@@ -469,4 +602,6 @@ def build_test_repository_client(
         return XrayCloudRepositoryClient(config, client)
     if provider == "testrail":
         return TestRailRepositoryClient(config, client)
+    if provider in {"zephyr", "zephyr_cloud", "zephyr_scale"}:
+        return ZephyrCloudRepositoryClient(config, client)
     raise IntegrationConfigurationError(f"Unsupported TEST_REPOSITORY_PROVIDER: {provider}")

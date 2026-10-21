@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings, settings
 from app.models import (
+    Alert,
     Feedback,
     OutboxEvent,
     RepositorySyncRun,
@@ -17,6 +18,7 @@ from app.models import (
     TestExecutionRun,
     TestScenario,
 )
+from app.services.alerts import ALERT_DELIVERY_REQUESTED, AlertWebhookClient, create_alert
 from app.services.execution import ExecutableTestCase, ExecutionResult, TestExecutionClient
 from app.services.integrations import RepositoryClient, RepositoryTestCase, build_test_repository_client
 from app.services.indexing import IndexableArtifact, IndexingService, build_indexing_service
@@ -80,11 +82,13 @@ class OutboxProcessor:
         worker_id: str | None = None,
         repository_client: RepositoryClient | None = None,
         execution_client: TestExecutionClient | None = None,
+        alert_client: AlertWebhookClient | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._indexing_service = indexing_service
         self._repository_client = repository_client
         self._execution_client = execution_client
+        self._alert_client = alert_client
         self._config = config
         self._worker_id = worker_id or f"indexer-{uuid.uuid4()}"
 
@@ -138,6 +142,8 @@ class OutboxProcessor:
                     operation = ("repository", await self._load_repository_delivery(db, event))
                 elif event.event_type == TEST_CASE_EXECUTION_REQUESTED:
                     operation = ("execution", await self._load_execution(db, event))
+                elif event.event_type == ALERT_DELIVERY_REQUESTED:
+                    operation = ("alert", await self._load_alert(db, event))
                 else:
                     raise ValueError("unsupported outbox event type")
             if operation[0] == "index":
@@ -154,7 +160,7 @@ class OutboxProcessor:
                     branch=branch,
                     idempotency_key=idempotency_key,
                 )
-            else:
+            elif operation[0] == "execution":
                 if self._execution_client is None:
                     self._execution_client = TestExecutionClient(self._config)
                 test_case, environment, idempotency_key = operation[1]
@@ -163,6 +169,11 @@ class OutboxProcessor:
                     environment=environment,
                     idempotency_key=idempotency_key,
                 )
+            else:
+                if self._alert_client is None:
+                    self._alert_client = AlertWebhookClient(self._config)
+                alert, idempotency_key = operation[1]
+                await self._alert_client.deliver(alert, idempotency_key=idempotency_key)
         except Exception as exc:
             await self._record_failure(event_id, type(exc).__name__)
             return
@@ -189,6 +200,8 @@ class OutboxProcessor:
                 await self._complete_repository_delivery(db, event)
             elif event.event_type == TEST_CASE_EXECUTION_REQUESTED and execution_result is not None:
                 await self._complete_execution(db, event, execution_result)
+            elif event.event_type == ALERT_DELIVERY_REQUESTED:
+                await self._complete_alert_delivery(db, event)
             await db.commit()
 
     async def _record_failure(self, event_id: uuid.UUID, error_type: str) -> None:
@@ -223,6 +236,29 @@ class OutboxProcessor:
                     execution_run.status = "error"
                     execution_run.completed_at = _utcnow()
                     execution_run.result = {"failure_type": error_type[:255]}
+            if exhausted and event.event_type == ALERT_DELIVERY_REQUESTED:
+                alert = await db.get(Alert, event.aggregate_id)
+                if alert:
+                    alert.delivery_status = "failed"
+            elif exhausted:
+                project_id = await self._event_project_id(db, event)
+                await create_alert(
+                    db,
+                    dedupe_key=f"outbox-exhausted:{event.id}",
+                    category="outbox_exhausted",
+                    severity="critical",
+                    title=f"Delivery exhausted for {event.event_type}",
+                    details={
+                        "event_id": str(event.id),
+                        "event_type": event.event_type,
+                        "aggregate_type": event.aggregate_type,
+                        "aggregate_id": str(event.aggregate_id),
+                        "attempts": event.attempts,
+                        "failure_type": error_type[:255],
+                    },
+                    project_id=project_id,
+                    config=self._config,
+                )
             await db.commit()
 
     async def _load_artifact(self, db: AsyncSession, event: OutboxEvent) -> IndexableArtifact:
@@ -425,6 +461,53 @@ class OutboxProcessor:
         execution_run.external_run_id = result.external_run_id
         execution_run.result = result.summary
         execution_run.completed_at = event.processed_at
+        if result.status == "failed":
+            await create_alert(
+                db,
+                dedupe_key=f"execution-failed:{execution_run.id}",
+                category="test_execution_failed",
+                severity="high",
+                title="Automated test execution failed",
+                details={
+                    "execution_run_id": str(execution_run.id),
+                    "test_case_id": str(execution_run.test_case_id),
+                    "test_case_version": execution_run.test_case_version,
+                    "environment": execution_run.environment,
+                    "external_run_id": execution_run.external_run_id,
+                },
+                project_id=execution_run.project_id,
+                config=self._config,
+            )
+
+    async def _load_alert(self, db: AsyncSession, event: OutboxEvent) -> tuple[Alert, str]:
+        alert = await db.get(Alert, event.aggregate_id)
+        if not alert or alert.delivery_status not in {"pending", "failed"}:
+            raise LookupError("pending alert no longer exists")
+        return alert, event.event_key
+
+    async def _complete_alert_delivery(self, db: AsyncSession, event: OutboxEvent) -> None:
+        alert = await db.get(Alert, event.aggregate_id, with_for_update=True)
+        if alert:
+            alert.delivery_status = "delivered"
+            alert.delivered_at = event.processed_at
+
+    async def _event_project_id(self, db: AsyncSession, event: OutboxEvent) -> uuid.UUID | None:
+        if event.event_type == TEST_CASE_EXECUTION_REQUESTED:
+            execution_run = await db.get(TestExecutionRun, event.aggregate_id)
+            return execution_run.project_id if execution_run else None
+        if event.event_type == TEST_CASE_REPOSITORY_SYNC_REQUESTED:
+            sync_run_id = event.payload.get("sync_run_id")
+            if sync_run_id:
+                try:
+                    sync_run = await db.get(RepositorySyncRun, uuid.UUID(sync_run_id))
+                except (TypeError, ValueError, AttributeError):
+                    sync_run = None
+                project_id = (sync_run.details or {}).get("project_id") if sync_run else None
+                try:
+                    return uuid.UUID(project_id) if project_id else None
+                except (TypeError, ValueError, AttributeError):
+                    return None
+        return None
 
     async def _feedback_requirement(self, db: AsyncSession, feedback: Feedback) -> Requirement:
         if feedback.target_level == "requirement":

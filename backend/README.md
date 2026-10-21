@@ -108,6 +108,11 @@ For TestRail, set `TEST_REPOSITORY_PROVIDER=testrail`, `TEST_REPOSITORY_BASE_URL
 The adapter looks up a deterministic reference before calling `add_case` or `update_case`, preventing ordinary
 worker retries from creating duplicate cases.
 
+For Zephyr Cloud, set `TEST_REPOSITORY_PROVIDER=zephyr_cloud`, `ZEPHYR_API_TOKEN`, and optionally
+`ZEPHYR_BASE_URL`. The repository value supplied by the sync request is the Zephyr project key. Each immutable
+approved version uses a stable `ATG-...-V...` reference; retries find that version and overwrite its step script
+instead of creating another test case.
+
 The admin operations API exposes sanitized dependency status and outbox retry controls. `/health/live` is a
 process check; `/health/ready` includes a database query. Provider probes never return credentials or response
 bodies.
@@ -137,6 +142,16 @@ stable `Idempotency-Key`, and must return a terminal `passed` or `failed` status
 and a JSON `result`. Network/provider failures are retried without storing provider response bodies; exhausted
 deliveries become `error` runs and remain visible to operations staff.
 
+Execution failures and retry-exhausted outbox events create deduplicated alerts in PostgreSQL. Configure
+`ALERT_WEBHOOK_URL`, `ALERT_WEBHOOK_TOKEN`, and optionally `ALERT_WEBHOOK_TIMEOUT_SECONDS` to route them to an
+external incident receiver. Webhook delivery is itself outbox-backed and retry-safe; alerts remain visible and
+acknowledgeable through `/api/v1/operations/alerts` even when no webhook is configured or delivery fails.
+
+Rate limits use shared PostgreSQL counters, so limits apply across API replicas rather than resetting per process.
+Configure `API_RATE_LIMIT_PER_MINUTE`, `AUTH_RATE_LIMIT_PER_MINUTE`, and `RATE_LIMIT_ENABLED`. Authenticated limits
+are keyed by a one-way hash of user ID; password and OIDC entry limits are keyed by a one-way hash of the direct
+client address. Exceeded requests return `429` with `Retry-After: 60`.
+
 ## Database migration
 
 Apply all managed migrations with Alembic:
@@ -156,3 +171,37 @@ pytest -q tests
 ```
 
 PostgreSQL integration tests use `TEST_POSTGRES_DSN`; tests that require it skip when the variable is absent.
+
+## Calibration and compliance
+
+Project approvers can submit at least ten labeled semantic scores to `/api/v1/impact/calibrations`. All three
+labels (`duplicate`, `update`, `unrelated`) are required. The service records the dataset digest, distribution,
+thresholds, confusion matrix, accuracy, and macro F1, but not the raw labeled rows. Applying a run activates its
+ordered thresholds for subsequent impact analysis.
+
+Project compliance profiles control framework labels, evidence retention, export enablement, stable actor
+pseudonymization, and mandatory approval notes. Evidence exports are project-scoped, bounded, SHA-256 addressed,
+and logged in the audit trail. Every export reports `is_complete` and `truncated_sections`; consumers must not
+treat a truncated response as a complete audit package.
+
+## Load, recovery, and live acceptance
+
+Run a bounded latency gate against liveness or an authenticated standard-query endpoint:
+
+```bash
+python scripts/load_smoke.py --url http://127.0.0.1:8000/health/live --requests 1000 --concurrency 50
+```
+
+The recovery drill only permits a distinct local database whose name ends in `_drill`. It replaces objects in
+that disposable target, verifies the restored schema and Alembic revision, and prints a redacted JSON report:
+
+```bash
+DR_SOURCE_DSN='postgresql://...' DR_TARGET_DSN='postgresql://.../ai_test_gen_drill' \
+  python scripts/disaster_recovery_drill.py --allow-target-reset
+```
+
+With tenant credentials present in the normal environment, run the sanitized provider gate:
+
+```bash
+python scripts/acceptance_probe.py --require llm,pinecone,jira,test_repository,oidc
+```

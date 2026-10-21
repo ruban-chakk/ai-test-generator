@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import Settings
 from app.models import (
+    Alert,
     OutboxEvent,
     Project,
     RepositorySyncRun,
@@ -60,7 +61,8 @@ class RecordingRepository:
 
 
 class RecordingExecutionClient:
-    def __init__(self) -> None:
+    def __init__(self, status: str = "passed") -> None:
+        self.status = status
         self.executions: list[tuple[ExecutableTestCase, str, str]] = []
 
     async def execute(
@@ -72,7 +74,7 @@ class RecordingExecutionClient:
     ) -> ExecutionResult:
         self.executions.append((test_case, environment, idempotency_key))
         return ExecutionResult(
-            status="passed",
+            status=self.status,
             external_run_id="external-run-1",
             summary={"steps_passed": len(test_case.steps)},
         )
@@ -174,6 +176,56 @@ def test_outbox_worker_indexes_and_completes_event() -> None:
             assert indexer.artifacts[0].project_id == str(project_id)
             assert "expired password reset link" in indexer.artifacts[0].text.lower()
             assert await processor.process_batch() == 0
+        finally:
+            await cleanup(session_factory, project_id, event_id)
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_failed_execution_creates_one_durable_project_alert() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(TEST_DSN)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        project_id, test_case_id, event_id = await seed_event(session_factory)
+        async with session_factory() as db:
+            execution_run = ExecutionRunModel(
+                project_id=project_id,
+                test_case_id=test_case_id,
+                test_case_version=1,
+                environment="production",
+                runner="generic",
+                status="queued",
+                idempotency_key=f"execution-failure-{uuid.uuid4()}",
+                result={},
+                requested_by="integration-test",
+            )
+            db.add(execution_run)
+            await db.flush()
+            execution_run_id = execution_run.id
+            event = await db.get(OutboxEvent, event_id)
+            event.event_type = TEST_CASE_EXECUTION_REQUESTED
+            event.event_key = f"execution.run:{execution_run.id}"
+            event.aggregate_type = "test_execution_run"
+            event.aggregate_id = execution_run.id
+            await db.commit()
+
+        try:
+            processor = OutboxProcessor(
+                session_factory,
+                config=processor_settings(),
+                worker_id="failed-execution-worker",
+                execution_client=RecordingExecutionClient(status="failed"),  # type: ignore[arg-type]
+            )
+            assert await processor.process_batch() == 1
+            async with session_factory() as db:
+                alerts = (
+                    await db.execute(select(Alert).where(Alert.project_id == project_id))
+                ).scalars().all()
+                assert len(alerts) == 1
+                assert alerts[0].category == "test_execution_failed"
+                assert alerts[0].delivery_status == "not_configured"
+                assert alerts[0].details["execution_run_id"] == str(execution_run_id)
         finally:
             await cleanup(session_factory, project_id, event_id)
             await engine.dispose()

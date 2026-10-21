@@ -285,6 +285,53 @@ CREATE INDEX IF NOT EXISTS idx_test_execution_runs_project ON test_execution_run
 CREATE INDEX IF NOT EXISTS idx_test_execution_runs_test_case ON test_execution_runs(test_case_id);
 CREATE INDEX IF NOT EXISTS idx_test_execution_runs_status ON test_execution_runs(status);
 
+CREATE TABLE IF NOT EXISTS alerts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
+  dedupe_key varchar NOT NULL UNIQUE,
+  category varchar NOT NULL,
+  severity varchar NOT NULL,
+  title text NOT NULL,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status varchar NOT NULL DEFAULT 'open',
+  delivery_status varchar NOT NULL DEFAULT 'not_configured',
+  acknowledged_by varchar,
+  acknowledged_at timestamptz,
+  delivered_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_project ON alerts(project_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_category ON alerts(category);
+CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
+CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+CREATE INDEX IF NOT EXISTS idx_alerts_delivery_status ON alerts(delivery_status);
+
+CREATE TABLE IF NOT EXISTS api_rate_limits (
+  bucket_key varchar PRIMARY KEY,
+  window_start timestamptz NOT NULL,
+  request_count integer NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS semantic_calibration_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  dataset_digest varchar NOT NULL,
+  sample_count integer NOT NULL,
+  label_distribution jsonb NOT NULL DEFAULT '{}'::jsonb,
+  previous_thresholds jsonb NOT NULL DEFAULT '{}'::jsonb,
+  proposed_thresholds jsonb NOT NULL DEFAULT '{}'::jsonb,
+  metrics jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status varchar NOT NULL DEFAULT 'proposed',
+  requested_by varchar NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  applied_at timestamptz,
+  CONSTRAINT uq_semantic_calibration_dataset UNIQUE (project_id, dataset_digest)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_calibration_project ON semantic_calibration_runs(project_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_calibration_status ON semantic_calibration_runs(status);
+
 CREATE TABLE IF NOT EXISTS approval_records (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   target_level varchar NOT NULL,

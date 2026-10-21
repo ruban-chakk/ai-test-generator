@@ -292,6 +292,50 @@ class TestExecutionRun(Base):
     test_case = relationship("TestCase", back_populates="execution_runs")
 
 
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    dedupe_key = Column(String, nullable=False, unique=True)
+    category = Column(String, nullable=False, index=True)
+    severity = Column(String, nullable=False, index=True)
+    title = Column(Text, nullable=False)
+    details = Column(JSON, nullable=False, default=dict)
+    status = Column(String, nullable=False, default="open", index=True)
+    delivery_status = Column(String, nullable=False, default="not_configured", index=True)
+    acknowledged_by = Column(String, nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ApiRateLimit(Base):
+    __tablename__ = "api_rate_limits"
+
+    bucket_key = Column(String, primary_key=True)
+    window_start = Column(DateTime(timezone=True), nullable=False)
+    request_count = Column(Integer, nullable=False, default=0)
+
+
+class SemanticCalibrationRun(Base):
+    __tablename__ = "semantic_calibration_runs"
+    __table_args__ = (UniqueConstraint("project_id", "dataset_digest", name="uq_semantic_calibration_dataset"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    dataset_digest = Column(String, nullable=False)
+    sample_count = Column(Integer, nullable=False)
+    label_distribution = Column(JSON, nullable=False, default=dict)
+    previous_thresholds = Column(JSON, nullable=False, default=dict)
+    proposed_thresholds = Column(JSON, nullable=False, default=dict)
+    metrics = Column(JSON, nullable=False, default=dict)
+    status = Column(String, nullable=False, default="proposed", index=True)
+    requested_by = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    applied_at = Column(DateTime, nullable=True)
+
+
 class ApprovalRecord(Base):
     __tablename__ = "approval_records"
 

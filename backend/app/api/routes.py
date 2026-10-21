@@ -1,11 +1,12 @@
 import uuid
 import re
 import hashlib
-from datetime import datetime
+import json
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -13,6 +14,7 @@ from app.db import get_db
 from app.core.config import settings
 from app.core.security import current_principal, require_global_role
 from app.models import (
+    Alert,
     ApprovalRecord,
     AuditLog,
     EvaluationRun,
@@ -28,6 +30,7 @@ from app.models import (
     Requirement,
     RepositorySyncRun,
     RevisionRecord,
+    SemanticCalibrationRun,
     TestCase,
     TestCaseStep as TestCaseStepModel,
     TestCaseVersion,
@@ -36,11 +39,15 @@ from app.models import (
     User,
 )
 from app.schemas import (
+    AlertSummary,
     ApprovalAction,
     ApprovalRecordSummary,
     AuditLogSummary,
     CleanupRequest,
     CleanupResult,
+    ComplianceEvidenceExport,
+    ComplianceProfileSummary,
+    ComplianceProfileUpdate,
     EvaluationRunRequest,
     EvaluationRunSummary,
     FeedbackCreate,
@@ -65,6 +72,8 @@ from app.schemas import (
     RepositorySyncRequest,
     RepositorySyncRunSummary,
     SemanticSearchResult,
+    SemanticCalibrationRequest,
+    SemanticCalibrationSummary,
     RequirementCreate,
     RequirementDetail,
     RevisionRecordSummary,
@@ -103,6 +112,7 @@ from app.services.integrations import (
 from app.services.file_ingestion import FileIngestionError, parse_requirement_file
 from app.services.health import probe_external_dependencies
 from app.services.search import build_semantic_search_service
+from app.services.calibration import CalibrationSample, calibrate_thresholds
 
 api_router = APIRouter()
 
@@ -334,6 +344,7 @@ async def _run_impact_analysis(
     created_by: str = "system",
     context_ids: list[uuid.UUID] | None = None,
 ) -> ImpactAnalysisSummary:
+    duplicate_threshold, update_threshold = await _impact_thresholds(db, project_id)
     try:
         semantic_service = build_semantic_impact_service()
         matches = await semantic_service.search(source_text, project_id=str(project_id))
@@ -358,13 +369,13 @@ async def _run_impact_analysis(
         score = match.score
         keyword_overlap = source_tokens & DEPRECATION_KEYWORDS
         try:
-            if score >= DUPLICATE_THRESHOLD:
+            if score >= duplicate_threshold:
                 duplicates.append(
                     _semantic_candidate(
                         match.metadata,
                         score,
                         "archive_duplicate",
-                        "Semantic similarity is at or above the 80% duplicate threshold.",
+                        f"Semantic similarity is at or above the {round(duplicate_threshold * 100)}% duplicate threshold.",
                     )
                 )
             elif keyword_overlap and score >= 0.25:
@@ -376,7 +387,7 @@ async def _run_impact_analysis(
                         "Requirement language indicates replacement or retirement of semantically overlapping coverage.",
                     )
                 )
-            elif score >= UPDATE_THRESHOLD:
+            elif score >= update_threshold:
                 updates.append(
                     _semantic_candidate(
                         match.metadata,
@@ -406,14 +417,14 @@ async def _run_impact_analysis(
         "deprecation_count": len(deprecations),
         "update_count": len(updates),
         "manual_review_recommended": bool(deprecations or updates or risk_score >= 40),
-        "thresholds": {"duplicate": DUPLICATE_THRESHOLD, "update": UPDATE_THRESHOLD},
+        "thresholds": {"duplicate": duplicate_threshold, "update": update_threshold},
         "similarity_mode": "embedding_cosine",
     }
 
     analysis = ImpactAnalysis(
         requirement_id=requirement_id,
         source_text=source_text,
-        similarity_threshold=int(DUPLICATE_THRESHOLD * 100),
+        similarity_threshold=int(duplicate_threshold * 100),
         duplicates=jsonable_encoder(duplicates),
         deprecations=jsonable_encoder(deprecations),
         updates=jsonable_encoder(updates),
@@ -440,7 +451,7 @@ async def _run_impact_analysis(
         id=analysis.id,
         requirement_id=requirement_id,
         source_text=source_text,
-        similarity_threshold=DUPLICATE_THRESHOLD,
+        similarity_threshold=duplicate_threshold,
         duplicates=duplicates,
         deprecations=deprecations,
         updates=updates,
@@ -450,6 +461,24 @@ async def _run_impact_analysis(
         created_by=created_by,
         created_at=analysis.created_at,
     )
+
+
+async def _impact_thresholds(db: AsyncSession, project_id: uuid.UUID) -> tuple[float, float]:
+    policy = await db.scalar(
+        select(GovernancePolicy).where(
+            GovernancePolicy.name == f"semantic-impact-thresholds:{project_id}",
+            GovernancePolicy.status == "active",
+        )
+    )
+    rules = policy.rules if policy and isinstance(policy.rules, dict) else {}
+    try:
+        duplicate = float(rules.get("duplicate", DUPLICATE_THRESHOLD))
+        update = float(rules.get("update", UPDATE_THRESHOLD))
+    except (TypeError, ValueError):
+        return DUPLICATE_THRESHOLD, UPDATE_THRESHOLD
+    if not 0 <= update < duplicate <= 1:
+        return DUPLICATE_THRESHOLD, UPDATE_THRESHOLD
+    return duplicate, update
 
 
 def _test_case_snapshot(test_case: TestCase) -> dict:
@@ -932,6 +961,11 @@ async def _create_approval_record(
     approved_by: str,
     notes: str | None = None,
 ) -> None:
+    project_id = await _target_project_id(db, target_level, target_id)
+    if project_id is not None:
+        profile, _ = await _compliance_profile(db, project_id)
+        if profile.approval_notes_required and not (notes or "").strip():
+            raise HTTPException(status_code=422, detail="This project's compliance profile requires approval notes")
     approval = ApprovalRecord(
         target_level=target_level,
         target_id=target_id,
@@ -949,6 +983,55 @@ async def _create_approval_record(
         details={"notes": notes, "version": version},
     )
     db.add(audit)
+
+
+async def _target_project_id(
+    db: AsyncSession, target_level: str, target_id: uuid.UUID
+) -> uuid.UUID | None:
+    if target_level == "requirement":
+        return await db.scalar(select(Requirement.project_id).where(Requirement.id == target_id))
+    if target_level == "scenario":
+        return await db.scalar(
+            select(Requirement.project_id)
+            .join(TestScenario, TestScenario.requirement_id == Requirement.id)
+            .where(TestScenario.id == target_id)
+        )
+    if target_level == "test_case":
+        return await db.scalar(
+            select(Requirement.project_id)
+            .join(TestCase, TestCase.requirement_id == Requirement.id)
+            .where(TestCase.id == target_id)
+        )
+    return None
+
+
+async def _compliance_profile(
+    db: AsyncSession, project_id: uuid.UUID
+) -> tuple[ComplianceProfileSummary, GovernancePolicy | None]:
+    policy = await db.scalar(
+        select(GovernancePolicy).where(
+            GovernancePolicy.name == f"compliance-profile:{project_id}",
+            GovernancePolicy.status == "active",
+        )
+    )
+    rules = policy.rules if policy and isinstance(policy.rules, dict) else {}
+    try:
+        retention_days = int(rules.get("evidence_retention_days", 365))
+    except (TypeError, ValueError):
+        retention_days = 365
+    raw_frameworks = rules.get("frameworks", [])
+    if not isinstance(raw_frameworks, list):
+        raw_frameworks = []
+    profile = ComplianceProfileSummary(
+        project_id=project_id,
+        frameworks=[str(item) for item in raw_frameworks][:10],
+        evidence_retention_days=min(3650, max(30, retention_days)),
+        evidence_export_enabled=bool(rules.get("evidence_export_enabled", True)),
+        pseudonymize_actors=bool(rules.get("pseudonymize_actors", True)),
+        approval_notes_required=bool(rules.get("approval_notes_required", False)),
+        updated_at=policy.updated_at if policy else None,
+    )
+    return profile, policy
 
 
 @api_router.post(
@@ -1814,6 +1897,151 @@ async def list_impact_analyses(
     ]
 
 
+async def _apply_semantic_calibration(
+    db: AsyncSession,
+    calibration: SemanticCalibrationRun,
+    actor: str,
+) -> None:
+    if calibration.status == "applied":
+        return
+    policy_name = f"semantic-impact-thresholds:{calibration.project_id}"
+    policy = await db.scalar(select(GovernancePolicy).where(GovernancePolicy.name == policy_name))
+    rules = {
+        **calibration.proposed_thresholds,
+        "calibration_run_id": str(calibration.id),
+        "dataset_digest": calibration.dataset_digest,
+        "sample_count": calibration.sample_count,
+        "metrics": calibration.metrics,
+    }
+    if policy:
+        policy.rules = rules
+        policy.status = "active"
+        policy.updated_at = datetime.utcnow()
+    else:
+        db.add(
+            GovernancePolicy(
+                name=policy_name,
+                policy_type="semantic_impact_thresholds",
+                rules=rules,
+                status="active",
+                created_by=actor,
+            )
+        )
+    calibration.status = "applied"
+    calibration.applied_at = datetime.utcnow()
+    db.add(
+        AuditLog(
+            entity_type="semantic_calibration",
+            entity_id=calibration.id,
+            action="semantic_thresholds_applied",
+            actor=actor,
+            details={
+                "project_id": str(calibration.project_id),
+                "dataset_digest": calibration.dataset_digest,
+                "thresholds": calibration.proposed_thresholds,
+                "metrics": calibration.metrics,
+            },
+        )
+    )
+
+
+@api_router.post(
+    "/impact/calibrations",
+    response_model=SemanticCalibrationSummary,
+    tags=["Impact"],
+)
+async def create_semantic_calibration(
+    payload: SemanticCalibrationRequest,
+    db: AsyncSession = Depends(get_db),
+) -> SemanticCalibrationSummary:
+    await _ensure_project(db, payload.project_id)
+    await _require_project_access(db, payload.project_id, {"approver", "admin"})
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"semantic-calibration:{payload.project_id}"},
+    )
+    actor = current_principal().username
+    samples = [
+        CalibrationSample(similarity=item.similarity, expected_action=item.expected_action.strip().lower())
+        for item in payload.samples
+    ]
+    try:
+        result = calibrate_thresholds(samples)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    canonical_samples = sorted((round(item.similarity, 6), item.expected_action) for item in samples)
+    dataset_digest = hashlib.sha256(
+        json.dumps(canonical_samples, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    calibration = await db.scalar(
+        select(SemanticCalibrationRun).where(
+            SemanticCalibrationRun.project_id == payload.project_id,
+            SemanticCalibrationRun.dataset_digest == dataset_digest,
+        )
+    )
+    if calibration is None:
+        duplicate_threshold, update_threshold = await _impact_thresholds(db, payload.project_id)
+        calibration = SemanticCalibrationRun(
+            project_id=payload.project_id,
+            dataset_digest=dataset_digest,
+            sample_count=len(samples),
+            label_distribution=result.label_distribution,
+            previous_thresholds={"duplicate": duplicate_threshold, "update": update_threshold},
+            proposed_thresholds={
+                "duplicate": result.duplicate_threshold,
+                "update": result.update_threshold,
+            },
+            metrics={
+                "accuracy": result.accuracy,
+                "macro_f1": result.macro_f1,
+                "confusion": result.confusion,
+            },
+            status="proposed",
+            requested_by=actor,
+        )
+        db.add(calibration)
+        await db.flush()
+        db.add(
+            AuditLog(
+                entity_type="semantic_calibration",
+                entity_id=calibration.id,
+                action="semantic_calibration_created",
+                actor=actor,
+                details={
+                    "project_id": str(payload.project_id),
+                    "dataset_digest": dataset_digest,
+                    "sample_count": len(samples),
+                    "proposed_thresholds": calibration.proposed_thresholds,
+                    "metrics": calibration.metrics,
+                },
+            )
+        )
+    if payload.apply:
+        await _apply_semantic_calibration(db, calibration, actor)
+    await db.commit()
+    await db.refresh(calibration)
+    return calibration
+
+
+@api_router.get(
+    "/impact/calibrations",
+    response_model=list[SemanticCalibrationSummary],
+    tags=["Impact"],
+)
+async def list_semantic_calibrations(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[SemanticCalibrationSummary]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    result = await db.execute(
+        select(SemanticCalibrationRun)
+        .where(SemanticCalibrationRun.project_id == project_id)
+        .order_by(SemanticCalibrationRun.created_at.desc())
+    )
+    return result.scalars().all()
+
+
 @api_router.post(
     "/impact/test_cases/{test_case_id}/deprecate",
     response_model=TestCaseSummary,
@@ -2565,6 +2793,70 @@ async def retry_outbox_event(
     return event
 
 
+@api_router.get(
+    "/operations/alerts",
+    response_model=list[AlertSummary],
+    tags=["Operations"],
+)
+async def list_alerts(
+    project_id: uuid.UUID | None = Query(None),
+    status: str | None = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> list[AlertSummary]:
+    principal = current_principal()
+    if principal.role != "admin":
+        if project_id is None:
+            raise HTTPException(status_code=422, detail="project_id is required")
+        await _require_project_access(db, project_id)
+    elif project_id is not None:
+        await _ensure_project(db, project_id)
+    stmt = select(Alert)
+    if project_id is not None:
+        stmt = stmt.where(Alert.project_id == project_id)
+    if status:
+        if status not in {"open", "acknowledged"}:
+            raise HTTPException(status_code=422, detail="Unsupported alert status")
+        stmt = stmt.where(Alert.status == status)
+    result = await db.execute(stmt.order_by(Alert.created_at.desc()).limit(limit))
+    return result.scalars().all()
+
+
+@api_router.post(
+    "/operations/alerts/{alert_id}/acknowledge",
+    response_model=AlertSummary,
+    tags=["Operations"],
+)
+async def acknowledge_alert(
+    alert_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> AlertSummary:
+    alert = await db.get(Alert, alert_id, with_for_update=True)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if alert.project_id is None:
+        require_global_role("admin")
+    else:
+        await _require_project_access(db, alert.project_id, {"approver", "admin"})
+    if alert.status != "acknowledged":
+        actor = current_principal().username
+        alert.status = "acknowledged"
+        alert.acknowledged_by = actor
+        alert.acknowledged_at = datetime.utcnow()
+        db.add(
+            AuditLog(
+                entity_type="alert",
+                entity_id=alert.id,
+                action="alert_acknowledged",
+                actor=actor,
+                details={"category": alert.category, "severity": alert.severity},
+            )
+        )
+        await db.commit()
+        await db.refresh(alert)
+    return alert
+
+
 @api_router.post(
     "/governance/policies",
     response_model=GovernancePolicySummary,
@@ -2622,6 +2914,274 @@ async def list_governance_policies(
     stmt = stmt.order_by(GovernancePolicy.updated_at.desc())
     result = await db.execute(stmt)
     return result.scalars().all()
+
+
+@api_router.put(
+    "/compliance/projects/{project_id}/profile",
+    response_model=ComplianceProfileSummary,
+    tags=["Compliance"],
+)
+async def update_compliance_profile(
+    project_id: uuid.UUID,
+    payload: ComplianceProfileUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> ComplianceProfileSummary:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"admin"})
+    actor = current_principal().username
+    normalized_frameworks = sorted({item.strip().upper() for item in payload.frameworks if item.strip()})
+    rules = {**payload.model_dump(), "frameworks": normalized_frameworks}
+    name = f"compliance-profile:{project_id}"
+    policy = await db.scalar(select(GovernancePolicy).where(GovernancePolicy.name == name))
+    if policy:
+        policy.rules = rules
+        policy.status = "active"
+        policy.policy_type = "project_compliance"
+        policy.updated_at = datetime.utcnow()
+    else:
+        policy = GovernancePolicy(
+            name=name,
+            policy_type="project_compliance",
+            rules=rules,
+            status="active",
+            created_by=actor,
+        )
+        db.add(policy)
+        await db.flush()
+    db.add(
+        AuditLog(
+            entity_type="project",
+            entity_id=project_id,
+            action="compliance_profile_updated",
+            actor=actor,
+            details={"rules": rules},
+        )
+    )
+    await db.commit()
+    await db.refresh(policy)
+    profile, _ = await _compliance_profile(db, project_id)
+    return profile
+
+
+@api_router.get(
+    "/compliance/projects/{project_id}/profile",
+    response_model=ComplianceProfileSummary,
+    tags=["Compliance"],
+)
+async def get_compliance_profile(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> ComplianceProfileSummary:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    profile, _ = await _compliance_profile(db, project_id)
+    return profile
+
+
+def _pseudonymize_actor(project_id: uuid.UUID, actor: str) -> str:
+    digest = hashlib.sha256(f"{project_id}:{actor}".encode("utf-8")).hexdigest()[:16]
+    return f"actor-{digest}"
+
+
+def _pseudonymize_actor_fields(value: object, project_id: uuid.UUID) -> object:
+    actor_keys = {"actor", "approved_by", "created_by", "requested_by", "acknowledged_by"}
+    if isinstance(value, list):
+        return [_pseudonymize_actor_fields(item, project_id) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _pseudonymize_actor(project_id, item)
+            if key in actor_keys and isinstance(item, str)
+            else _pseudonymize_actor_fields(item, project_id)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    """Normalize API datetimes to the UTC-naive convention used by database columns."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+@api_router.get(
+    "/compliance/projects/{project_id}/evidence",
+    response_model=ComplianceEvidenceExport,
+    tags=["Compliance"],
+)
+async def export_compliance_evidence(
+    project_id: uuid.UUID,
+    period_start: datetime | None = Query(None),
+    period_end: datetime | None = Query(None),
+    limit: int = Query(1000, ge=1, le=5000),
+    db: AsyncSession = Depends(get_db),
+) -> ComplianceEvidenceExport:
+    project = await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"approver", "admin"})
+    profile, _ = await _compliance_profile(db, project_id)
+    if not profile.evidence_export_enabled:
+        raise HTTPException(status_code=403, detail="Compliance evidence export is disabled for this project")
+    end = _as_utc_naive(period_end) if period_end else datetime.utcnow()
+    retention_start = end - timedelta(days=profile.evidence_retention_days)
+    requested_start = _as_utc_naive(period_start) if period_start else retention_start
+    start = max(requested_start, retention_start)
+    if start >= end:
+        raise HTTPException(status_code=422, detail="period_start must be before period_end")
+
+    requirement_rows = (
+        await db.execute(
+            select(Requirement)
+            .where(Requirement.project_id == project_id)
+            .order_by(Requirement.created_at)
+            .limit(limit + 1)
+        )
+    ).scalars().all()
+    truncated_sections: set[str] = set()
+    if len(requirement_rows) > limit:
+        truncated_sections.add("requirements_and_linked_evidence")
+    requirements = requirement_rows[:limit]
+    requirement_ids = [item.id for item in requirements]
+    scenario_rows = (
+        await db.execute(select(TestScenario).where(TestScenario.requirement_id.in_(requirement_ids)).limit(limit + 1))
+    ).scalars().all() if requirement_ids else []
+    test_case_rows = (
+        await db.execute(select(TestCase).where(TestCase.requirement_id.in_(requirement_ids)).limit(limit + 1))
+    ).scalars().all() if requirement_ids else []
+    if len(scenario_rows) > limit or len(test_case_rows) > limit:
+        truncated_sections.add("requirements_and_linked_evidence")
+    scenarios = scenario_rows[:limit]
+    test_cases = test_case_rows[:limit]
+    entity_ids = [*requirement_ids, *[item.id for item in scenarios], *[item.id for item in test_cases]]
+    approval_rows = (
+        await db.execute(
+            select(ApprovalRecord)
+            .where(
+                ApprovalRecord.target_id.in_(entity_ids),
+                ApprovalRecord.approved_at >= start,
+                ApprovalRecord.approved_at <= end,
+            )
+            .order_by(ApprovalRecord.approved_at)
+            .limit(limit + 1)
+        )
+    ).scalars().all() if entity_ids else []
+    audit_rows = (
+        await db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.entity_id.in_([project_id, *entity_ids]),
+                AuditLog.created_at >= start,
+                AuditLog.created_at <= end,
+            )
+            .order_by(AuditLog.created_at)
+            .limit(limit + 1)
+        )
+    ).scalars().all()
+    version_rows = (
+        await db.execute(
+            select(TestCaseVersion)
+            .where(
+                TestCaseVersion.requirement_id.in_(requirement_ids),
+                TestCaseVersion.approved_at >= start,
+                TestCaseVersion.approved_at <= end,
+            )
+            .order_by(TestCaseVersion.approved_at)
+            .limit(limit + 1)
+        )
+    ).scalars().all() if requirement_ids else []
+    calibration_rows = (
+        await db.execute(
+            select(SemanticCalibrationRun)
+            .where(
+                SemanticCalibrationRun.project_id == project_id,
+                SemanticCalibrationRun.created_at >= start,
+                SemanticCalibrationRun.created_at <= end,
+            )
+            .order_by(SemanticCalibrationRun.created_at)
+            .limit(limit + 1)
+        )
+    ).scalars().all()
+    section_rows = {
+        "approvals": approval_rows,
+        "audit_log": audit_rows,
+        "version_history": version_rows,
+        "semantic_calibrations": calibration_rows,
+    }
+    for section, rows in section_rows.items():
+        if len(rows) > limit:
+            truncated_sections.add(section)
+    approvals = approval_rows[:limit]
+    audits = audit_rows[:limit]
+    versions = version_rows[:limit]
+    calibrations = calibration_rows[:limit]
+
+    def exported_actor(value: str) -> str:
+        return _pseudonymize_actor(project_id, value) if profile.pseudonymize_actors else value
+
+    def exported_details(value: dict | None) -> object:
+        if not profile.pseudonymize_actors:
+            return value
+        return _pseudonymize_actor_fields(value, project_id)
+
+    evidence = {
+        "project": {"id": str(project.id), "name": project.name, "status": project.status},
+        "requirements": [
+            {"id": str(item.id), "external_id": item.external_id, "title": item.title, "source": item.source, "status": item.status}
+            for item in requirements
+        ],
+        "approvals": [
+            {"id": str(item.id), "target_level": item.target_level, "target_id": str(item.target_id), "status": item.status,
+             "version": item.version, "notes": item.notes, "actor": exported_actor(item.approved_by), "at": item.approved_at.isoformat()}
+            for item in approvals
+        ],
+        "version_history": [
+            {"id": str(item.id), "test_case_id": str(item.test_case_id), "version": item.version, "status": item.status,
+             "actor": exported_actor(item.approved_by), "at": item.approved_at.isoformat()}
+            for item in versions
+        ],
+        "audit_log": [
+            {"id": str(item.id), "entity_type": item.entity_type, "entity_id": str(item.entity_id) if item.entity_id else None,
+             "action": item.action, "actor": exported_actor(item.actor), "details": exported_details(item.details), "at": item.created_at.isoformat()}
+            for item in audits
+        ],
+        "semantic_calibrations": [
+            {"id": str(item.id), "dataset_digest": item.dataset_digest, "sample_count": item.sample_count,
+             "label_distribution": item.label_distribution, "thresholds": item.proposed_thresholds,
+             "metrics": item.metrics, "status": item.status, "actor": exported_actor(item.requested_by), "at": item.created_at.isoformat()}
+            for item in calibrations
+        ],
+    }
+    counts = {key: len(value) for key, value in evidence.items() if isinstance(value, list)}
+    truncated = sorted(truncated_sections)
+    is_complete = not truncated
+    generated_at = datetime.utcnow()
+    canonical = json.dumps(
+        {"evidence": evidence, "record_counts": counts, "is_complete": is_complete, "truncated_sections": truncated},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    db.add(
+        AuditLog(
+            entity_type="project",
+            entity_id=project_id,
+            action="compliance_evidence_exported",
+            actor=current_principal().username,
+            details={"sha256": digest, "period_start": start.isoformat(), "period_end": end.isoformat(), "record_counts": counts},
+        )
+    )
+    await db.commit()
+    return ComplianceEvidenceExport(
+        project_id=project_id,
+        generated_at=generated_at,
+        period_start=start,
+        period_end=end,
+        profile=profile,
+        evidence=evidence,
+        record_counts=counts,
+        is_complete=is_complete,
+        truncated_sections=truncated,
+        sha256=digest,
+    )
 
 
 @api_router.get(

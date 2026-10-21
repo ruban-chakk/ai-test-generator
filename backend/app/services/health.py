@@ -86,6 +86,15 @@ def _repository_probe(config: Settings, client: httpx.AsyncClient):
             {"Accept": "application/json"},
             auth=(config.testrail_username, config.testrail_api_key),
         )
+    if provider in {"zephyr", "zephyr_cloud", "zephyr_scale"}:
+        return _probe(
+            client,
+            "test_repository",
+            bool(config.zephyr_base_url and config.zephyr_api_token),
+            "GET",
+            f"{config.zephyr_base_url.rstrip('/')}/projects",
+            {"Authorization": f"Bearer {config.zephyr_api_token}", "Accept": "application/json"},
+        )
     return _probe(
         client,
         "test_repository",

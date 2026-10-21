@@ -13,6 +13,7 @@ from app.services.integrations import (
     TestRailRepositoryClient as RailRepositoryClient,
     TestRepositoryClient as RepositoryClient,
     XrayCloudRepositoryClient as XrayRepositoryClient,
+    ZephyrCloudRepositoryClient as ZephyrRepositoryClient,
     build_test_repository_client,
 )
 
@@ -190,6 +191,44 @@ def test_xray_adapter_reuses_existing_version_label() -> None:
         assert result["test"]["issueId"] == "10001"
         assert len(requests) == 2
         assert requests[1].headers["Authorization"] == "Bearer xray-token"
+
+    asyncio.run(scenario())
+
+
+def test_zephyr_adapter_creates_case_and_overwrites_steps_with_stable_reference() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer zephyr-token"
+        if request.method == "GET":
+            assert request.url.params["projectKey"] == "QA"
+            return httpx.Response(200, json={"values": [], "isLast": True, "total": 0})
+        if request.url.path.endswith("/testcases"):
+            payload = json.loads(request.content)
+            assert payload["name"] == "[ATG-case-id-V3] Reject expired token"
+            assert payload["labels"] == ["ai-test-generator", "atg-case-id-v3"]
+            return httpx.Response(201, json={"key": "QA-T42", "name": payload["name"]})
+        payload = json.loads(request.content)
+        assert request.url.path.endswith("/testcases/QA-T42/teststeps")
+        assert payload["mode"] == "OVERWRITE"
+        assert payload["items"][0]["inline"]["expectedResult"] == "Request is rejected"
+        return httpx.Response(204)
+
+    async def scenario() -> None:
+        config = Settings(
+            _env_file=None,
+            test_repository_provider="zephyr_cloud",
+            zephyr_api_token="zephyr-token",
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = build_test_repository_client(config, client)
+            assert isinstance(adapter, ZephyrRepositoryClient)
+            result = await adapter.upsert(
+                repository_case(), repository="QA", branch="/generated", idempotency_key="delivery-key"
+            )
+        assert result == {"created": True, "key": "QA-T42", "reference": "ATG-case-id-V3"}
+        assert len(requests) == 3
 
     asyncio.run(scenario())
 

@@ -17,6 +17,7 @@ from app.db import get_db
 from app.models import AuditLog, User
 from app.schemas import AuthConfiguration, TokenResponse, UserSummary
 from app.services.oidc import OIDCClient, OIDCConfigurationError, OIDCProviderError, allowed_email_domain
+from app.services.rate_limit import enforce_auth_rate_limit
 
 
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -36,7 +37,8 @@ async def auth_configuration() -> AuthConfiguration:
 
 
 @auth_router.get("/oidc/login")
-async def oidc_login() -> RedirectResponse:
+async def oidc_login(request: Request, db: AsyncSession = Depends(get_db)) -> RedirectResponse:
+    await enforce_auth_rate_limit(request, db, scope="auth-oidc")
     try:
         client = OIDCClient()
     except OIDCConfigurationError as exc:
@@ -146,10 +148,12 @@ async def oidc_callback(
 
 @auth_router.post("/token", response_model=TokenResponse)
 async def issue_token(
+    request: Request,
     response: Response,
     form: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
+    await enforce_auth_rate_limit(request, db, scope="auth-password")
     identity = form.username.strip().lower()
     result = await db.execute(
         select(User).where(

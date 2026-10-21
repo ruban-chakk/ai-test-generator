@@ -210,6 +210,49 @@ export type ImpactAnalyzePayload = {
   created_by: string;
 };
 
+export type SemanticCalibrationSample = {
+  similarity: number;
+  expected_action: 'duplicate' | 'update' | 'unrelated';
+};
+
+export type SemanticCalibrationSummary = {
+  id: string;
+  project_id: string;
+  dataset_digest: string;
+  sample_count: number;
+  label_distribution: Record<string, number>;
+  previous_thresholds: Record<string, number>;
+  proposed_thresholds: Record<string, number>;
+  metrics: { accuracy: number; macro_f1: number; confusion: Record<string, Record<string, number>> };
+  status: 'proposed' | 'applied';
+  requested_by: string;
+  created_at: string;
+  applied_at?: string;
+};
+
+export type ComplianceProfile = {
+  project_id: string;
+  frameworks: string[];
+  evidence_retention_days: number;
+  evidence_export_enabled: boolean;
+  pseudonymize_actors: boolean;
+  approval_notes_required: boolean;
+  updated_at?: string;
+};
+
+export type ComplianceEvidenceExport = {
+  project_id: string;
+  generated_at: string;
+  period_start: string;
+  period_end: string;
+  profile: ComplianceProfile;
+  evidence: Record<string, unknown>;
+  record_counts: Record<string, number>;
+  is_complete: boolean;
+  truncated_sections: string[];
+  sha256: string;
+};
+
 export type SemanticSearchResult = {
   vector_id: string;
   entity_type: 'requirement' | 'test_case' | 'feedback';
@@ -319,6 +362,21 @@ export type OutboxEventSummary = {
   locked_by?: string;
   processed_at?: string;
   last_error?: string;
+  created_at: string;
+};
+
+export type AlertSummary = {
+  id: string;
+  project_id?: string;
+  category: string;
+  severity: string;
+  title: string;
+  details: Record<string, unknown>;
+  status: 'open' | 'acknowledged';
+  delivery_status: 'not_configured' | 'pending' | 'delivered' | 'failed';
+  acknowledged_by?: string;
+  acknowledged_at?: string;
+  delivered_at?: string;
   created_at: string;
 };
 
@@ -821,6 +879,44 @@ export async function analyzeImpact(payload: ImpactAnalyzePayload): Promise<Impa
   return handleResponse<ImpactAnalysisSummary>(response);
 }
 
+export async function createSemanticCalibration(
+  projectId: string,
+  samples: SemanticCalibrationSample[],
+  apply: boolean,
+): Promise<SemanticCalibrationSummary> {
+  const response = await fetch(`${API_BASE_URL}/impact/calibrations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, samples, apply }),
+  });
+  return handleResponse<SemanticCalibrationSummary>(response);
+}
+
+export async function getSemanticCalibrations(projectId: string): Promise<SemanticCalibrationSummary[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<SemanticCalibrationSummary[]>(`${API_BASE_URL}/impact/calibrations?${params.toString()}`);
+}
+
+export async function getComplianceProfile(projectId: string): Promise<ComplianceProfile> {
+  return request<ComplianceProfile>(`${API_BASE_URL}/compliance/projects/${projectId}/profile`);
+}
+
+export async function updateComplianceProfile(
+  projectId: string,
+  profile: Omit<ComplianceProfile, 'project_id' | 'updated_at'>,
+): Promise<ComplianceProfile> {
+  const response = await fetch(`${API_BASE_URL}/compliance/projects/${projectId}/profile`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile),
+  });
+  return handleResponse<ComplianceProfile>(response);
+}
+
+export async function exportComplianceEvidence(projectId: string): Promise<ComplianceEvidenceExport> {
+  return request<ComplianceEvidenceExport>(`${API_BASE_URL}/compliance/projects/${projectId}/evidence`);
+}
+
 export async function deprecateImpactedTestCase(
   testCaseId: string,
   payload: ApprovalActionPayload,
@@ -975,6 +1071,19 @@ export async function getOutboxEvents(status?: OutboxEventSummary['status']): Pr
 export async function retryOutboxEvent(eventId: string): Promise<OutboxEventSummary> {
   const response = await fetch(`${API_BASE_URL}/operations/outbox/${eventId}/retry`, { method: 'POST' });
   return handleResponse<OutboxEventSummary>(response);
+}
+
+export async function getAlerts(projectId?: string): Promise<AlertSummary[]> {
+  const params = new URLSearchParams();
+  if (projectId) params.set('project_id', projectId);
+  return request<AlertSummary[]>(
+    `${API_BASE_URL}/operations/alerts${params.toString() ? `?${params.toString()}` : ''}`,
+  );
+}
+
+export async function acknowledgeAlert(alertId: string): Promise<AlertSummary> {
+  const response = await fetch(`${API_BASE_URL}/operations/alerts/${alertId}/acknowledge`, { method: 'POST' });
+  return handleResponse<AlertSummary>(response);
 }
 
 export async function createGovernancePolicy(

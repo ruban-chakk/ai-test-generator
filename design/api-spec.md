@@ -58,8 +58,12 @@ outbox; it is not a synchronous database-plus-provider dual write.
 - `GET /impact`
 - `POST /impact/test_cases/{id}/deprecate|review-update`
 
-The service uses embedding cosine scores from Pinecone. Duplicate classification uses a `0.80` threshold; update
-and deprecation recommendations remain heuristics that require human review and dataset calibration.
+The service uses embedding cosine scores from Pinecone. Project approvers can submit labeled duplicate/update/
+unrelated examples through `POST /impact/calibrations`; an explicit apply flag activates measured project
+thresholds. Deprecation recommendations remain conservative and require human review.
+
+- `POST /impact/calibrations` — evaluate an idempotently identified labeled dataset and optionally apply thresholds.
+- `GET /impact/calibrations?project_id=` — list aggregate calibration evidence without retaining raw labels.
 
 ## External integrations
 
@@ -84,7 +88,7 @@ Approver/admin body:
 ```
 
 The endpoint queues approved cases and returns a repository sync run. The outbox worker delivers through the
-configured generic HTTP, Xray Cloud, or TestRail adapter; completion is recorded only after all deliveries succeed.
+configured generic HTTP, Xray Cloud, TestRail, or Zephyr Cloud adapter; completion is recorded only after all deliveries succeed.
 
 - `GET /integrations/runs` and `GET /integrations/test-repo/sync` are admin-only run history endpoints.
 
@@ -95,7 +99,12 @@ configured generic HTTP, Xray Cloud, or TestRail adapter; completion is recorded
 - `GET /monitoring/summary` — database counters.
 - `GET /operations/dependencies` — sanitized live provider probes.
 - `GET /operations/outbox`, `POST /operations/outbox/{id}/retry` — inspect and safely retry delivery failures.
+- `GET /operations/alerts`, `POST /operations/alerts/{id}/acknowledge` — project-aware failure notifications,
+  delivery state, and acknowledgement evidence.
 - `POST /governance/policies`, `GET /governance/policies` — governance policy storage.
+- `GET|PUT /compliance/projects/{project_id}/profile` — project frameworks, retention, export, pseudonymization,
+  and mandatory approval-note controls.
+- `GET /compliance/projects/{project_id}/evidence` — bounded, retention-aware, SHA-256-addressed evidence export with explicit `is_complete` and `truncated_sections` metadata.
 - `GET /repository/test_cases` — list cases visible to the caller.
 
 Outside the API prefix, `GET /health/live` is a process liveness check and `GET /health/ready` verifies database
@@ -120,5 +129,5 @@ must return a terminal result; the application records passed, failed, or exhaus
 - `502`: configured external provider failed.
 - `503`: required external provider or secret is not configured.
 
-Not implemented: Zephyr Cloud delivery, alert routing, distributed rate limiting,
-tenant-specific compliance exports, semantic threshold calibration, load certification, and disaster-recovery drills.
+Live provider acceptance requires tenant credentials and is run with `scripts/acceptance_probe.py`; secrets and
+tenant-specific acceptance results are deliberately not committed.

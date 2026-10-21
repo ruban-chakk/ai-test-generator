@@ -118,4 +118,8 @@ See `design/development-phases.md` for a detailed enterprise-grade roadmap.
 - Implemented: Deterministic NLP cleanup, validation, transactional outbox, authentication, and project RBAC
 - Prototype: Database metrics summary and governance-policy storage
 - Implemented: dependency health checks, generic OIDC federation, and generic/Xray Cloud/TestRail repository adapters.
-- Pending: alert routing, rate limiting, load/recovery evidence, tenant-specific compliance controls, and Zephyr delivery.
+- Implemented: durable operational alerts, retry-safe webhook routing, and acknowledgement evidence.
+- Implemented: shared PostgreSQL rate limiting for authenticated and authentication traffic.
+- Implemented: Zephyr Cloud delivery, labeled semantic calibration, project-specific compliance controls and
+  evidence exports, broader browser coverage, bounded load certification, and guarded recovery drills.
+- Deployment gate: run sanitized live acceptance with the target tenant credentials.

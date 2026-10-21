@@ -6,10 +6,11 @@ An enterprise-grade full-stack solution for generating and managing test cases f
 
 The end-to-end review workflow is implemented: database-backed authentication and project RBAC, manual/Jira/file
 ingestion, OpenAI-compatible RAG generation, Pinecone indexing and semantic search, approval/versioning,
-feedback-driven revision, impact analysis, audit history, and durable repository delivery. Repository delivery
-supports a generic idempotent HTTP contract, Xray Cloud, and TestRail. Generic OIDC login, dependency probes,
-outbox recovery controls, durable automated execution through a configured runner, component tests, and mocked
-browser critical-path tests are also included. External features fail closed when their credentials are absent.
+feedback-driven revision, calibrated impact analysis, audit history, and durable repository delivery. Repository
+delivery supports a generic idempotent HTTP contract, Xray Cloud, TestRail, and Zephyr Cloud. Generic OIDC login,
+dependency probes, outbox recovery controls, durable automated execution, routed operational alerts, shared API
+rate limits, project compliance evidence, component tests, and browser critical-path tests are also included.
+External features fail closed when their credentials are absent.
 
 ## Goal
 
@@ -38,10 +39,9 @@ Create an enterprise-ready system that:
 - LLM + embeddings: OpenAI / Anthropic / Azure OpenAI
 - Evaluation: OpenAI evals or custom automated validation
 
-## Next steps
+## Production acceptance
 
-1. Calibrate semantic impact thresholds against labeled enterprise examples.
-2. Expand browser coverage beyond the operations/import critical path.
-3. Add Zephyr Cloud after validating a tenant-specific public API contract.
-4. Add alert routing, rate limits, load tests, and disaster-recovery exercises.
-5. Validate OIDC, Xray, and TestRail against the target enterprise tenants before production rollout.
+The codebase includes sanitized dependency acceptance probes, a bounded load gate, and a guarded PostgreSQL
+backup/restore drill. Run these against the target deployment and a disposable recovery database before release.
+Real OIDC, Xray/TestRail/Zephyr, Pinecone, Jira, LLM, and runner credentials are intentionally not stored here;
+tenant owners must supply them for live acceptance.

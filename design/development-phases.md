@@ -39,7 +39,8 @@
 - Implemented: project-scoped embedding similarity search and the 80% duplicate threshold.
 - Prototype: Heuristic deprecation/update recommendations and risk/coverage scores.
 - Implemented: Impact analysis results are surfaced in the requirement detail UI.
-- Pending production work: calibrate semantic thresholds and deprecation classification against labeled data.
+- Implemented: project-scoped labeled threshold calibration with reproducible metrics, explicit application, and
+  retained aggregate evidence. Deprecation decisions remain human-approved.
 
 ## Phase 5: Integration, scale, and compliance
 - Implemented: Project-scoped Jira Cloud JQL ingestion with paginated issue upserts and vector-index outbox events.
@@ -50,5 +51,10 @@
 - Implemented: bounded file ingestion, project-scoped semantic search, component tests, and a browser critical path.
 - Implemented: project-scoped automated execution of approved immutable test-case versions through a retryable,
   credential-driven runner contract, with durable run history and UI controls.
-- Pending production work: alert routing, rate limiting, tenant-specific compliance controls, semantic calibration,
-  expanded browser coverage, load testing, and recovery exercises.
+- Implemented: deduplicated PostgreSQL alerts for failed execution and exhausted delivery, retry-safe webhook
+  routing, operations visibility, and audited acknowledgement.
+- Implemented: atomic PostgreSQL-backed limits shared across API replicas for authenticated and authentication
+  traffic, with hashed bucket subjects and standard retry guidance.
+- Implemented: tenant-specific compliance controls/exports, semantic calibration, expanded browser coverage,
+  bounded load testing, and guarded backup/restore recovery exercises.
+- Deployment gate: validate configured providers against each target enterprise tenant.

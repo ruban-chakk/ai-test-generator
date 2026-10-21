@@ -1,15 +1,23 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  acknowledgeAlert,
+  AlertSummary,
   cleanupRequirementText,
   CleanupResult,
+  ComplianceEvidenceExport,
+  ComplianceProfile,
+  createSemanticCalibration,
   createGovernancePolicy,
   DependencyHealthSummary,
   EvaluationRunSummary,
   getGovernancePolicies,
+  getAlerts,
+  getComplianceProfile,
   getDependencyHealth,
   getMonitoringSummary,
   getOutboxEvents,
+  getSemanticCalibrations,
   GovernancePolicySummary,
   importJiraRequirements,
   importRequirementFile,
@@ -17,10 +25,14 @@ import {
   MonitoringSummary,
   OutboxEventSummary,
   RepositorySyncRunSummary,
+  SemanticCalibrationSample,
+  SemanticCalibrationSummary,
   ProjectSummary,
   runEvaluationSuite,
   retryOutboxEvent,
   syncTestRepository,
+  updateComplianceProfile,
+  exportComplianceEvidence,
 } from '../api';
 
 type OperationsPageProps = {
@@ -45,20 +57,50 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
   const [policies, setPolicies] = useState<GovernancePolicySummary[]>([]);
   const [dependencies, setDependencies] = useState<DependencyHealthSummary | null>(null);
   const [outboxEvents, setOutboxEvents] = useState<OutboxEventSummary[]>([]);
+  const [alerts, setAlerts] = useState<AlertSummary[]>([]);
+  const [compliance, setCompliance] = useState<ComplianceProfile | null>(null);
+  const [complianceExport, setComplianceExport] = useState<ComplianceEvidenceExport | null>(null);
+  const [calibrations, setCalibrations] = useState<SemanticCalibrationSummary[]>([]);
+  const [frameworks, setFrameworks] = useState('SOC2, ISO27001');
+  const [retentionDays, setRetentionDays] = useState(365);
+  const [approvalNotesRequired, setApprovalNotesRequired] = useState(false);
+  const [calibrationData, setCalibrationData] = useState(JSON.stringify([
+    { similarity: 0.96, expected_action: 'duplicate' },
+    { similarity: 0.91, expected_action: 'duplicate' },
+    { similarity: 0.86, expected_action: 'duplicate' },
+    { similarity: 0.74, expected_action: 'update' },
+    { similarity: 0.68, expected_action: 'update' },
+    { similarity: 0.57, expected_action: 'update' },
+    { similarity: 0.41, expected_action: 'unrelated' },
+    { similarity: 0.30, expected_action: 'unrelated' },
+    { similarity: 0.20, expected_action: 'unrelated' },
+    { similarity: 0.10, expected_action: 'unrelated' },
+  ], null, 2));
 
   const refreshOperations = async () => {
     try {
       setError(null);
-      const [monitoringData, policyData, dependencyData, outboxData] = await Promise.all([
+      const [monitoringData, policyData, dependencyData, outboxData, alertData, complianceData, calibrationRuns] = await Promise.all([
         getMonitoringSummary(),
         getGovernancePolicies(),
         getDependencyHealth(),
         getOutboxEvents(),
+        getAlerts(selectedProject?.id),
+        selectedProject ? getComplianceProfile(selectedProject.id) : Promise.resolve(null),
+        selectedProject ? getSemanticCalibrations(selectedProject.id) : Promise.resolve([]),
       ]);
       setMonitoring(monitoringData);
       setPolicies(policyData);
       setDependencies(dependencyData);
       setOutboxEvents(outboxData);
+      setAlerts(alertData);
+      setCompliance(complianceData);
+      setCalibrations(calibrationRuns);
+      if (complianceData) {
+        setFrameworks(complianceData.frameworks.join(', '));
+        setRetentionDays(complianceData.evidence_retention_days);
+        setApprovalNotesRequired(complianceData.approval_notes_required);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load operations data');
     }
@@ -66,7 +108,7 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
 
   useEffect(() => {
     refreshOperations();
-  }, []);
+  }, [selectedProject?.id]);
 
   const runAction = async (name: string, action: () => Promise<void>) => {
     try {
@@ -110,6 +152,12 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
     });
   };
 
+  const handleAcknowledgeAlert = (alertId: string) => {
+    runAction(`ack-${alertId}`, async () => {
+      await acknowledgeAlert(alertId);
+    });
+  };
+
   const handleSync = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selectedProject) {
@@ -147,6 +195,36 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
           approved_cases_locked: true,
         },
       });
+    });
+  };
+
+  const handleCompliance = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProject) return;
+    runAction('compliance', async () => {
+      setCompliance(await updateComplianceProfile(selectedProject.id, {
+        frameworks: frameworks.split(',').map((item) => item.trim()).filter(Boolean),
+        evidence_retention_days: retentionDays,
+        evidence_export_enabled: true,
+        pseudonymize_actors: true,
+        approval_notes_required: approvalNotesRequired,
+      }));
+    });
+  };
+
+  const handleEvidenceExport = () => {
+    if (!selectedProject) return;
+    runAction('evidence', async () => {
+      setComplianceExport(await exportComplianceEvidence(selectedProject.id));
+    });
+  };
+
+  const handleCalibration = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProject) return;
+    runAction('calibration', async () => {
+      const parsed = JSON.parse(calibrationData) as SemanticCalibrationSample[];
+      await createSemanticCalibration(selectedProject.id, parsed, true);
     });
   };
 
@@ -330,6 +408,88 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
                 </p>
               </div>
             ))}
+          </div>
+        </article>
+
+        <article className="detail-card">
+          <h2>Project compliance</h2>
+          <p className="case-meta">Controls and export evidence for {selectedProject?.name ?? 'a selected project'}.</p>
+          <form onSubmit={handleCompliance}>
+            <label>
+              Frameworks
+              <input value={frameworks} onChange={(event) => setFrameworks(event.target.value)} />
+            </label>
+            <label>
+              Evidence retention days
+              <input type="number" min="30" max="3650" value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))} />
+            </label>
+            <label>
+              <input type="checkbox" checked={approvalNotesRequired} onChange={(event) => setApprovalNotesRequired(event.target.checked)} />
+              Require approval notes
+            </label>
+            <div className="detail-actions">
+              <button className="primary-button" type="submit" disabled={!selectedProject || busy === 'compliance'}>
+                {busy === 'compliance' ? 'Saving...' : 'Save compliance profile'}
+              </button>
+              <button className="secondary-button" type="button" onClick={handleEvidenceExport} disabled={!selectedProject || busy === 'evidence'}>
+                {busy === 'evidence' ? 'Exporting...' : 'Generate evidence export'}
+              </button>
+            </div>
+          </form>
+          {compliance ? <p className="case-meta">Active retention: {compliance.evidence_retention_days} days</p> : null}
+          {complianceExport ? (
+            <p className="case-meta" role="status">
+              Evidence SHA-256: {complianceExport.sha256}
+              {complianceExport.is_complete
+                ? ' (complete)'
+                : ` (truncated: ${complianceExport.truncated_sections.join(', ')})`}
+            </p>
+          ) : null}
+        </article>
+
+        <article className="detail-card">
+          <h2>Semantic calibration</h2>
+          <p className="case-meta">Apply thresholds from labeled similarity outcomes. Include all three actions and at least 10 samples.</p>
+          <form onSubmit={handleCalibration}>
+            <label>
+              Labeled samples (JSON)
+              <textarea value={calibrationData} onChange={(event) => setCalibrationData(event.target.value)} rows={12} required />
+            </label>
+            <button className="primary-button" type="submit" disabled={!selectedProject || busy === 'calibration'}>
+              {busy === 'calibration' ? 'Calibrating...' : 'Calibrate and apply'}
+            </button>
+          </form>
+          {calibrations[0] ? (
+            <p className="case-meta">Latest: {calibrations[0].status} · macro F1 {calibrations[0].metrics.macro_f1}</p>
+          ) : <p className="case-meta">No calibration evidence yet.</p>}
+        </article>
+
+        <article className="detail-card ops-span-full">
+          <h2>Operational alerts</h2>
+          <p className="case-meta">Execution failures and exhausted deliveries that need human attention.</p>
+          <div className="history-list">
+            {alerts.length ? alerts.map((alert) => (
+              <div className="history-card" key={alert.id}>
+                <div className="history-card-header">
+                  <strong>{alert.title}</strong>
+                  <span className={`status-pill status-${alert.severity}`}>{alert.severity}</span>
+                </div>
+                <p className="case-meta">
+                  {alert.category.replace(/_/g, ' ')} · delivery {alert.delivery_status.replace(/_/g, ' ')}
+                </p>
+                <pre>{JSON.stringify(alert.details, null, 2)}</pre>
+                {alert.status === 'open' ? (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => handleAcknowledgeAlert(alert.id)}
+                    disabled={busy === `ack-${alert.id}`}
+                  >
+                    {busy === `ack-${alert.id}` ? 'Acknowledging...' : 'Acknowledge'}
+                  </button>
+                ) : <span className="status-pill status-completed">Acknowledged</span>}
+              </div>
+            )) : <p>No operational alerts found.</p>}
           </div>
         </article>
 

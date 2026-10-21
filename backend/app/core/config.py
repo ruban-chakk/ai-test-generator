@@ -54,9 +54,17 @@ class Settings(BaseSettings):
     testrail_project_id: int | None = None
     testrail_section_id: int | None = None
     testrail_suite_id: int | None = None
+    zephyr_base_url: str = "https://api.zephyrscale.smartbear.com/v2"
+    zephyr_api_token: str = Field(default="", repr=False)
     execution_runner_base_url: str = ""
     execution_runner_token: str = Field(default="", repr=False)
     execution_runner_timeout_seconds: float = 120.0
+    alert_webhook_url: str = ""
+    alert_webhook_token: str = Field(default="", repr=False)
+    alert_webhook_timeout_seconds: float = 10.0
+    rate_limit_enabled: bool = True
+    api_rate_limit_per_minute: int = 120
+    auth_rate_limit_per_minute: int = 10
     upload_max_bytes: int = 2_000_000
     upload_max_requirements: int = 100
     health_probe_timeout_seconds: float = 5.0

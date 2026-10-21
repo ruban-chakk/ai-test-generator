@@ -75,7 +75,7 @@ The pipeline supports feedback-informed revision by including user feedback and 
 The initial enterprise design includes:
 - Jira Cloud JQL ingestion through the REST API
 - Test case repository persistence for approved cases
-- Xray Cloud and TestRail adapters publish immutable approved versions; Zephyr remains a future integration
+- Xray Cloud, TestRail, and Zephyr Cloud adapters publish immutable approved versions using stable delivery references
 
 ## Data flow
 

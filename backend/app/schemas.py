@@ -158,7 +158,32 @@ class ImpactAnalysisSummary(APIModel):
     coverage_score: int
     summary: dict
     created_by: str
+
+
+class SemanticCalibrationSample(APIModel):
+    similarity: float = Field(ge=0, le=1)
+    expected_action: str
+
+
+class SemanticCalibrationRequest(APIModel):
+    project_id: uuid.UUID
+    samples: List[SemanticCalibrationSample] = Field(min_length=10, max_length=5000)
+    apply: bool = False
+
+
+class SemanticCalibrationSummary(APIModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    dataset_digest: str
+    sample_count: int
+    label_distribution: dict
+    previous_thresholds: dict
+    proposed_thresholds: dict
+    metrics: dict
+    status: str
+    requested_by: str
     created_at: datetime
+    applied_at: Optional[datetime] = None
 
 
 
@@ -221,6 +246,21 @@ class TestExecutionRunSummary(APIModel):
     requested_by: str
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class AlertSummary(APIModel):
+    id: uuid.UUID
+    project_id: Optional[uuid.UUID] = None
+    category: str
+    severity: str
+    title: str
+    details: dict
+    status: str
+    delivery_status: str
+    acknowledged_by: Optional[str] = None
+    acknowledged_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
     created_at: datetime
 
 
@@ -297,6 +337,32 @@ class GovernancePolicySummary(GovernancePolicyCreate):
     id: uuid.UUID
     created_at: datetime
     updated_at: datetime
+
+
+class ComplianceProfileUpdate(APIModel):
+    frameworks: List[str] = Field(default_factory=list, max_length=10)
+    evidence_retention_days: int = Field(default=365, ge=30, le=3650)
+    evidence_export_enabled: bool = True
+    pseudonymize_actors: bool = True
+    approval_notes_required: bool = False
+
+
+class ComplianceProfileSummary(ComplianceProfileUpdate):
+    project_id: uuid.UUID
+    updated_at: Optional[datetime] = None
+
+
+class ComplianceEvidenceExport(APIModel):
+    project_id: uuid.UUID
+    generated_at: datetime
+    period_start: datetime
+    period_end: datetime
+    profile: ComplianceProfileSummary
+    evidence: dict
+    record_counts: dict
+    is_complete: bool
+    truncated_sections: List[str] = Field(default_factory=list)
+    sha256: str
 
 
 
