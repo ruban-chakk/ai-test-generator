@@ -74,6 +74,15 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - FR20: The system shall store embeddings for requirements, approved test cases, and feedback in Pinecone.
 - FR21: The system shall retrieve relevant historical requirements and approved test cases for generation context.
 - FR22: The system shall support similarity search for duplicate detection and impact analysis.
+- FR23: The web application shall provide project-scoped keyword, semantic, and hybrid search over requirements,
+  approved test cases, and feedback. Hybrid ranking shall preserve evidence from both retrieval methods.
+- FR24: The system shall bulk-import historical test cases, scenarios, and steps with stable external identities,
+  atomic audit evidence, conflict detection, and asynchronous vector indexing.
+- FR25: The system shall reconcile missing vector-index events from canonical PostgreSQL records and index each
+  approved test-case version from its immutable snapshot.
+- FR26: The system shall support reusable project-scoped import mapping profiles for company-specific JSON and CSV
+  requirement and historical test-case formats, with preview, allow-listed transforms, custom fields, audit evidence,
+  and transactional vector-index intents.
 
 ## Non-functional requirements
 

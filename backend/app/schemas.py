@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -37,6 +37,8 @@ class TestCaseStep(APIModel):
 
 class TestCaseSummary(APIModel):
     id: uuid.UUID
+    external_id: Optional[str] = None
+    source: str = "generated"
     title: str
     description: str
     prerequisite: Optional[str] = None
@@ -51,6 +53,40 @@ class TestCaseSummary(APIModel):
     repository_status: str = "draft"
     repository_synced_at: Optional[datetime] = None
     steps: Optional[List[TestCaseStep]] = None
+    custom_fields_json: dict = Field(default_factory=dict)
+
+
+class ImportMappingProfileCreate(APIModel):
+    project_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=255)
+    entity_type: Literal["requirement", "test_case"]
+    configuration: dict[str, Any]
+    active: bool = True
+
+
+class ImportMappingProfileUpdate(APIModel):
+    name: str = Field(min_length=1, max_length=255)
+    configuration: dict[str, Any]
+    active: bool = True
+
+
+class ImportMappingProfileSummary(ImportMappingProfileCreate):
+    id: uuid.UUID
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class MappedImportPreview(APIModel):
+    entity_type: Literal["requirement", "test_case"]
+    source_record_count: int
+    mapped_record_count: int
+    valid_record_count: int
+    skipped_record_count: int
+    warning_count: int = 0
+    error_count: int = 0
+    issues: List[dict] = Field(default_factory=list)
+    samples: List[dict] = Field(default_factory=list)
 
 
 
@@ -128,6 +164,10 @@ class SemanticSearchResult(APIModel):
     text: str
     score: float
     metadata: dict
+    search_mode: Literal["semantic", "keyword", "hybrid"] = "semantic"
+    semantic_score: Optional[float] = None
+    keyword_score: Optional[float] = None
+    matched_fields: List[str] = Field(default_factory=list)
 
 
 class ImpactCandidate(APIModel):
@@ -302,6 +342,7 @@ class DependencyStatusSummary(APIModel):
     name: str
     status: str
     configured: bool
+    detail: Optional[str] = None
 
 
 class DependencyHealthSummary(APIModel):
@@ -395,6 +436,8 @@ class TestCaseVersionSummary(APIModel):
     requirement_id: uuid.UUID
     scenario_id: uuid.UUID
     version: int
+    external_id: Optional[str] = None
+    source: str = "generated"
     title: str
     description: str
     prerequisite: Optional[str] = None
@@ -407,6 +450,8 @@ class TestCaseVersionSummary(APIModel):
     approved_at: datetime
     notes: Optional[str] = None
     steps_snapshot: List[dict]
+    vector_id: Optional[str] = None
+    custom_fields_json: dict = Field(default_factory=dict)
 
 
 
@@ -425,6 +470,7 @@ class ValidationResult(APIModel):
 
 class TestScenarioSummary(APIModel):
     id: uuid.UUID
+    external_id: Optional[str] = None
     title: str
     description: str
     priority: Optional[str] = None
@@ -506,7 +552,23 @@ class RequirementCreate(RequirementBase):
 class RequirementDetail(RequirementBase):
     id: uuid.UUID
     status: str = "draft"
+    version: int = 1
     metadata_json: Optional[dict] = None
     scenarios: Optional[List[TestScenarioSummary]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class RequirementVersionSummary(APIModel):
+    id: uuid.UUID
+    requirement_id: uuid.UUID
+    project_id: Optional[uuid.UUID] = None
+    version: int
+    external_id: Optional[str] = None
+    title: str
+    description: str
+    source: str
+    status: str
+    metadata_json: Optional[dict] = None
+    vector_id: Optional[str] = None
+    created_at: datetime

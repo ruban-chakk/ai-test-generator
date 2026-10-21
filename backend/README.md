@@ -26,6 +26,10 @@ Copy `.env.example` to `.env` and configure the database and Pinecone values.
 Generation requires an OpenAI-compatible chat/embedding endpoint and a Pinecone index host. Configure
 `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `EMBEDDING_MODEL`, `PINECONE_API_KEY`, and `PINECONE_HOST`.
 `PINECONE_HOST` must be the data-plane host for an existing index; Compose does not emulate Pinecone locally.
+The index must be a bring-your-own-vectors dense index without integrated embedding or a document schema. Its
+dimension must equal `EMBEDDING_DIMENSION` (`1536` for the default `text-embedding-3-small` model), and its metric
+should be cosine. The dependency probe validates the index type, dimension, host, readiness, and data plane before
+live workflow acceptance starts.
 The generation endpoint returns `503` when providers are not configured and `502` when a configured provider
 fails; it never substitutes hard-coded generated content.
 
@@ -45,8 +49,49 @@ JWKS settings. Configure `OIDC_ALLOWED_EMAIL_DOMAINS` before enabling optional a
 users receive the reviewer role; identity-provider claims cannot grant application roles or project membership.
 
 File ingestion accepts only bounded UTF-8 `.txt`, `.md`, `.csv`, and `.json` documents. Configure
-`UPLOAD_MAX_BYTES` and `UPLOAD_MAX_REQUIREMENTS`. The importer validates structure, rejects binary content,
+`UPLOAD_MAX_BYTES`, `UPLOAD_MAX_REQUIREMENTS`, and `UPLOAD_MAX_TEST_CASES`. The importer validates structure, rejects binary content,
 stores only normalized requirements and a content hash, and never persists the raw uploaded document.
+
+Historical test cases can be imported from the Operations page or `POST /api/v1/test-cases/import-file`. Import
+their referenced requirements first; each case identifies one by `requirement_external_id`. JSON accepts an array
+or an object with a `test_cases` array. CSV uses the same fields, with `steps` encoded as a JSON array. A minimal
+JSON record is:
+
+```json
+{
+  "external_id": "TC-101",
+  "requirement_external_id": "REQ-10",
+  "scenario_external_id": "SC-10",
+  "scenario_title": "Password reset links",
+  "scenario_description": "Validate secure password reset link handling.",
+  "title": "Reject an expired reset link",
+  "description": "An expired link must not change credentials.",
+  "priority": "high",
+  "severity": "major",
+  "status": "approved",
+  "version": 3,
+  "approved_at": "2025-01-02T03:04:05Z",
+  "approved_by": "legacy-reviewer",
+  "steps": [
+    {
+      "step_number": 1,
+      "action": "Open an expired password reset link.",
+      "expected_result": "The application rejects the expired link."
+    }
+  ]
+}
+```
+
+External IDs are unique within a requirement. Reimporting identical content is a no-op for canonical records;
+reusing an identity with different content returns a conflict instead of silently overwriting an approved case.
+The import transaction stores the case, steps, immutable version, approval evidence, audit record, and vector
+outbox event atomically. Provider calls remain asynchronous.
+
+The project Search page supports `hybrid`, `semantic`, and `keyword` modes through `GET /api/v1/search`.
+Semantic mode uses project-filtered Pinecone retrieval. Keyword mode uses PostgreSQL full-text search over
+requirements, approved test cases, and feedback. Hybrid mode combines both ranked lists with reciprocal-rank
+fusion and returns the semantic score, keyword score, and matched fields as ranking evidence. Apply the latest
+Alembic migration to install the supporting GIN indexes.
 
 Approved test cases and submitted feedback are indexed through a transactional outbox. Run one batch locally:
 
@@ -60,8 +105,25 @@ Or run the continuous worker with Compose after configuring the LLM and Pinecone
 docker compose --profile workers up -d indexer
 ```
 
-Outbox rows contain only stable entity identifiers; the worker loads current canonical content from PostgreSQL.
-Pinecone upserts use stable vector IDs, so recovery after a worker crash or duplicate delivery is idempotent.
+Outbox rows contain only stable entity identifiers. Requirement and feedback events load current canonical content;
+requirement and approved-case events load immutable version snapshots. Pinecone upserts use stable versioned vector
+IDs, so older requirement and approved test-case versions remain searchable and recovery after a worker crash or
+duplicate delivery is idempotent. Jira content changes increment the requirement version; unchanged issues are not
+re-indexed.
+
+To queue vectors for existing PostgreSQL records that never received an indexing event, run the idempotent
+reconciliation command. By default it selects requirements and feedback without vector IDs plus approved test cases
+that are not marked indexed. `--all` deliberately requeues every vectorizable record and is useful after rebuilding
+or replacing a Pinecone index:
+
+```bash
+python scripts/backfill_vectors.py --project-id '<project-uuid>'
+python scripts/backfill_vectors.py --project-id '<project-uuid>' --all
+python scripts/process_outbox.py --once
+```
+
+The command only commits canonical vector identifiers, audit evidence, and outbox intents. Provider calls remain in
+the worker, so a database transaction is never coupled to a Pinecone request.
 
 ## External integrations
 
@@ -205,3 +267,30 @@ With tenant credentials present in the normal environment, run the sanitized pro
 ```bash
 python scripts/acceptance_probe.py --require llm,pinecone,jira,xray,testrail,zephyr,oidc,execution_runner
 ```
+
+To certify the complete API and worker path, use a dedicated acceptance project or disposable environment. The
+command creates synthetic artifacts and intentionally retains them as audit evidence. Supply the password through
+an environment variable so it is not exposed in command history:
+
+```bash
+LIVE_ACCEPTANCE_BASE_URL='https://testgen.example.com' \
+LIVE_ACCEPTANCE_USERNAME='acceptance-admin' \
+LIVE_ACCEPTANCE_PASSWORD='...' \
+python scripts/live_workflow_acceptance.py \
+  --project-id '<dedicated-project-uuid>' \
+  --allow-retained-artifacts
+```
+
+The command verifies requirement creation and indexing, live LLM generation, requirement/scenario/test-case
+approval, approved-case indexing, and impact analysis. It fails if the outbox worker does not complete either
+indexing event within the configured wait period and never includes credentials or provider response bodies in
+its report.
+
+# Company-specific import mappings
+
+The Operations page can save project-scoped mapping profiles for JSON or CSV requirements and historical test cases.
+Use **Preview mapping** before import. Canonical fields are validated, selected custom fields are retained in PostgreSQL,
+and their text is included in the immutable embedding artifact sent through the transactional outbox.
+
+Mapped imports default to a 10 MB source limit and 20,000 mapped records. Configure these with
+`MAPPED_UPLOAD_MAX_BYTES` and `MAPPED_IMPORT_MAX_RECORDS`.

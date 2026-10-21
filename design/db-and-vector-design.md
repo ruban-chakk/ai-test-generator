@@ -9,6 +9,7 @@
 - `description` text NOT NULL
 - `source` varchar NOT NULL
 - `status` varchar NOT NULL
+- `version` integer NOT NULL DEFAULT 1
 - `metadata` jsonb
 - `vector_id` varchar NULL
 - `created_at` timestamptz NOT NULL DEFAULT now()
@@ -19,9 +20,23 @@ Indexes:
 - `idx_requirements_external_id` on `external_id`
 - `idx_requirements_title_trgm` on `title` using gin(trgm)
 
+### requirement_versions
+- `id` uuid PRIMARY KEY
+- `requirement_id` uuid REFERENCES requirements(id) ON DELETE CASCADE
+- `project_id` uuid REFERENCES projects(id) ON DELETE SET NULL
+- `version` integer NOT NULL
+- immutable external ID, title, description, source, status, and metadata snapshot
+- `vector_id` varchar NULL
+
+Indexes:
+- unique (`requirement_id`, `version`)
+- unique non-null `vector_id`
+- `project_id`
+
 ### test_scenarios
 - `id` uuid PRIMARY KEY
 - `requirement_id` uuid REFERENCES requirements(id) ON DELETE CASCADE
+- `external_id` varchar NULL
 - `title` text NOT NULL
 - `description` text NOT NULL
 - `priority` varchar
@@ -42,6 +57,8 @@ Indexes:
 - `id` uuid PRIMARY KEY
 - `scenario_id` uuid REFERENCES test_scenarios(id) ON DELETE CASCADE
 - `requirement_id` uuid REFERENCES requirements(id) ON DELETE CASCADE
+- `external_id` varchar NULL
+- `source` varchar NOT NULL DEFAULT `generated`
 - `title` text NOT NULL
 - `description` text NOT NULL
 - `prerequisite` text
@@ -153,7 +170,8 @@ Indexes:
 - `text_snippet`: text
 
 ### Vector storage strategy
-- Store one embedding per entity.
+- Store one versioned embedding per immutable requirement and approved test-case snapshot, plus one embedding per
+  feedback entity.
 - For requirements, store the full requirement description.
 - For scenarios, store the scenario title + description.
 - For test cases, store title, description, prerequisite, and step summaries.
@@ -174,7 +192,8 @@ Indexes:
   - filter on `target_id` and `target_level`
 
 ### Index maintenance
-- Update or upsert embeddings when an entity is approved or revised.
+- Create or upsert a stable version vector when a test case is approved or imported; never overwrite an older
+  approved-version vector.
 - Delete or mark deprecated embeddings when a case is retired.
 - Rebuild index periodically if metadata schema changes significantly.
 
@@ -183,6 +202,8 @@ Indexes:
 - Keep `vector_id` in PostgreSQL to map entities to Pinecone vectors.
 - Commit canonical state and an outbox intent in one PostgreSQL transaction; never attempt a database/Pinecone dual write.
 - Workers upsert stable vector IDs, recover stale claims, retry transient failures, and retain sanitized failure types.
+- The vector reconciliation command recreates missing or failed outbox intents without making provider calls in the
+  database transaction.
 
 ## Example table DDL
 

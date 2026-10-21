@@ -127,7 +127,7 @@ test('approver can queue an approved test case for automated execution', async (
   await expect(page.getByText('queued')).toBeVisible();
 });
 
-test('reviewer can run project-scoped semantic search and open a linked requirement', async ({ page }) => {
+test('reviewer can run project-scoped hybrid search and open a linked requirement', async ({ page }) => {
   await page.route('**/api/v1/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -143,9 +143,11 @@ test('reviewer can run project-scoped semantic search and open a linked requirem
       expect(url.searchParams.get('project_id')).toBe('project-1');
       expect(url.searchParams.get('query')).toBe('expired reset token');
       expect(url.searchParams.get('entity_type')).toBe('test_case');
+      expect(url.searchParams.get('mode')).toBe('hybrid');
       body = [{
         vector_id: 'test_case:case-1:v2', entity_type: 'test_case', entity_id: 'case-1',
         title: 'Reject expired reset token', text: 'Expired reset links are rejected.', score: 0.92,
+        search_mode: 'hybrid', semantic_score: 0.88, keyword_score: 0.76, matched_fields: ['title'],
         metadata: { requirement_id: 'requirement-1' },
       }];
     } else if (path.endsWith('/requirements/requirement-1')) {
@@ -164,7 +166,9 @@ test('reviewer can run project-scoped semantic search and open a linked requirem
   await page.getByLabel('Artifact type').selectOption('test_case');
   await page.getByRole('button', { name: 'Search' }).click();
   await expect(page.getByRole('heading', { name: 'Reject expired reset token' })).toBeVisible();
-  await expect(page.getByText('92%')).toBeVisible();
+  await expect(page.getByText('Hybrid rank 92%')).toBeVisible();
+  await expect(page.getByText('Semantic 88%')).toBeVisible();
+  await expect(page.getByText('Keyword 76%')).toBeVisible();
   await page.getByRole('link', { name: 'Open requirement' }).click();
   await expect(page.getByRole('heading', { name: 'Secure password reset' })).toBeVisible();
 });

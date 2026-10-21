@@ -2,7 +2,9 @@ import uuid
 import re
 import hashlib
 import json
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -22,6 +24,7 @@ from app.models import (
     GovernancePolicy,
     ImpactAnalysis,
     IntegrationRun,
+    ImportMappingProfile,
     OperationalMetric,
     OutboxEvent,
     Project,
@@ -37,6 +40,7 @@ from app.models import (
     TestExecutionRun,
     TestScenario,
     User,
+    RequirementVersion,
 )
 from app.schemas import (
     AlertSummary,
@@ -59,6 +63,10 @@ from app.schemas import (
     ImpactAnalysisSummary,
     ImpactCandidate,
     IntegrationRunSummary,
+    ImportMappingProfileCreate,
+    ImportMappingProfileUpdate,
+    ImportMappingProfileSummary,
+    MappedImportPreview,
     JiraImportRequest,
     MonitoringSummary,
     DependencyHealthSummary,
@@ -76,6 +84,7 @@ from app.schemas import (
     SemanticCalibrationSummary,
     RequirementCreate,
     RequirementDetail,
+    RequirementVersionSummary,
     RevisionRecordSummary,
     TestCaseCreate,
     TestCaseStep,
@@ -96,8 +105,8 @@ from app.services.generation import (
 )
 from app.services.outbox import (
     FEEDBACK_INDEX_REQUESTED,
-    REQUIREMENT_INDEX_REQUESTED,
-    TEST_CASE_INDEX_REQUESTED,
+    REQUIREMENT_VERSION_INDEX_REQUESTED,
+    TEST_CASE_VERSION_INDEX_REQUESTED,
     TEST_CASE_REPOSITORY_SYNC_REQUESTED,
     TEST_CASE_EXECUTION_REQUESTED,
     enqueue_outbox_event,
@@ -110,9 +119,23 @@ from app.services.integrations import (
     JiraCloudClient,
 )
 from app.services.file_ingestion import FileIngestionError, parse_requirement_file
+from app.services.historical_ingestion import (
+    HistoricalIngestionError,
+    parse_historical_test_case_file,
+)
+from app.services.historical_import import (
+    HistoricalImportConflictError,
+    import_historical_test_cases,
+)
+from app.services.mapped_ingestion import (
+    MappedIngestionError,
+    map_import_file,
+    validate_mapping_configuration,
+)
 from app.services.health import probe_external_dependencies
-from app.services.search import build_semantic_search_service
+from app.services.search import KeywordSearchService, build_semantic_search_service, fuse_search_matches
 from app.services.calibration import CalibrationSample, calibrate_thresholds
+from app.services.versioning import snapshot_requirement
 
 api_router = APIRouter()
 
@@ -615,12 +638,14 @@ async def _create_test_case_version(
     test_case: TestCase,
     approved_by: str,
     notes: str | None,
-) -> None:
+) -> TestCaseVersion:
     version = TestCaseVersion(
         test_case_id=test_case.id,
         requirement_id=test_case.requirement_id,
         scenario_id=test_case.scenario_id,
         version=test_case.version,
+        external_id=test_case.external_id,
+        source=test_case.source,
         title=test_case.title,
         description=test_case.description,
         prerequisite=test_case.prerequisite,
@@ -633,8 +658,28 @@ async def _create_test_case_version(
         approved_at=test_case.approved_at or datetime.utcnow(),
         notes=notes,
         steps_snapshot=_step_snapshot(test_case),
+        vector_id=f"test_case:{test_case.id}:v{test_case.version}",
     )
     db.add(version)
+    await db.flush()
+    return version
+
+
+async def _snapshot_requirement_and_enqueue(
+    db: AsyncSession,
+    requirement: Requirement,
+) -> RequirementVersion:
+    version = await snapshot_requirement(db, requirement)
+    if requirement.project_id is not None:
+        enqueue_index_event(
+            db,
+            event_key=f"requirement_version.index:{version.id}",
+            event_type=REQUIREMENT_VERSION_INDEX_REQUESTED,
+            aggregate_type="requirement_version",
+            aggregate_id=version.id,
+            payload={"requirement_id": str(requirement.id), "version": requirement.version},
+        )
+    return version
 
 
 @api_router.get(
@@ -899,13 +944,7 @@ async def create_requirement(
     )
     db.add(requirement)
     await db.flush()
-    enqueue_index_event(
-        db,
-        event_key=f"requirement.index:{requirement.id}:created",
-        event_type=REQUIREMENT_INDEX_REQUESTED,
-        aggregate_type="requirement",
-        aggregate_id=requirement.id,
-    )
+    await _snapshot_requirement_and_enqueue(db, requirement)
     await db.commit()
     stmt = (
         select(Requirement)
@@ -950,6 +989,28 @@ async def get_requirement(
     if not requirement:
         raise HTTPException(status_code=404, detail="Requirement not found")
     return requirement
+
+
+@api_router.get(
+    "/requirements/{requirement_id}/versions",
+    response_model=list[RequirementVersionSummary],
+    tags=["Requirements"],
+)
+async def get_requirement_versions(
+    requirement_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> list[RequirementVersionSummary]:
+    try:
+        requirement_uuid = uuid.UUID(requirement_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+    await _require_requirement_access(db, requirement_uuid)
+    result = await db.execute(
+        select(RequirementVersion)
+        .where(RequirementVersion.requirement_id == requirement_uuid)
+        .order_by(RequirementVersion.version.desc())
+    )
+    return result.scalars().all()
 
 
 async def _create_approval_record(
@@ -1271,9 +1332,9 @@ async def approve_test_case(
     test_case.locked = True
     test_case.repository_status = "pending_index"
     test_case.repository_synced_at = None
-    test_case.vector_id = test_case.vector_id or f"test_case:{test_case.id}:v{test_case.version}"
+    test_case.vector_id = f"test_case:{test_case.id}:v{test_case.version}"
     actor = _actor(payload)
-    await _create_test_case_version(db, test_case, actor, payload.notes)
+    version = await _create_test_case_version(db, test_case, actor, payload.notes)
     await _create_approval_record(
         db,
         "test_case",
@@ -1285,10 +1346,11 @@ async def approve_test_case(
     )
     enqueue_index_event(
         db,
-        event_key=f"test_case.index:{test_case.id}:v{test_case.version}",
-        event_type=TEST_CASE_INDEX_REQUESTED,
-        aggregate_type="test_case",
-        aggregate_id=test_case.id,
+        event_key=f"test_case_version.index:{version.id}",
+        event_type=TEST_CASE_VERSION_INDEX_REQUESTED,
+        aggregate_type="test_case_version",
+        aggregate_id=version.id,
+        payload={"test_case_id": str(test_case.id), "version": test_case.version},
     )
     await db.commit()
     await db.refresh(test_case)
@@ -1494,6 +1556,7 @@ async def process_feedback_revision(
                 feedback_text=feedback.comment,
                 target_context=str(target_context),
                 action=action,
+                requirement_version=requirement.version,
             )
         except GenerationConfigurationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1764,22 +1827,40 @@ async def semantic_search(
     query: str = Query(..., min_length=2, max_length=500),
     entity_type: str | None = Query(None),
     limit: int = Query(20, ge=1, le=50),
+    mode: Literal["semantic", "keyword", "hybrid"] = Query("semantic"),
     db: AsyncSession = Depends(get_db),
 ) -> list[SemanticSearchResult]:
     await _ensure_project(db, project_id)
     if entity_type and entity_type not in {"requirement", "test_case", "feedback"}:
         raise HTTPException(status_code=422, detail="Unsupported semantic search entity type")
-    try:
-        matches = await build_semantic_search_service().search(
+    candidate_limit = min(limit * 4, 100) if mode == "hybrid" else limit
+    keyword_matches = []
+    if mode in {"keyword", "hybrid"}:
+        keyword_matches = await KeywordSearchService(db).search(
             query.strip(),
             project_id=str(project_id),
             entity_type=entity_type,
-            limit=limit,
+            limit=candidate_limit,
         )
-    except GenerationConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except GenerationProviderError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    semantic_matches = []
+    if mode in {"semantic", "hybrid"}:
+        try:
+            semantic_matches = await build_semantic_search_service().search(
+                query.strip(),
+                project_id=str(project_id),
+                entity_type=entity_type,
+                limit=candidate_limit,
+            )
+        except GenerationConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except GenerationProviderError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if mode == "hybrid":
+        matches = fuse_search_matches(semantic_matches, keyword_matches, limit=limit)
+    elif mode == "keyword":
+        matches = keyword_matches[:limit]
+    else:
+        matches = semantic_matches[:limit]
     return [
         SemanticSearchResult(
             vector_id=match.vector_id,
@@ -1789,6 +1870,10 @@ async def semantic_search(
             text=match.text,
             score=round(match.score, 4),
             metadata=match.metadata,
+            search_mode=mode,
+            semantic_score=round(match.semantic_score, 4) if match.semantic_score is not None else None,
+            keyword_score=round(match.keyword_score, 4) if match.keyword_score is not None else None,
+            matched_fields=list(match.matched_fields),
         )
         for match in matches
     ]
@@ -2183,13 +2268,7 @@ async def import_requirement_file(
             )
             db.add(requirement)
             await db.flush()
-            enqueue_index_event(
-                db,
-                event_key=f"requirement.index:{requirement.id}:file-import",
-                event_type=REQUIREMENT_INDEX_REQUESTED,
-                aggregate_type="requirement",
-                aggregate_id=requirement.id,
-            )
+            await _snapshot_requirement_and_enqueue(db, requirement)
             created_count += 1
         requirement_ids.append(str(requirement.id))
 
@@ -2228,6 +2307,365 @@ async def import_requirement_file(
             },
         )
     )
+    await db.commit()
+    await db.refresh(run)
+    return run
+
+
+@api_router.post(
+    "/test-cases/import-file",
+    response_model=IntegrationRunSummary,
+    tags=["TestCases"],
+)
+async def import_historical_test_case_file(
+    project_id: uuid.UUID = Form(...),
+    uploaded_file: UploadFile = File(..., alias="file"),
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationRunSummary:
+    require_global_role("approver", "admin")
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id, {"approver", "admin"})
+    allowed_content_types = {
+        "text/csv",
+        "application/csv",
+        "application/json",
+        "application/octet-stream",
+    }
+    if uploaded_file.content_type and uploaded_file.content_type.lower() not in allowed_content_types:
+        raise HTTPException(status_code=415, detail="Unsupported historical test-case file content type")
+    content = await uploaded_file.read(settings.upload_max_bytes + 1)
+    filename = uploaded_file.filename
+    await uploaded_file.close()
+    try:
+        parsed = parse_historical_test_case_file(
+            filename,
+            content,
+            max_bytes=settings.upload_max_bytes,
+            max_test_cases=settings.upload_max_test_cases,
+        )
+        result = await import_historical_test_cases(
+            db,
+            project_id=project_id,
+            items=parsed,
+            actor=current_principal().username,
+        )
+    except HistoricalIngestionError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HistoricalImportConflictError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    run = await db.get(IntegrationRun, result.run_id)
+    if run is None:
+        raise HTTPException(status_code=500, detail="Historical import evidence was not persisted")
+    return run
+
+
+@api_router.get(
+    "/import-mappings",
+    response_model=list[ImportMappingProfileSummary],
+    tags=["Integrations"],
+)
+async def list_import_mapping_profiles(
+    project_id: uuid.UUID,
+    entity_type: Literal["requirement", "test_case"] | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> list[ImportMappingProfile]:
+    await _ensure_project(db, project_id)
+    await _require_project_access(db, project_id)
+    query = select(ImportMappingProfile).where(ImportMappingProfile.project_id == project_id)
+    if entity_type:
+        query = query.where(ImportMappingProfile.entity_type == entity_type)
+    result = await db.execute(query.order_by(ImportMappingProfile.entity_type, ImportMappingProfile.name))
+    return list(result.scalars().all())
+
+
+@api_router.post(
+    "/import-mappings",
+    response_model=ImportMappingProfileSummary,
+    tags=["Integrations"],
+)
+async def create_import_mapping_profile(
+    payload: ImportMappingProfileCreate,
+    db: AsyncSession = Depends(get_db),
+) -> ImportMappingProfile:
+    require_global_role("approver", "admin")
+    await _ensure_project(db, payload.project_id)
+    await _require_project_access(db, payload.project_id, {"approver", "admin"})
+    try:
+        validate_mapping_configuration(payload.entity_type, payload.configuration)
+    except MappedIngestionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    existing = (
+        await db.execute(
+            select(ImportMappingProfile).where(
+                ImportMappingProfile.project_id == payload.project_id,
+                ImportMappingProfile.entity_type == payload.entity_type,
+                ImportMappingProfile.name == payload.name.strip(),
+            )
+        )
+    ).scalars().first()
+    if existing:
+        raise HTTPException(status_code=409, detail="An import mapping profile with this name already exists")
+    profile = ImportMappingProfile(
+        project_id=payload.project_id,
+        name=payload.name.strip(),
+        entity_type=payload.entity_type,
+        configuration=payload.configuration,
+        active=payload.active,
+        created_by=current_principal().username,
+    )
+    db.add(profile)
+    await db.flush()
+    db.add(AuditLog(
+        entity_type="import_mapping_profile",
+        entity_id=profile.id,
+        action="import_mapping_profile_created",
+        actor=current_principal().username,
+        details={"project_id": str(payload.project_id), "entity_type": payload.entity_type, "name": profile.name},
+    ))
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+@api_router.put(
+    "/import-mappings/{profile_id}",
+    response_model=ImportMappingProfileSummary,
+    tags=["Integrations"],
+)
+async def update_import_mapping_profile(
+    profile_id: uuid.UUID,
+    payload: ImportMappingProfileUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> ImportMappingProfile:
+    require_global_role("approver", "admin")
+    profile = await db.get(ImportMappingProfile, profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Import mapping profile not found")
+    await _require_project_access(db, profile.project_id, {"approver", "admin"})
+    try:
+        validate_mapping_configuration(profile.entity_type, payload.configuration)
+    except MappedIngestionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    duplicate = (
+        await db.execute(
+            select(ImportMappingProfile).where(
+                ImportMappingProfile.project_id == profile.project_id,
+                ImportMappingProfile.entity_type == profile.entity_type,
+                ImportMappingProfile.name == payload.name.strip(),
+                ImportMappingProfile.id != profile.id,
+            )
+        )
+    ).scalars().first()
+    if duplicate:
+        raise HTTPException(status_code=409, detail="An import mapping profile with this name already exists")
+    profile.name = payload.name.strip()
+    profile.configuration = payload.configuration
+    profile.active = payload.active
+    db.add(AuditLog(
+        entity_type="import_mapping_profile",
+        entity_id=profile.id,
+        action="import_mapping_profile_updated",
+        actor=current_principal().username,
+        details={"project_id": str(profile.project_id), "name": profile.name},
+    ))
+    await db.commit()
+    await db.refresh(profile)
+    return profile
+
+
+async def _mapped_upload(profile_id: uuid.UUID, uploaded_file: UploadFile, db: AsyncSession):
+    profile = await db.get(ImportMappingProfile, profile_id)
+    if not profile or not profile.active:
+        raise HTTPException(status_code=404, detail="Active import mapping profile not found")
+    await _require_project_access(db, profile.project_id, {"approver", "admin"})
+    content = await uploaded_file.read(settings.mapped_upload_max_bytes + 1)
+    filename = uploaded_file.filename
+    await uploaded_file.close()
+    try:
+        batch = map_import_file(
+            filename,
+            content,
+            entity_type=profile.entity_type,
+            configuration=profile.configuration,
+            max_bytes=settings.mapped_upload_max_bytes,
+            max_records=settings.mapped_import_max_records,
+        )
+    except MappedIngestionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return profile, batch, content
+
+
+@api_router.post(
+    "/imports/mapped/preview",
+    response_model=MappedImportPreview,
+    tags=["Integrations"],
+)
+async def preview_mapped_import(
+    profile_id: uuid.UUID = Form(...),
+    uploaded_file: UploadFile = File(..., alias="file"),
+    db: AsyncSession = Depends(get_db),
+) -> MappedImportPreview:
+    require_global_role("approver", "admin")
+    profile, batch, _ = await _mapped_upload(profile_id, uploaded_file, db)
+    issues = list(batch.issues)
+    preview_items = list(batch.items)
+    skipped = sum(issue.get("severity") == "error" for issue in issues)
+    if profile.entity_type == "test_case" and preview_items:
+        refs = {item.requirement_external_id for item in preview_items}
+        available = set(
+            (
+                await db.execute(
+                    select(Requirement.external_id).where(
+                        Requirement.project_id == profile.project_id,
+                        Requirement.external_id.in_(refs),
+                    )
+                )
+            ).scalars().all()
+        )
+        eligible = [item for item in preview_items if item.requirement_external_id in available]
+        missing_count = len(preview_items) - len(eligible)
+        if missing_count:
+            severity = (
+                "warning"
+                if profile.configuration.get("options", {}).get("unresolved_reference_policy") == "skip"
+                else "error"
+            )
+            issues.append({
+                "severity": severity,
+                "message": f"{missing_count} mapped test-case links reference requirements absent from this project",
+            })
+            skipped += missing_count
+        preview_items = eligible
+    errors = sum(issue.get("severity") == "error" for issue in issues)
+    warnings = sum(issue.get("severity") == "warning" for issue in issues)
+    return MappedImportPreview(
+        entity_type=profile.entity_type,
+        source_record_count=batch.source_record_count,
+        mapped_record_count=len(batch.items),
+        valid_record_count=len(preview_items),
+        skipped_record_count=skipped,
+        warning_count=warnings,
+        error_count=errors,
+        issues=issues[:100],
+        samples=[asdict(item) for item in preview_items[:3]],
+    )
+
+
+@api_router.post(
+    "/imports/mapped",
+    response_model=IntegrationRunSummary,
+    tags=["Integrations"],
+)
+async def execute_mapped_import(
+    profile_id: uuid.UUID = Form(...),
+    uploaded_file: UploadFile = File(..., alias="file"),
+    db: AsyncSession = Depends(get_db),
+) -> IntegrationRun:
+    require_global_role("approver", "admin")
+    profile, batch, content = await _mapped_upload(profile_id, uploaded_file, db)
+    blocking = [issue for issue in batch.issues if issue.get("severity") == "error"]
+    if blocking:
+        raise HTTPException(status_code=422, detail={"message": "Mapped import contains invalid rows", "issues": blocking[:100]})
+    actor = current_principal().username
+    if profile.entity_type == "test_case":
+        items = list(batch.items)
+        policy = profile.configuration.get("options", {}).get("unresolved_reference_policy", "reject")
+        skipped_missing = 0
+        if policy == "skip":
+            refs = {item.requirement_external_id for item in items}
+            available = set(
+                (
+                    await db.execute(
+                        select(Requirement.external_id).where(
+                            Requirement.project_id == profile.project_id,
+                            Requirement.external_id.in_(refs),
+                        )
+                    )
+                ).scalars().all()
+            )
+            filtered = [item for item in items if item.requirement_external_id in available]
+            skipped_missing = len(items) - len(filtered)
+            items = filtered
+        if not items:
+            raise HTTPException(status_code=422, detail="No mapped test cases reference requirements in this project")
+        try:
+            result = await import_historical_test_cases(db, project_id=profile.project_id, items=items, actor=actor)
+        except HistoricalImportConflictError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        run = await db.get(IntegrationRun, result.run_id)
+        run.integration_type = "mapped_test_case_import"
+        run.parameters = {**run.parameters, "mapping_profile_id": str(profile.id)}
+        run.result = {
+            **run.result,
+            "source_record_count": batch.source_record_count,
+            "mapping_warning_count": len(batch.issues),
+            "skipped_missing_requirement_count": skipped_missing,
+        }
+        await db.commit()
+        await db.refresh(run)
+        return run
+
+    created_count = 0
+    existing_count = 0
+    requirement_ids: list[str] = []
+    for item in batch.items:
+        requirement = (
+            await db.execute(
+                select(Requirement).where(
+                    Requirement.project_id == profile.project_id,
+                    Requirement.external_id == item.external_id,
+                )
+            )
+        ).scalars().first()
+        if requirement:
+            existing_count += 1
+        else:
+            requirement = Requirement(
+                project_id=profile.project_id,
+                external_id=item.external_id,
+                title=item.title,
+                description=item.description,
+                source="mapped_import",
+                status="draft",
+                metadata_json=item.metadata,
+            )
+            db.add(requirement)
+            await db.flush()
+            await _snapshot_requirement_and_enqueue(db, requirement)
+            created_count += 1
+        requirement_ids.append(str(requirement.id))
+    run = IntegrationRun(
+        integration_type="mapped_requirement_import",
+        status="completed",
+        requested_by=actor,
+        parameters={
+            "project_id": str(profile.project_id),
+            "mapping_profile_id": str(profile.id),
+            "filename": uploaded_file.filename,
+            "sha256": hashlib.sha256(content).hexdigest(),
+        },
+        result={
+            "source_record_count": batch.source_record_count,
+            "mapped_count": len(batch.items),
+            "created_count": created_count,
+            "existing_count": existing_count,
+            "requirement_ids": requirement_ids,
+            "mapping_warning_count": len(batch.issues),
+        },
+        completed_at=datetime.utcnow(),
+    )
+    db.add(run)
+    await db.flush()
+    db.add(AuditLog(
+        entity_type="integration",
+        entity_id=run.id,
+        action="mapped_requirements_imported",
+        actor=actor,
+        details={"project_id": str(profile.project_id), "profile_id": str(profile.id), "created_count": created_count},
+    ))
     await db.commit()
     await db.refresh(run)
     return run
@@ -2281,6 +2719,7 @@ async def import_jira_requirements(
     imported_ids: list[str] = []
     created_count = 0
     updated_count = 0
+    unchanged_count = 0
     for issue in issues:
         existing = await db.execute(
             select(Requirement).where(
@@ -2297,11 +2736,21 @@ async def import_jira_requirements(
             "cleanup_issues": cleanup_issues,
         }
         if requirement:
-            requirement.title = issue.summary
-            requirement.description = cleaned_description
-            requirement.metadata_json = metadata
-            requirement.status = "draft"
-            updated_count += 1
+            changed = (
+                requirement.title != issue.summary
+                or requirement.description != cleaned_description
+                or requirement.metadata_json != metadata
+            )
+            if changed:
+                requirement.version += 1
+                requirement.title = issue.summary
+                requirement.description = cleaned_description
+                requirement.metadata_json = metadata
+                requirement.status = "draft"
+                await _snapshot_requirement_and_enqueue(db, requirement)
+                updated_count += 1
+            else:
+                unchanged_count += 1
         else:
             requirement = Requirement(
                 project_id=payload.project_id,
@@ -2314,20 +2763,8 @@ async def import_jira_requirements(
             )
             db.add(requirement)
             await db.flush()
+            await _snapshot_requirement_and_enqueue(db, requirement)
             created_count += 1
-        digest = hashlib.sha256(
-            f"{issue.updated or ''}\n{issue.summary}\n{cleaned_description}".encode("utf-8")
-        ).hexdigest()[:16]
-        event_key = f"requirement.index:{requirement.id}:{digest}"
-        event_exists = await db.scalar(select(OutboxEvent.id).where(OutboxEvent.event_key == event_key))
-        if event_exists is None:
-            enqueue_index_event(
-                db,
-                event_key=event_key,
-                event_type=REQUIREMENT_INDEX_REQUESTED,
-                aggregate_type="requirement",
-                aggregate_id=requirement.id,
-            )
         imported_ids.append(str(requirement.id))
 
     run.status = "completed"
@@ -2335,6 +2772,7 @@ async def import_jira_requirements(
         "fetched_count": len(issues),
         "created_count": created_count,
         "updated_count": updated_count,
+        "unchanged_count": unchanged_count,
         "requirement_ids": imported_ids,
     }
     run.completed_at = datetime.utcnow()
@@ -2729,7 +3167,12 @@ async def dependency_health() -> DependencyHealthSummary:
     require_global_role("admin")
     probes = await probe_external_dependencies()
     statuses = [
-        DependencyStatusSummary(name=probe.name, status=probe.status, configured=probe.configured)
+        DependencyStatusSummary(
+            name=probe.name,
+            status=probe.status,
+            configured=probe.configured,
+            detail=probe.detail,
+        )
         for probe in probes
     ]
     overall = "healthy" if all(item.status == "healthy" for item in statuses) else "degraded"
@@ -3496,6 +3939,7 @@ async def generate_requirement_draft(
             title=requirement.title,
             description=requirement.description,
             external_id=requirement.external_id,
+            requirement_version=requirement.version,
         )
     except GenerationConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

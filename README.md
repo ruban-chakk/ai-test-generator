@@ -5,11 +5,13 @@ An enterprise-grade full-stack solution for generating and managing test cases f
 ## Implementation status
 
 The end-to-end review workflow is implemented: database-backed authentication and project RBAC, manual/Jira/file
-ingestion, OpenAI-compatible RAG generation, Pinecone indexing and semantic search, approval/versioning,
+ingestion, OpenAI-compatible RAG generation, Pinecone indexing, keyword/semantic/hybrid search, approval/versioning,
 feedback-driven revision, calibrated impact analysis, audit history, and durable repository delivery. Repository
 delivery supports a generic idempotent HTTP contract, Xray Cloud, TestRail, and Zephyr Cloud. Generic OIDC login,
 dependency probes, outbox recovery controls, durable automated execution, routed operational alerts, shared API
 rate limits, project compliance evidence, component tests, and browser critical-path tests are also included.
+Historical test cases can be imported in bulk from JSON/CSV, and operator tooling can reconcile missing vectors
+while preserving independently indexed immutable requirement and approved-case versions.
 External features fail closed when their credentials are absent.
 
 ## Goal
@@ -29,6 +31,8 @@ Create an enterprise-ready system that:
 - `design/implementation-plan.md` — overall architecture, workflow, and MVP strategy
 - `design/data-model.md` — concrete entity definitions and relationships
 - `design/ui-flows.md` — the UI experience, approval/review/feedback patterns
+- `design/gaps-2026-10-21.md` — dated status of implemented capabilities, remaining gaps, and recommended priorities
+- `design/release-evidence-2026-10-21.md` — dated verification results, external acceptance status, and release blockers
 
 ## Suggested tech stack
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import or_, select
@@ -14,7 +15,9 @@ from app.models import (
     OutboxEvent,
     RepositorySyncRun,
     Requirement,
+    RequirementVersion,
     TestCase,
+    TestCaseVersion,
     TestExecutionRun,
     TestScenario,
 )
@@ -25,14 +28,23 @@ from app.services.indexing import IndexableArtifact, IndexingService, build_inde
 
 
 TEST_CASE_INDEX_REQUESTED = "test_case.index_requested"
+TEST_CASE_VERSION_INDEX_REQUESTED = "test_case_version.index_requested"
 FEEDBACK_INDEX_REQUESTED = "feedback.index_requested"
 REQUIREMENT_INDEX_REQUESTED = "requirement.index_requested"
+REQUIREMENT_VERSION_INDEX_REQUESTED = "requirement_version.index_requested"
 TEST_CASE_REPOSITORY_SYNC_REQUESTED = "test_case.repository_sync_requested"
 TEST_CASE_EXECUTION_REQUESTED = "test_case.execution_requested"
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _text_with_custom_fields(text: str, custom_fields: dict) -> str:
+    if not custom_fields:
+        return text
+    rendered = json.dumps(custom_fields, ensure_ascii=False, sort_keys=True, default=str)
+    return f"{text}\nCustom fields: {rendered[:8000]}"
 
 
 def enqueue_outbox_event(
@@ -63,6 +75,7 @@ def enqueue_index_event(
     event_type: str,
     aggregate_type: str,
     aggregate_id: uuid.UUID,
+    payload: dict | None = None,
 ) -> OutboxEvent:
     return enqueue_outbox_event(
         db,
@@ -70,6 +83,7 @@ def enqueue_index_event(
         event_type=event_type,
         aggregate_type=aggregate_type,
         aggregate_id=aggregate_id,
+        payload=payload,
     )
 
 
@@ -134,7 +148,9 @@ class OutboxProcessor:
                     return
                 if event.event_type in {
                     REQUIREMENT_INDEX_REQUESTED,
+                    REQUIREMENT_VERSION_INDEX_REQUESTED,
                     TEST_CASE_INDEX_REQUESTED,
+                    TEST_CASE_VERSION_INDEX_REQUESTED,
                     FEEDBACK_INDEX_REQUESTED,
                 }:
                     operation = ("index", await self._load_artifact(db, event))
@@ -191,11 +207,27 @@ class OutboxProcessor:
                 requirement = await db.get(Requirement, event.aggregate_id)
                 if requirement:
                     requirement.vector_id = requirement.vector_id or f"requirement:{requirement.id}"
+            elif event.event_type == REQUIREMENT_VERSION_INDEX_REQUESTED:
+                version = await db.get(RequirementVersion, event.aggregate_id)
+                if version:
+                    version.vector_id = version.vector_id or f"requirement:{version.requirement_id}:v{version.version}"
+                    requirement = await db.get(Requirement, version.requirement_id)
+                    if requirement and requirement.version == version.version:
+                        requirement.vector_id = version.vector_id
             elif event.event_type == TEST_CASE_INDEX_REQUESTED:
                 test_case = await db.get(TestCase, event.aggregate_id)
                 if test_case:
                     test_case.repository_status = "indexed"
                     test_case.repository_synced_at = event.processed_at
+            elif event.event_type == TEST_CASE_VERSION_INDEX_REQUESTED:
+                version = await db.get(TestCaseVersion, event.aggregate_id)
+                if version:
+                    version.vector_id = version.vector_id or f"test_case:{version.test_case_id}:v{version.version}"
+                    test_case = await db.get(TestCase, version.test_case_id)
+                    if test_case and test_case.version == version.version:
+                        test_case.vector_id = version.vector_id
+                        test_case.repository_status = "indexed"
+                        test_case.repository_synced_at = event.processed_at
             elif event.event_type == TEST_CASE_REPOSITORY_SYNC_REQUESTED:
                 await self._complete_repository_delivery(db, event)
             elif event.event_type == TEST_CASE_EXECUTION_REQUESTED and execution_result is not None:
@@ -271,12 +303,41 @@ class OutboxProcessor:
                 entity_type="requirement",
                 entity_id=str(requirement.id),
                 project_id=str(requirement.project_id),
-                text=f"Title: {requirement.title}\nDescription: {requirement.description}",
+                text=_text_with_custom_fields(
+                    f"Title: {requirement.title}\nDescription: {requirement.description}",
+                    (requirement.metadata_json or {}).get("custom_fields", {}),
+                ),
                 metadata={
                     "requirement_id": str(requirement.id),
                     "external_id": requirement.external_id or "",
                     "source": requirement.source,
                     "status": requirement.status,
+                },
+            )
+
+        if event.event_type == REQUIREMENT_VERSION_INDEX_REQUESTED:
+            version = await db.get(RequirementVersion, event.aggregate_id)
+            if not version or not version.project_id:
+                raise LookupError("requirement version project is unavailable")
+            return IndexableArtifact(
+                vector_id=version.vector_id or f"requirement:{version.requirement_id}:v{version.version}",
+                entity_type="requirement",
+                entity_id=str(version.requirement_id),
+                project_id=str(version.project_id),
+                text=_text_with_custom_fields(
+                    f"Title: {version.title}\nDescription: {version.description}",
+                    (version.metadata_json or {}).get("custom_fields", {}),
+                ),
+                metadata={
+                    "requirement_version_id": str(version.id),
+                    "requirement_id": str(version.requirement_id),
+                    "external_id": version.external_id or "",
+                    "source": version.source,
+                    "status": version.status,
+                    "title": version.title,
+                    "version": version.version,
+                    "created_at": version.created_at.isoformat(),
+                    "immutable_version": True,
                 },
             )
 
@@ -306,6 +367,7 @@ class OutboxProcessor:
                 ]
                 if part
             )
+            text = _text_with_custom_fields(text, test_case.custom_fields_json or {})
             return IndexableArtifact(
                 vector_id=test_case.vector_id or f"test_case:{test_case.id}:v{test_case.version}",
                 entity_type="test_case",
@@ -323,6 +385,57 @@ class OutboxProcessor:
                     "severity": test_case.severity or "",
                     "category": test_case.category or "",
                     "type": test_case.type or "",
+                },
+            )
+
+        if event.event_type == TEST_CASE_VERSION_INDEX_REQUESTED:
+            version = await db.get(TestCaseVersion, event.aggregate_id)
+            if not version:
+                raise LookupError("test case version no longer exists")
+            requirement = await db.get(Requirement, version.requirement_id)
+            if not requirement or not requirement.project_id:
+                raise LookupError("test case version project is unavailable")
+            step_text = " ".join(
+                f"Step {step.get('step_number')}: {step.get('action', '')} "
+                f"Expected: {step.get('expected_result', '')}"
+                for step in sorted(
+                    version.steps_snapshot or [],
+                    key=lambda item: int(item.get("step_number", 0)),
+                )
+            )
+            text = " ".join(
+                part
+                for part in [
+                    version.title,
+                    version.description,
+                    version.prerequisite,
+                    step_text,
+                ]
+                if part
+            )
+            text = _text_with_custom_fields(text, version.custom_fields_json or {})
+            return IndexableArtifact(
+                vector_id=version.vector_id or f"test_case:{version.test_case_id}:v{version.version}",
+                entity_type="test_case",
+                entity_id=str(version.test_case_id),
+                project_id=str(requirement.project_id),
+                text=text,
+                metadata={
+                    "test_case_version_id": str(version.id),
+                    "requirement_id": str(version.requirement_id),
+                    "scenario_id": str(version.scenario_id),
+                    "external_id": version.external_id or "",
+                    "source": version.source,
+                    "title": version.title,
+                    "status": version.status,
+                    "repository_status": "indexed",
+                    "version": version.version,
+                    "priority": version.priority or "",
+                    "severity": version.severity or "",
+                    "category": version.category or "",
+                    "type": version.type or "",
+                    "approved_at": version.approved_at.isoformat(),
+                    "immutable_version": True,
                 },
             )
 
@@ -492,6 +605,24 @@ class OutboxProcessor:
             alert.delivered_at = event.processed_at
 
     async def _event_project_id(self, db: AsyncSession, event: OutboxEvent) -> uuid.UUID | None:
+        if event.event_type == REQUIREMENT_INDEX_REQUESTED:
+            requirement = await db.get(Requirement, event.aggregate_id)
+            return requirement.project_id if requirement else None
+        if event.event_type == REQUIREMENT_VERSION_INDEX_REQUESTED:
+            version = await db.get(RequirementVersion, event.aggregate_id)
+            return version.project_id if version else None
+        if event.event_type == TEST_CASE_INDEX_REQUESTED:
+            test_case = await db.get(TestCase, event.aggregate_id)
+            requirement = await db.get(Requirement, test_case.requirement_id) if test_case else None
+            return requirement.project_id if requirement else None
+        if event.event_type == TEST_CASE_VERSION_INDEX_REQUESTED:
+            version = await db.get(TestCaseVersion, event.aggregate_id)
+            requirement = await db.get(Requirement, version.requirement_id) if version else None
+            return requirement.project_id if requirement else None
+        if event.event_type == FEEDBACK_INDEX_REQUESTED:
+            feedback = await db.get(Feedback, event.aggregate_id)
+            requirement = await self._feedback_requirement(db, feedback) if feedback else None
+            return requirement.project_id if requirement else None
         if event.event_type == TEST_CASE_EXECUTION_REQUESTED:
             execution_run = await db.get(TestExecutionRun, event.aggregate_id)
             return execution_run.project_id if execution_run else None

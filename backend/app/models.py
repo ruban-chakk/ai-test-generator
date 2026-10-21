@@ -30,6 +30,28 @@ class Project(Base):
 
     requirements = relationship("Requirement", back_populates="project")
     memberships = relationship("ProjectMembership", back_populates="project", cascade="all, delete-orphan")
+    import_mapping_profiles = relationship(
+        "ImportMappingProfile", back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class ImportMappingProfile(Base):
+    __tablename__ = "import_mapping_profiles"
+    __table_args__ = (
+        UniqueConstraint("project_id", "entity_type", "name", name="uq_import_mapping_profile_name"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    entity_type = Column(String(32), nullable=False, index=True)
+    configuration = Column(JSON, nullable=False, default=dict)
+    active = Column(Boolean, nullable=False, default=True)
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    project = relationship("Project", back_populates="import_mapping_profiles")
 
 
 class Requirement(Base):
@@ -42,6 +64,7 @@ class Requirement(Base):
     description = Column(Text, nullable=False)
     source = Column(String, nullable=False)
     status = Column(String, nullable=False, default="draft")
+    version = Column(Integer, nullable=False, default=1)
     metadata_json = Column("metadata", JSON, key="metadata_json", nullable=True)
     vector_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -50,6 +73,26 @@ class Requirement(Base):
     project = relationship("Project", back_populates="requirements")
     scenarios = relationship("TestScenario", back_populates="requirement", cascade="all, delete")
     test_cases = relationship("TestCase", back_populates="requirement", cascade="all, delete")
+    versions = relationship("RequirementVersion", back_populates="requirement", cascade="all, delete")
+
+
+class RequirementVersion(Base):
+    __tablename__ = "requirement_versions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    version = Column(Integer, nullable=False)
+    external_id = Column(String, nullable=True)
+    title = Column(Text, nullable=False)
+    description = Column(Text, nullable=False)
+    source = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    metadata_json = Column("metadata", JSON, key="metadata_json", nullable=True)
+    vector_id = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    requirement = relationship("Requirement", back_populates="versions")
 
 
 class TestScenario(Base):
@@ -57,6 +100,7 @@ class TestScenario(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
+    external_id = Column(String, nullable=True)
     title = Column(Text, nullable=False)
     description = Column(Text, nullable=False)
     priority = Column(String, nullable=True)
@@ -79,6 +123,8 @@ class TestCase(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scenario_id = Column(UUID(as_uuid=True), ForeignKey("test_scenarios.id", ondelete="CASCADE"), nullable=False)
     requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
+    external_id = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="generated")
     title = Column(Text, nullable=False)
     description = Column(Text, nullable=False)
     prerequisite = Column(Text, nullable=True)
@@ -93,6 +139,7 @@ class TestCase(Base):
     repository_status = Column(String, nullable=False, default="draft")
     repository_synced_at = Column(DateTime, nullable=True)
     vector_id = Column(String, nullable=True)
+    custom_fields_json = Column("custom_fields", JSON, key="custom_fields_json", nullable=False, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
@@ -125,6 +172,8 @@ class TestCaseVersion(Base):
     requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="CASCADE"), nullable=False)
     scenario_id = Column(UUID(as_uuid=True), ForeignKey("test_scenarios.id", ondelete="CASCADE"), nullable=False)
     version = Column(Integer, nullable=False)
+    external_id = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="generated")
     title = Column(Text, nullable=False)
     description = Column(Text, nullable=False)
     prerequisite = Column(Text, nullable=True)
@@ -137,6 +186,8 @@ class TestCaseVersion(Base):
     approved_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     notes = Column(Text, nullable=True)
     steps_snapshot = Column(JSON, nullable=False, default=list)
+    vector_id = Column(String, nullable=True)
+    custom_fields_json = Column("custom_fields", JSON, key="custom_fields_json", nullable=False, default=dict)
 
     test_case = relationship("TestCase", back_populates="versions")
 

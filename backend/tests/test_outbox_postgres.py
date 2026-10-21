@@ -13,8 +13,10 @@ from app.models import (
     Project,
     RepositorySyncRun,
     Requirement,
+    RequirementVersion,
     TestCase as CaseModel,
     TestCaseStep as StepModel,
+    TestCaseVersion as VersionModel,
     TestExecutionRun as ExecutionRunModel,
     TestScenario as ScenarioModel,
 )
@@ -23,7 +25,9 @@ from app.services.execution import ExecutableTestCase, ExecutionResult
 from app.services.integrations import RepositoryTestCase
 from app.services.outbox import (
     OutboxProcessor,
+    REQUIREMENT_VERSION_INDEX_REQUESTED,
     TEST_CASE_INDEX_REQUESTED,
+    TEST_CASE_VERSION_INDEX_REQUESTED,
     TEST_CASE_REPOSITORY_SYNC_REQUESTED,
     TEST_CASE_EXECUTION_REQUESTED,
 )
@@ -176,6 +180,159 @@ def test_outbox_worker_indexes_and_completes_event() -> None:
             assert indexer.artifacts[0].project_id == str(project_id)
             assert "expired password reset link" in indexer.artifacts[0].text.lower()
             assert await processor.process_batch() == 0
+        finally:
+            await cleanup(session_factory, project_id, event_id)
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_outbox_worker_indexes_immutable_requirement_version_snapshot() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(TEST_DSN)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        project_id: uuid.UUID | None = None
+        requirement_id: uuid.UUID | None = None
+        event_id: uuid.UUID | None = None
+        indexer = RecordingIndexer()
+        try:
+            async with session_factory() as db:
+                project = Project(name=f"requirement-version-{uuid.uuid4()}", status="active")
+                db.add(project)
+                await db.flush()
+                project_id = project.id
+                requirement = Requirement(
+                    project_id=project.id,
+                    external_id="REQ-VERSION-1",
+                    title="A later canonical requirement title",
+                    description="The mutable row has changed after the approved historical snapshot.",
+                    source="jira",
+                    status="draft",
+                    version=2,
+                )
+                db.add(requirement)
+                await db.flush()
+                requirement_id = requirement.id
+                version = RequirementVersion(
+                    requirement_id=requirement.id,
+                    project_id=project.id,
+                    version=1,
+                    external_id="REQ-VERSION-1",
+                    title="Immutable historical requirement title",
+                    description="The historical requirement must be indexed from this snapshot.",
+                    source="jira",
+                    status="approved",
+                    vector_id=f"requirement:{requirement.id}:v1",
+                )
+                db.add(version)
+                await db.flush()
+                event = OutboxEvent(
+                    event_key=f"requirement_version.index:{version.id}",
+                    event_type=REQUIREMENT_VERSION_INDEX_REQUESTED,
+                    aggregate_type="requirement_version",
+                    aggregate_id=version.id,
+                    payload={
+                        "schema_version": 1,
+                        "requirement_id": str(requirement.id),
+                        "version": 1,
+                    },
+                )
+                db.add(event)
+                await db.commit()
+                event_id = event.id
+
+            processor = OutboxProcessor(
+                session_factory,
+                indexer,
+                processor_settings(),
+                worker_id="requirement-version-index-worker",
+            )
+            assert await processor.process_batch() == 1
+            assert len(indexer.artifacts) == 1
+            artifact = indexer.artifacts[0]
+            assert artifact.vector_id == f"requirement:{requirement_id}:v1"
+            assert "Immutable historical requirement title" in artifact.text
+            assert "later canonical" not in artifact.text
+            assert artifact.metadata["immutable_version"] is True
+            async with session_factory() as db:
+                event = await db.get(OutboxEvent, event_id)
+                assert event.status == "completed"
+        finally:
+            if event_id is not None:
+                async with session_factory() as db:
+                    await db.execute(delete(OutboxEvent).where(OutboxEvent.id == event_id))
+                    if requirement_id is not None:
+                        await db.execute(delete(Requirement).where(Requirement.id == requirement_id))
+                    if project_id is not None:
+                        await db.execute(delete(Project).where(Project.id == project_id))
+                    await db.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_outbox_worker_indexes_immutable_test_case_version_snapshot() -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(TEST_DSN)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        project_id, test_case_id, event_id = await seed_event(session_factory)
+        indexer = RecordingIndexer()
+        try:
+            async with session_factory() as db:
+                test_case = await db.get(CaseModel, test_case_id)
+                version = VersionModel(
+                    test_case_id=test_case.id,
+                    requirement_id=test_case.requirement_id,
+                    scenario_id=test_case.scenario_id,
+                    version=1,
+                    source="generated",
+                    title="Immutable approved reset-link behavior",
+                    description="The approved snapshot rejects an expired reset link.",
+                    priority="high",
+                    severity="major",
+                    status="approved",
+                    approved_by="approver",
+                    steps_snapshot=[
+                        {
+                            "step_number": 1,
+                            "action": "Open the expired reset link.",
+                            "expected_result": "The approved snapshot rejects the link.",
+                        }
+                    ],
+                    vector_id=f"test_case:{test_case.id}:v1",
+                )
+                db.add(version)
+                await db.flush()
+                event = await db.get(OutboxEvent, event_id)
+                event.event_type = TEST_CASE_VERSION_INDEX_REQUESTED
+                event.event_key = f"test_case_version.index:{version.id}"
+                event.aggregate_type = "test_case_version"
+                event.aggregate_id = version.id
+                event.payload = {
+                    "schema_version": 1,
+                    "test_case_id": str(test_case.id),
+                    "version": 1,
+                }
+                test_case.title = "A later canonical mutation must not alter the snapshot"
+                await db.commit()
+
+            processor = OutboxProcessor(
+                session_factory,
+                indexer,
+                processor_settings(),
+                worker_id="version-index-worker",
+            )
+            assert await processor.process_batch() == 1
+            assert len(indexer.artifacts) == 1
+            artifact = indexer.artifacts[0]
+            assert artifact.vector_id == f"test_case:{test_case_id}:v1"
+            assert "Immutable approved reset-link behavior" in artifact.text
+            assert "later canonical mutation" not in artifact.text
+            assert artifact.metadata["immutable_version"] is True
+            async with session_factory() as db:
+                test_case = await db.get(CaseModel, test_case_id)
+                assert test_case.repository_status == "indexed"
+                assert test_case.vector_id == artifact.vector_id
         finally:
             await cleanup(session_factory, project_id, event_id)
             await engine.dispose()

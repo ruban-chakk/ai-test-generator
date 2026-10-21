@@ -1,5 +1,6 @@
 import asyncio
 
+import httpx
 import pytest
 
 from app.core.config import Settings
@@ -10,6 +11,7 @@ from app.services.generation import (
     GeneratedTestCase,
     GenerationConfigurationError,
     GenerationService,
+    PineconeVectorStore,
     RetrievedContext,
     build_generation_service,
 )
@@ -101,7 +103,7 @@ def test_generation_service_embeds_retrieves_and_generates_structured_draft() ->
         )
     )
 
-    assert result.requirement_vector_id == "requirement:requirement-1"
+    assert result.requirement_vector_id == "requirement:requirement-1:v1"
     assert result.model == "test-model"
     assert result.draft.scenarios[0].test_cases[0].steps[0].step_number == 1
     assert vector_store.upserts[0][2]["project_id"] == "project-1"
@@ -147,7 +149,7 @@ def test_feedback_generation_retrieves_context_without_overwriting_requirement_v
         )
     )
 
-    assert result.requirement_vector_id == "requirement:requirement-1"
+    assert result.requirement_vector_id == "requirement:requirement-1:v1"
     assert vector_store.upserts == []
     system_prompt, user_prompt = language_model.generated_prompts[0]
     assert "untrusted data" in system_prompt
@@ -165,3 +167,27 @@ def test_generation_service_fails_closed_without_provider_credentials() -> None:
 
     with pytest.raises(GenerationConfigurationError, match="LLM_API_KEY"):
         build_generation_service(config)
+
+
+def test_pinecone_document_schema_error_has_actionable_configuration_guidance() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            400,
+            json={
+                "message": "This index has a document schema, so writes must go through the documents API."
+            },
+        )
+    )
+
+    async def scenario() -> None:
+        config = Settings(
+            _env_file=None,
+            pinecone_api_key="pinecone-secret",
+            pinecone_host="https://pinecone.example",
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            store = PineconeVectorStore(config, client)
+            await store.upsert("requirement:1", [0.1, 0.2], {"text": "Requirement"})
+
+    with pytest.raises(GenerationConfigurationError, match="bring-your-own-vectors"):
+        asyncio.run(scenario())

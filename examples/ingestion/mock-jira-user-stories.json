@@ -1,0 +1,34 @@
+{
+  "requirements": [
+    {
+      "external_id": "SHOP-101",
+      "title": "Authenticate customers with email and password",
+      "description": "As a registered customer, I want to sign in with my email address and password so that I can access my account and saved checkout information.\n\nAcceptance criteria:\n1. A customer with valid credentials is signed in and redirected to the account page.\n2. Invalid credentials return a generic error that does not reveal whether the email exists.\n3. After five consecutive failed attempts, the account is locked for 15 minutes.\n4. A successful sign-in resets the failed-attempt counter.\n5. Passwords are never returned by the API or written to application logs."
+    },
+    {
+      "external_id": "SHOP-102",
+      "title": "Search the product catalog",
+      "description": "As a shopper, I want to search the catalog by product name, SKU, or keyword so that I can quickly find relevant products.\n\nAcceptance criteria:\n1. Search is case-insensitive and ignores leading or trailing whitespace.\n2. Results contain the product name, current price, stock state, and product URL.\n3. Exact SKU matches appear before partial text matches.\n4. An empty result set displays a clear no-results message.\n5. The first page returns no more than 20 products and exposes pagination controls when more results exist."
+    },
+    {
+      "external_id": "SHOP-103",
+      "title": "Manage quantities in the shopping cart",
+      "description": "As a shopper, I want to add products to my cart and change their quantities so that I can prepare an order before checkout.\n\nAcceptance criteria:\n1. Adding an available product creates a cart line or increments the existing line.\n2. Quantity must be a whole number between 1 and the available stock quantity.\n3. The line subtotal and cart total update immediately after a quantity change.\n4. Setting the quantity to zero removes the line after confirmation.\n5. The server revalidates current stock before accepting an update."
+    },
+    {
+      "external_id": "SHOP-104",
+      "title": "Pay for an order by credit card",
+      "description": "As a customer, I want to pay for my order using a credit card so that my order can be placed immediately.\n\nAcceptance criteria:\n1. Checkout requires a non-empty cart, delivery address, billing address, and valid payment token.\n2. The order is created once when the payment provider approves the charge.\n3. Repeating the same checkout request with the same idempotency key must not create a duplicate order or charge.\n4. A declined payment leaves the cart intact and displays a recoverable error.\n5. Raw card numbers and security codes are never stored by the application."
+    },
+    {
+      "external_id": "SHOP-105",
+      "title": "Apply a promotional code at checkout",
+      "description": "As a customer, I want to apply a promotional code so that an eligible discount is reflected in my order total.\n\nAcceptance criteria:\n1. Promotional codes are matched case-insensitively.\n2. The code must be active, within its validity period, and eligible for the cart contents.\n3. A valid code updates the discount, tax basis, and final total.\n4. An expired or ineligible code displays the reason without changing the total.\n5. Only one promotional code may be active on an order."
+    },
+    {
+      "external_id": "SHOP-106",
+      "title": "Cancel an unfulfilled order",
+      "description": "As a customer, I want to cancel an order that has not been fulfilled so that I can stop shipment and receive the appropriate refund.\n\nAcceptance criteria:\n1. Orders in Placed or Processing status may be cancelled.\n2. Shipped, Delivered, or previously Cancelled orders cannot be cancelled.\n3. Successful cancellation records the actor, timestamp, and reason.\n4. A captured payment triggers a refund request using the original payment reference.\n5. Repeated cancellation requests are idempotent and must not issue duplicate refunds."
+    }
+  ]
+}

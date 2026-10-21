@@ -13,6 +13,18 @@ def test_dependency_probes_report_health_without_exposing_credentials() -> None:
         seen.append(request)
         if request.url.host == "repository.example":
             return httpx.Response(503)
+        if request.url.host == "api.pinecone.io":
+            if request.headers["X-Pinecone-API-Version"] == "2026-07":
+                return httpx.Response(200, json={"schema": None})
+            return httpx.Response(
+                200,
+                json={
+                    "dimension": 1536,
+                    "vector_type": "dense",
+                    "host": "pinecone.example",
+                    "status": {"ready": True},
+                },
+            )
         return httpx.Response(200, json={})
 
     async def scenario() -> None:
@@ -39,6 +51,39 @@ def test_dependency_probes_report_health_without_exposing_credentials() -> None:
         serialized = repr(probes)
         for secret in ["llm-secret", "pinecone-secret", "jira-secret", "repository-secret"]:
             assert secret not in serialized
+
+    asyncio.run(scenario())
+
+
+def test_pinecone_document_index_is_reported_as_misconfigured() -> None:
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host or "")
+        return httpx.Response(
+            200,
+            json={
+                "schema": {
+                    "fields": {
+                        "embedding": {"type": "dense_vector", "dimension": 1536},
+                    }
+                }
+            },
+        )
+
+    async def scenario() -> None:
+        config = Settings(
+            _env_file=None,
+            pinecone_api_key="pinecone-secret",
+            pinecone_host="https://pinecone.example",
+            pinecone_index_name="document-index",
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            probes = await probe_external_dependencies(config, client)
+        pinecone = next(probe for probe in probes if probe.name == "pinecone")
+        assert pinecone.status == "misconfigured"
+        assert "bring-your-own-vectors" in (pinecone.detail or "")
+        assert seen_hosts.count("pinecone.example") == 0
 
     asyncio.run(scenario())
 

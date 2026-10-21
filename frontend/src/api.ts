@@ -18,6 +18,8 @@ export {};
 
 export type TestCaseSummary = {
   id: string;
+  external_id?: string;
+  source?: string;
   title: string;
   description: string;
   prerequisite?: string;
@@ -32,10 +34,12 @@ export type TestCaseSummary = {
   repository_status: string;
   repository_synced_at?: string;
   steps?: TestCaseStep[];
+  custom_fields_json?: Record<string, unknown>;
 };
 
 export type TestScenarioSummary = {
   id: string;
+  external_id?: string;
   title: string;
   description: string;
   priority?: string;
@@ -72,9 +76,25 @@ export type RequirementSummary = {
   description?: string;
   source: string;
   status: string;
+  version?: number;
   metadata_json?: Record<string, unknown>;
   created_at?: string;
   updated_at?: string;
+};
+
+export type RequirementVersionSummary = {
+  id: string;
+  requirement_id: string;
+  project_id?: string;
+  version: number;
+  external_id?: string;
+  title: string;
+  description: string;
+  source: string;
+  status: string;
+  metadata_json?: Record<string, unknown>;
+  vector_id?: string;
+  created_at: string;
 };
 
 export type RequirementDetail = RequirementSummary & {
@@ -261,14 +281,21 @@ export type SemanticSearchResult = {
   text: string;
   score: number;
   metadata: Record<string, unknown>;
+  search_mode: SearchMode;
+  semantic_score?: number;
+  keyword_score?: number;
+  matched_fields: string[];
 };
 
-export async function semanticSearch(
+export type SearchMode = 'hybrid' | 'semantic' | 'keyword';
+
+export async function searchArtifacts(
   projectId: string,
   query: string,
+  mode: SearchMode,
   entityType?: SemanticSearchResult['entity_type'],
 ): Promise<SemanticSearchResult[]> {
-  const params = new URLSearchParams({ project_id: projectId, query });
+  const params = new URLSearchParams({ project_id: projectId, query, mode });
   if (entityType) params.set('entity_type', entityType);
   return request<SemanticSearchResult[]>(`${API_BASE_URL}/search?${params.toString()}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -284,6 +311,30 @@ export type IntegrationRunSummary = {
   result: Record<string, unknown>;
   started_at: string;
   completed_at?: string;
+};
+
+export type ImportMappingProfile = {
+  id: string;
+  project_id: string;
+  name: string;
+  entity_type: 'requirement' | 'test_case';
+  configuration: Record<string, unknown>;
+  active: boolean;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type MappedImportPreview = {
+  entity_type: 'requirement' | 'test_case';
+  source_record_count: number;
+  mapped_record_count: number;
+  valid_record_count: number;
+  skipped_record_count: number;
+  warning_count: number;
+  error_count: number;
+  issues: Array<Record<string, unknown>>;
+  samples: Array<Record<string, unknown>>;
 };
 
 export type RepositorySyncRunSummary = {
@@ -340,8 +391,9 @@ export type MonitoringSummary = {
 
 export type DependencyStatusSummary = {
   name: string;
-  status: 'healthy' | 'unhealthy' | 'unreachable' | 'not_configured';
+  status: 'healthy' | 'unhealthy' | 'unreachable' | 'misconfigured' | 'not_configured';
   configured: boolean;
+  detail?: string;
 };
 
 export type DependencyHealthSummary = {
@@ -408,6 +460,8 @@ export type TestCaseVersionSummary = {
   requirement_id: string;
   scenario_id: string;
   version: number;
+  external_id?: string;
+  source?: string;
   title: string;
   description: string;
   prerequisite?: string;
@@ -420,6 +474,7 @@ export type TestCaseVersionSummary = {
   approved_at: string;
   notes?: string;
   steps_snapshot: Record<string, unknown>[];
+  vector_id?: string;
 };
 
 export type AuditLogSummary = {
@@ -565,6 +620,14 @@ export async function getRequirements(
 
 export async function getRequirement(id: string): Promise<RequirementDetail> {
   return request<RequirementDetail>(`${API_BASE_URL}/requirements/${id}`, {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
+export async function getRequirementVersions(id: string): Promise<RequirementVersionSummary[]> {
+  return request<RequirementVersionSummary[]>(`${API_BASE_URL}/requirements/${id}/versions`, {
     headers: {
       'Content-Type': 'application/json',
     },
@@ -973,6 +1036,56 @@ export async function importRequirementFile(
     body,
   });
   return handleResponse<IntegrationRunSummary>(response);
+}
+
+export async function importHistoricalTestCases(
+  projectId: string,
+  file: File,
+): Promise<IntegrationRunSummary> {
+  const body = new FormData();
+  body.set('project_id', projectId);
+  body.set('file', file);
+  const response = await fetch(`${API_BASE_URL}/test-cases/import-file`, {
+    method: 'POST',
+    body,
+  });
+  return handleResponse<IntegrationRunSummary>(response);
+}
+
+export async function getImportMappingProfiles(projectId: string): Promise<ImportMappingProfile[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<ImportMappingProfile[]>(`${API_BASE_URL}/import-mappings?${params.toString()}`);
+}
+
+export async function createImportMappingProfile(payload: {
+  project_id: string;
+  name: string;
+  entity_type: 'requirement' | 'test_case';
+  configuration: Record<string, unknown>;
+  active: boolean;
+}): Promise<ImportMappingProfile> {
+  const response = await fetch(`${API_BASE_URL}/import-mappings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<ImportMappingProfile>(response);
+}
+
+async function mappedImportRequest<T>(path: string, profileId: string, file: File): Promise<T> {
+  const body = new FormData();
+  body.set('profile_id', profileId);
+  body.set('file', file);
+  const response = await fetch(`${API_BASE_URL}${path}`, { method: 'POST', body });
+  return handleResponse<T>(response);
+}
+
+export function previewMappedImport(profileId: string, file: File): Promise<MappedImportPreview> {
+  return mappedImportRequest<MappedImportPreview>('/imports/mapped/preview', profileId, file);
+}
+
+export function executeMappedImport(profileId: string, file: File): Promise<IntegrationRunSummary> {
+  return mappedImportRequest<IntegrationRunSummary>('/imports/mapped', profileId, file);
 }
 
 export async function syncTestRepository(

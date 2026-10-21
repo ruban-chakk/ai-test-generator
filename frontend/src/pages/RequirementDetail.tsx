@@ -36,6 +36,20 @@ import {
   validateTarget,
 } from '../api';
 
+function CustomFields({ fields }: { fields?: Record<string, unknown> }) {
+  if (!fields || !Object.keys(fields).length) return null;
+  return (
+    <dl className="detail-list" aria-label="Custom fields">
+      {Object.entries(fields).map(([name, value]) => (
+        <div className="detail-row" key={name}>
+          <dt>{name.replace(/_/g, ' ')}</dt>
+          <dd>{typeof value === 'string' ? value : JSON.stringify(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
 const defaultScenarioValues = {
   title: '',
   description: '',
@@ -565,6 +579,7 @@ export default function RequirementDetailPage() {
           <article className="detail-card">
             <h2>Description</h2>
             <p>{requirement.description}</p>
+            <CustomFields fields={requirement.metadata_json?.custom_fields as Record<string, unknown> | undefined} />
           </article>
 
           <article className="detail-card impact-panel">
@@ -961,6 +976,7 @@ export default function RequirementDetailPage() {
                                 {testCase.prerequisite ? (
                                   <span className="table-description">Prerequisite: {testCase.prerequisite}</span>
                                 ) : null}
+                                <CustomFields fields={testCase.custom_fields_json} />
                               </td>
                               <td>{testCase.type ?? '—'}</td>
                               <td>{testCase.severity ?? '—'}</td>

@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4.1-mini"
     embedding_model: str = "text-embedding-3-small"
+    embedding_dimension: int = 1536
     provider_timeout_seconds: float = 30.0
     provider_max_attempts: int = 3
     auth_jwt_secret: str = Field(default="", repr=False)
@@ -34,6 +35,8 @@ class Settings(BaseSettings):
     pinecone_index_name: str = "ai-testgen-embeddings"
     pinecone_host: str = ""
     pinecone_namespace: str = "ai-test-generator"
+    pinecone_control_plane_url: str = "https://api.pinecone.io"
+    pinecone_api_version: str = "2026-07"
     outbox_batch_size: int = 25
     outbox_max_attempts: int = 8
     outbox_lock_timeout_seconds: int = 300
@@ -67,6 +70,9 @@ class Settings(BaseSettings):
     auth_rate_limit_per_minute: int = 10
     upload_max_bytes: int = 2_000_000
     upload_max_requirements: int = 100
+    upload_max_test_cases: int = 500
+    mapped_upload_max_bytes: int = 10_000_000
+    mapped_import_max_records: int = 20_000
     health_probe_timeout_seconds: float = 5.0
     oidc_enabled: bool = False
     oidc_issuer: str = ""

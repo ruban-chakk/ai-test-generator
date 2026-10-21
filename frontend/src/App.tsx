@@ -252,7 +252,7 @@ function App() {
           <NavLink to="/requirements/new">
             New Requirement
           </NavLink>
-          <NavLink to="/search">Semantic Search</NavLink>
+          <NavLink to="/search">Search</NavLink>
           <NavLink to="/executions">Executions</NavLink>
           {user.role === 'admin' ? <NavLink to="/operations">Operations</NavLink> : null}
         </nav>

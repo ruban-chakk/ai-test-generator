@@ -10,7 +10,7 @@ from starlette.datastructures import Headers, UploadFile
 
 from app.api.routes import import_requirement_file, retry_outbox_event
 from app.core.security import Principal, _principal_context
-from app.models import AuditLog, IntegrationRun, OutboxEvent, Project, Requirement
+from app.models import AuditLog, IntegrationRun, OutboxEvent, Project, Requirement, RequirementVersion
 
 
 TEST_DSN = os.getenv("TEST_POSTGRES_DSN")
@@ -57,12 +57,24 @@ def test_file_import_is_atomic_idempotent_and_queues_indexing() -> None:
                 assert len(requirements) == 1
                 assert requirements[0].external_id == "AUTH-101"
                 assert requirements[0].metadata_json["upload_filename"] == "requirements.csv"
+                versions = (
+                    await db.execute(
+                        select(RequirementVersion).where(
+                            RequirementVersion.requirement_id == requirements[0].id
+                        )
+                    )
+                ).scalars().all()
+                assert len(versions) == 1
                 events = (
-                    await db.execute(select(OutboxEvent).where(OutboxEvent.aggregate_id == requirements[0].id))
+                    await db.execute(select(OutboxEvent).where(OutboxEvent.aggregate_id == versions[0].id))
                 ).scalars().all()
                 assert len(events) == 1
                 event_id = events[0].id
-                assert events[0].payload == {"schema_version": 1}
+                assert events[0].payload == {
+                    "schema_version": 1,
+                    "requirement_id": str(requirements[0].id),
+                    "version": 1,
+                }
 
                 events[0].status = "failed"
                 events[0].attempts = 8
@@ -77,10 +89,13 @@ def test_file_import_is_atomic_idempotent_and_queues_indexing() -> None:
             if project_id:
                 async with session_factory() as db:
                     requirement_ids = select(Requirement.id).where(Requirement.project_id == project_id)
+                    version_ids = select(RequirementVersion.id).where(
+                        RequirementVersion.requirement_id.in_(requirement_ids)
+                    )
                     await db.execute(delete(AuditLog).where(AuditLog.entity_id.in_(run_ids)))
                     if event_id:
                         await db.execute(delete(AuditLog).where(AuditLog.entity_id == event_id))
-                    await db.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(requirement_ids)))
+                    await db.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(version_ids)))
                     await db.execute(delete(Requirement).where(Requirement.project_id == project_id))
                     await db.execute(delete(IntegrationRun).where(IntegrationRun.id.in_(run_ids)))
                     await db.execute(delete(Project).where(Project.id == project_id))

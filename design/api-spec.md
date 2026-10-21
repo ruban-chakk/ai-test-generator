@@ -26,7 +26,13 @@ Base URL: `/api/v1`. JSON responses are returned directly rather than inside a r
 - `POST /requirements` — create a project-scoped requirement.
 - `POST /requirements/import-file` — import bounded UTF-8 TXT, Markdown, CSV, or JSON requirements; file content
   is treated as untrusted and raw documents are not retained.
+- `POST /test-cases/import-file` — import bounded historical test cases from JSON or CSV after their referenced
+  requirements exist. Stable requirement/scenario/case external identities make identical reimports idempotent;
+  conflicting content is rejected. Each case, step set, immutable version, approval record, audit record, and
+  version-index outbox event is committed atomically.
 - `GET /requirements/{requirement_id}` — retrieve a requirement, nested scenarios, cases, and steps.
+- `GET /requirements/{requirement_id}/versions` — list immutable requirement content snapshots and their stable
+  versioned vector identifiers.
 - `POST /requirements/{requirement_id}/generate` — run configured OpenAI-compatible generation with
   project-filtered Pinecone retrieval and persist a schema-validated draft. Returns `503` if unconfigured and `502`
   on provider failure; it never substitutes canned output.
@@ -47,11 +53,15 @@ Base URL: `/api/v1`. JSON responses are returned directly rather than inside a r
 - `GET /validate/{target_level}/{target_id}`, `POST /quality/{target_level}/{target_id}`, `GET /quality`
 
 Approved cases are locked and versioned. Vector indexing is queued in the same PostgreSQL transaction through the
-outbox; it is not a synchronous database-plus-provider dual write.
+outbox; it is not a synchronous database-plus-provider dual write. The worker indexes the immutable approved
+version snapshot under `test_case:<case-id>:v<version>`, so later edits cannot alter historical vector content.
 
-## Semantic impact
+## Search and semantic impact
 
-- `GET /search?project_id=&query=&entity_type=&limit=` — project-filtered semantic search over indexed artifacts.
+- `GET /search?project_id=&query=&mode=&entity_type=&limit=` — project-filtered search over requirements, approved
+  test cases, and feedback. `mode` is `semantic` (the backward-compatible API default), `keyword`, or `hybrid`.
+  Keyword mode uses PostgreSQL full-text search against canonical records. Hybrid mode uses reciprocal-rank fusion
+  to combine PostgreSQL keyword ranks with Pinecone semantic ranks without treating their raw scores as comparable.
 
 - `GET /requirements/{requirement_id}/impact`
 - `POST /impact/analyze` with `project_id`, `text`, and optional project-consistent `context_ids`.
@@ -99,6 +109,9 @@ configured generic HTTP, Xray Cloud, TestRail, or Zephyr Cloud adapter; completi
 - `GET /monitoring/summary` — database counters.
 - `GET /operations/dependencies` — sanitized live provider probes.
 - `GET /operations/outbox`, `POST /operations/outbox/{id}/retry` — inspect and safely retry delivery failures.
+- `python scripts/backfill_vectors.py [--project-id <uuid>] [--all]` — operator command that reconciles missing
+  requirement, feedback, approved-case, and immutable-version indexing events without calling providers in the
+  database transaction.
 - `GET /operations/alerts`, `POST /operations/alerts/{id}/acknowledge` — project-aware failure notifications,
   delivery state, and acknowledgement evidence.
 - `POST /governance/policies`, `GET /governance/policies` — governance policy storage.
@@ -131,3 +144,13 @@ must return a terminal result; the application records passed, failed, or exhaus
 
 Live provider acceptance requires tenant credentials and is run with `scripts/acceptance_probe.py`; secrets and
 tenant-specific acceptance results are deliberately not committed.
+# Configurable imports
+
+- `GET /api/v1/import-mappings?project_id={uuid}` lists reusable project-scoped mapping profiles.
+- `POST /api/v1/import-mappings` creates a validated requirement or test-case mapping profile.
+- `PUT /api/v1/import-mappings/{profile_id}` updates a profile without changing its artifact type.
+- `POST /api/v1/imports/mapped/preview` validates a JSON/CSV file and returns mapped samples and bounded issues.
+- `POST /api/v1/imports/mapped` imports the previewed format into canonical PostgreSQL records and queues vector events.
+
+Mapping transforms are selected from an allow-list (`string`, case normalization, integer/version conversion,
+ISO/Excel dates, Jira-style references, and numbered test steps). Profiles never contain executable expressions.

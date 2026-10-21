@@ -20,6 +20,13 @@ import {
   getSemanticCalibrations,
   GovernancePolicySummary,
   importJiraRequirements,
+  importHistoricalTestCases,
+  createImportMappingProfile,
+  executeMappedImport,
+  getImportMappingProfiles,
+  previewMappedImport,
+  ImportMappingProfile,
+  MappedImportPreview,
   importRequirementFile,
   IntegrationRunSummary,
   MonitoringSummary,
@@ -34,6 +41,53 @@ import {
   updateComplianceProfile,
   exportComplianceEvidence,
 } from '../api';
+
+const STORY_MAPPING = {
+  fields: {
+    external_id: { source: 'key' },
+    title: { source: 'summary' },
+    description: {
+      sources: ['description', 'acceptanceCriteria'],
+      separator: '\n\nAcceptance criteria:\n',
+    },
+  },
+  custom_fields: {
+    status: 'status.name', priority: 'priority.name', project: 'project', epic: 'epic',
+    risk: 'risk', labels: 'labels', components: 'components', source_type: 'sourceType',
+  },
+  options: {},
+};
+
+const TEST_CASE_MAPPING = {
+  fields: {
+    external_id: { source: 'id' },
+    requirement_external_id: { source: 'linkedStories', transform: 'references' },
+    scenario_external_id: { source: 'module' },
+    scenario_title: { source: 'module' },
+    scenario_description: { source: 'module' },
+    title: { source: 'title' },
+    description: { source: 'description' },
+    prerequisite: { source: 'preRequisites' },
+    priority: { source: 'priority' },
+    severity: { source: 'risk' },
+    category: { source: 'module' },
+    type: { source: 'type' },
+    status: { default: 'approved' },
+    version: { source: 'version', transform: 'version_integer' },
+    approved_at: { source: 'lastModifiedDate', transform: 'excel_datetime' },
+    approved_by: { source: 'createdBy' },
+    steps: { source: 'steps', transform: 'numbered_steps' },
+  },
+  custom_fields: {
+    automation_manual: 'automationManual', created_by: 'createdBy', created_date: 'createdDate',
+    last_modified_date: 'lastModifiedDate', module: 'module',
+  },
+  options: {
+    expected_result_source: 'expectedResults',
+    multi_requirement_strategy: 'duplicate',
+    unresolved_reference_policy: 'skip',
+  },
+};
 
 type OperationsPageProps = {
   selectedProject: ProjectSummary | null;
@@ -52,6 +106,16 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
   const [syncRun, setSyncRun] = useState<RepositorySyncRunSummary | null>(null);
   const [uploadRun, setUploadRun] = useState<IntegrationRunSummary | null>(null);
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [historicalRun, setHistoricalRun] = useState<IntegrationRunSummary | null>(null);
+  const [historicalFile, setHistoricalFile] = useState<File | null>(null);
+  const [mappingProfiles, setMappingProfiles] = useState<ImportMappingProfile[]>([]);
+  const [mappingEntity, setMappingEntity] = useState<'requirement' | 'test_case'>('requirement');
+  const [mappingName, setMappingName] = useState('Company user stories');
+  const [mappingConfig, setMappingConfig] = useState(JSON.stringify(STORY_MAPPING, null, 2));
+  const [mappedProfileId, setMappedProfileId] = useState('');
+  const [mappedFile, setMappedFile] = useState<File | null>(null);
+  const [mappedPreview, setMappedPreview] = useState<MappedImportPreview | null>(null);
+  const [mappedRun, setMappedRun] = useState<IntegrationRunSummary | null>(null);
   const [cleanupResult, setCleanupResult] = useState<CleanupResult | null>(null);
   const [evaluationRun, setEvaluationRun] = useState<EvaluationRunSummary | null>(null);
   const [policies, setPolicies] = useState<GovernancePolicySummary[]>([]);
@@ -108,7 +172,54 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
 
   useEffect(() => {
     refreshOperations();
+    if (selectedProject) {
+      getImportMappingProfiles(selectedProject.id).then(setMappingProfiles).catch(() => setMappingProfiles([]));
+    } else {
+      setMappingProfiles([]);
+    }
   }, [selectedProject?.id]);
+
+  const changeMappingEntity = (entity: 'requirement' | 'test_case') => {
+    setMappingEntity(entity);
+    setMappingName(entity === 'requirement' ? 'Company user stories' : 'Company test cases');
+    setMappingConfig(JSON.stringify(entity === 'requirement' ? STORY_MAPPING : TEST_CASE_MAPPING, null, 2));
+  };
+
+  const handleSaveMapping = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProject) {
+      setError('Select a project before saving an import mapping.');
+      return;
+    }
+    runAction('save-mapping', async () => {
+      const profile = await createImportMappingProfile({
+        project_id: selectedProject.id,
+        name: mappingName,
+        entity_type: mappingEntity,
+        configuration: JSON.parse(mappingConfig) as Record<string, unknown>,
+        active: true,
+      });
+      setMappingProfiles((current) => [...current, profile]);
+      setMappedProfileId(profile.id);
+    });
+  };
+
+  const handleMappedPreview = () => {
+    if (!mappedProfileId || !mappedFile) {
+      setError('Choose a mapping profile and source file first.');
+      return;
+    }
+    runAction('mapped-preview', async () => {
+      setMappedPreview(await previewMappedImport(mappedProfileId, mappedFile));
+    });
+  };
+
+  const handleMappedImport = () => {
+    if (!mappedProfileId || !mappedFile) return;
+    runAction('mapped-import', async () => {
+      setMappedRun(await executeMappedImport(mappedProfileId, mappedFile));
+    });
+  };
 
   const runAction = async (name: string, action: () => Promise<void>) => {
     try {
@@ -143,6 +254,18 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
     runAction('file-import', async () => {
       setUploadRun(await importRequirementFile(selectedProject.id, uploadFile));
       setUploadFile(null);
+    });
+  };
+
+  const handleHistoricalImport = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedProject || !historicalFile) {
+      setError('Select a project and historical test-case file before importing.');
+      return;
+    }
+    runAction('historical-import', async () => {
+      setHistoricalRun(await importHistoricalTestCases(selectedProject.id, historicalFile));
+      setHistoricalFile(null);
     });
   };
 
@@ -244,6 +367,62 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
 
       <section className="ops-grid">
         <article className="detail-card">
+          <h2>Configurable import mappings</h2>
+          <p className="case-meta">
+            Save project-specific JSON/CSV mappings. Unknown company fields are retained and included in semantic indexing.
+          </p>
+          <form onSubmit={handleSaveMapping}>
+            <label>
+              Artifact type
+              <select value={mappingEntity} onChange={(event) => changeMappingEntity(event.target.value as 'requirement' | 'test_case')}>
+                <option value="requirement">User story / requirement</option>
+                <option value="test_case">Historical test case</option>
+              </select>
+            </label>
+            <label>
+              Mapping name
+              <input value={mappingName} onChange={(event) => setMappingName(event.target.value)} required />
+            </label>
+            <label>
+              Mapping configuration
+              <textarea rows={16} value={mappingConfig} onChange={(event) => setMappingConfig(event.target.value)} required />
+            </label>
+            <button className="secondary-button" type="submit" disabled={!selectedProject || busy === 'save-mapping'}>
+              {busy === 'save-mapping' ? 'Saving...' : 'Save mapping'}
+            </button>
+          </form>
+          <hr />
+          <label>
+            Saved mapping
+            <select value={mappedProfileId} onChange={(event) => { setMappedProfileId(event.target.value); setMappedPreview(null); }}>
+              <option value="">Select mapping</option>
+              {mappingProfiles.filter((profile) => profile.active).map((profile) => (
+                <option key={profile.id} value={profile.id}>{profile.name} · {profile.entity_type.replace('_', ' ')}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Company JSON or CSV file
+            <input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => { setMappedFile(event.target.files?.[0] ?? null); setMappedPreview(null); }} />
+          </label>
+          <div className="detail-actions">
+            <button className="secondary-button" type="button" onClick={handleMappedPreview} disabled={!mappedProfileId || !mappedFile || busy === 'mapped-preview'}>
+              {busy === 'mapped-preview' ? 'Previewing...' : 'Preview mapping'}
+            </button>
+            <button className="primary-button" type="button" onClick={handleMappedImport} disabled={!mappedProfileId || !mappedFile || !mappedPreview || mappedPreview.error_count > 0 || busy === 'mapped-import'}>
+              {busy === 'mapped-import' ? 'Importing...' : 'Import mapped data'}
+            </button>
+          </div>
+          {mappedPreview ? (
+            <p className="case-meta" role="status">
+              Source {mappedPreview.source_record_count} · Mapped {mappedPreview.mapped_record_count} · Eligible{' '}
+              {mappedPreview.valid_record_count} · Skipped {mappedPreview.skipped_record_count} · Warnings{' '}
+              {mappedPreview.warning_count} · Errors {mappedPreview.error_count}
+            </p>
+          ) : null}
+          {mappedRun ? <p className="case-meta" role="status">Import completed: {String(mappedRun.result.created_count ?? mappedRun.result.created_test_case_count ?? 0)} created</p> : null}
+        </article>
+        <article className="detail-card">
           <h2>Monitoring</h2>
           {monitoring ? (
             <div className="impact-summary-grid">
@@ -263,6 +442,40 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
         </article>
 
         <article className="detail-card">
+          <h2>Historical test cases</h2>
+          <p className="case-meta">
+            JSON or CSV · Requirements must already exist · Destination: {selectedProject?.name ?? 'Select a project'}
+          </p>
+          <form onSubmit={handleHistoricalImport}>
+            <label>
+              Historical test-case file
+              <input
+                type="file"
+                accept=".json,.csv,text/csv,application/json"
+                onChange={(event) => setHistoricalFile(event.target.files?.[0] ?? null)}
+                required
+              />
+            </label>
+            <div className="detail-actions">
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={busy === 'historical-import' || !selectedProject || !historicalFile}
+              >
+                {busy === 'historical-import' ? 'Importing...' : 'Import historical cases'}
+              </button>
+            </div>
+          </form>
+          {historicalRun ? (
+            <p className="case-meta" role="status">
+              Created {String(historicalRun.result.created_test_case_count ?? 0)} · Existing{' '}
+              {String(historicalRun.result.existing_test_case_count ?? 0)} · Queued vectors{' '}
+              {String(historicalRun.result.queued_vector_count ?? 0)}
+            </p>
+          ) : null}
+        </article>
+
+        <article className="detail-card">
           <h2>Dependency health</h2>
           <p className="case-meta" role="status">
             Overall: {dependencies?.status ?? 'checking'}
@@ -272,6 +485,7 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
               <div className="history-card" key={dependency.name}>
                 <strong>{dependency.name.replace(/_/g, ' ')}</strong>
                 <span className={`status-pill status-${dependency.status}`}>{dependency.status.replace(/_/g, ' ')}</span>
+                {dependency.detail ? <p className="case-meta">{dependency.detail}</p> : null}
               </div>
             ))}
           </div>

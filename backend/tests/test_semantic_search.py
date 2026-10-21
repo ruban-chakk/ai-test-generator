@@ -1,7 +1,7 @@
 import asyncio
 
 from app.services.generation import RetrievedContext
-from app.services.search import SemanticSearchService
+from app.services.search import SearchMatch, SemanticSearchService, fuse_search_matches
 
 
 class FakeLanguageModel:
@@ -52,4 +52,34 @@ def test_semantic_search_filters_types_and_removes_project_metadata() -> None:
     assert len(results) == 1
     assert results[0].entity_id == "case-1"
     assert results[0].score == 0.94
+    assert results[0].semantic_score == 0.94
     assert "project_id" not in results[0].metadata
+
+
+def test_hybrid_search_fuses_rankings_and_preserves_component_evidence() -> None:
+    semantic = [
+        SearchMatch("vector-a", "requirement", "a", "Semantic first", "A", 0.95, {}, semantic_score=0.95),
+        SearchMatch("vector-b", "requirement", "b", "Shared", "B", 0.80, {}, semantic_score=0.80),
+    ]
+    keyword = [
+        SearchMatch(
+            "vector-b",
+            "requirement",
+            "b",
+            "Shared current title",
+            "B current",
+            0.90,
+            {"external_id": "REQ-42"},
+            keyword_score=0.90,
+            matched_fields=("external ID",),
+        ),
+        SearchMatch("vector-c", "test_case", "c", "Keyword second", "C", 0.70, {}, keyword_score=0.70),
+    ]
+
+    results = fuse_search_matches(semantic, keyword, limit=3)
+
+    assert [result.entity_id for result in results] == ["b", "a", "c"]
+    assert results[0].semantic_score == 0.80
+    assert results[0].keyword_score == 0.90
+    assert results[0].matched_fields == ("external ID",)
+    assert results[0].title == "Shared current title"

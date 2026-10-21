@@ -12,10 +12,12 @@ import {
   getComplianceProfile,
   getDependencyHealth,
   getGovernancePolicies,
+  getImportMappingProfiles,
   getMonitoringSummary,
   getOutboxEvents,
   getSemanticCalibrations,
   importRequirementFile,
+  importHistoricalTestCases,
   retryOutboxEvent,
   updateComplianceProfile,
 } from '../api';
@@ -36,6 +38,11 @@ vi.mock('../api', () => ({
   exportComplianceEvidence: vi.fn(),
   importJiraRequirements: vi.fn(),
   importRequirementFile: vi.fn(),
+  importHistoricalTestCases: vi.fn(),
+  getImportMappingProfiles: vi.fn(),
+  createImportMappingProfile: vi.fn(),
+  previewMappedImport: vi.fn(),
+  executeMappedImport: vi.fn(),
   retryOutboxEvent: vi.fn(),
   runEvaluationSuite: vi.fn(),
   syncTestRepository: vi.fn(),
@@ -50,6 +57,7 @@ const project = {
 };
 
 function mockRefresh() {
+  vi.mocked(getImportMappingProfiles).mockResolvedValue([]);
   vi.mocked(getMonitoringSummary).mockResolvedValue({
     status: 'ok',
     metrics: { requirements: 2 },
@@ -59,7 +67,15 @@ function mockRefresh() {
   vi.mocked(getDependencyHealth).mockResolvedValue({
     status: 'degraded',
     checked_at: '2026-10-21T00:00:00Z',
-    dependencies: [{ name: 'jira', status: 'not_configured', configured: false }],
+    dependencies: [
+      {
+        name: 'pinecone',
+        status: 'misconfigured',
+        configured: true,
+        detail: 'Index uses a document schema; a bring-your-own-vectors index is required',
+      },
+      { name: 'jira', status: 'not_configured', configured: false },
+    ],
   });
   vi.mocked(getOutboxEvents).mockResolvedValue([
     {
@@ -168,6 +184,35 @@ describe('OperationsPage', () => {
 
     await waitFor(() => expect(importRequirementFile).toHaveBeenCalledWith('project-1', file));
     expect(await screen.findByText(/Created 1/)).toBeInTheDocument();
+  });
+
+  it('imports historical test cases into the active project', async () => {
+    const user = userEvent.setup();
+    vi.mocked(importHistoricalTestCases).mockResolvedValue({
+      id: 'run-historical-1',
+      integration_type: 'historical_test_case_import',
+      status: 'completed',
+      requested_by: 'admin',
+      parameters: {},
+      result: {
+        created_test_case_count: 2,
+        existing_test_case_count: 1,
+        queued_vector_count: 2,
+      },
+      started_at: '2026-10-21T00:00:00Z',
+      completed_at: '2026-10-21T00:00:01Z',
+    });
+    render(<MemoryRouter><OperationsPage selectedProject={project} /></MemoryRouter>);
+    await screen.findByText('not configured');
+
+    const file = new File(['{"test_cases":[]}'], 'historical.json', { type: 'application/json' });
+    const fileInput = screen.getByLabelText('Historical test-case file');
+    await user.upload(fileInput, file);
+    fireEvent.submit(fileInput.closest('form')!);
+
+    await waitFor(() => expect(importHistoricalTestCases).toHaveBeenCalledWith('project-1', file));
+    expect(await screen.findByText(/Created 2/)).toBeInTheDocument();
+    expect(screen.getByText(/Queued vectors 2/)).toBeInTheDocument();
   });
 
   it('applies project compliance controls, exports evidence, and calibrates thresholds', async () => {

@@ -44,6 +44,8 @@
 
 ## Phase 5: Integration, scale, and compliance
 - Implemented: Project-scoped Jira Cloud JQL ingestion with paginated issue upserts and vector-index outbox events.
+- Implemented: Idempotent JSON/CSV historical test-case ingestion with immutable version snapshots and vector
+  reconciliation/backfill tooling.
 - Implemented: Project-scoped repository sync queues per-case delivery events and records truthful queued/completed/failed status.
 - Prototype: NLP cleanup, validation, quality scoring, metrics, and monitoring summaries.
 - Prototype: Governance policy storage and operations UI.

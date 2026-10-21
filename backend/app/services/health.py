@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -13,6 +14,7 @@ class DependencyProbe:
     name: str
     status: str
     configured: bool
+    detail: str | None = None
 
 
 async def probe_external_dependencies(
@@ -31,15 +33,7 @@ async def probe_external_dependencies(
             f"{config.llm_base_url.rstrip('/')}/models",
             {"Authorization": f"Bearer {config.llm_api_key}"},
         ),
-        _probe(
-            http,
-            "pinecone",
-            bool(config.pinecone_api_key and config.pinecone_host),
-            "POST",
-            f"{config.pinecone_host.rstrip('/')}/describe_index_stats",
-            {"Api-Key": config.pinecone_api_key, "Content-Type": "application/json"},
-            json={},
-        ),
+        _pinecone_probe(config, http),
         _probe(
             http,
             "jira",
@@ -103,6 +97,107 @@ def _repository_probe(config: Settings, client: httpx.AsyncClient):
         f"{config.test_repository_base_url.rstrip('/')}/health",
         {"Authorization": f"Bearer {config.test_repository_token}"},
     )
+
+
+async def _pinecone_probe(config: Settings, client: httpx.AsyncClient) -> DependencyProbe:
+    configured = bool(config.pinecone_api_key and config.pinecone_host and config.pinecone_index_name)
+    if not configured:
+        return DependencyProbe(name="pinecone", status="not_configured", configured=False)
+    control_url = f"{config.pinecone_control_plane_url.rstrip('/')}/indexes/{config.pinecone_index_name}"
+    base_headers = {"Api-Key": config.pinecone_api_key, "Accept": "application/json"}
+    try:
+        schema_response = await client.get(
+            control_url,
+            headers={**base_headers, "X-Pinecone-API-Version": config.pinecone_api_version},
+        )
+        if not schema_response.is_success:
+            return DependencyProbe(
+                name="pinecone",
+                status="unhealthy",
+                configured=True,
+                detail=f"Index configuration check returned HTTP {schema_response.status_code}",
+            )
+        schema_payload = schema_response.json()
+        if schema_payload.get("schema"):
+            return DependencyProbe(
+                name="pinecone",
+                status="misconfigured",
+                configured=True,
+                detail="Index uses a document schema; a bring-your-own-vectors index is required",
+            )
+
+        index_response = await client.get(
+            control_url,
+            headers={**base_headers, "X-Pinecone-API-Version": "2025-10"},
+        )
+        if not index_response.is_success:
+            return DependencyProbe(
+                name="pinecone",
+                status="unhealthy",
+                configured=True,
+                detail=f"Index description returned HTTP {index_response.status_code}",
+            )
+        index = index_response.json()
+        if index.get("embed"):
+            return DependencyProbe(
+                name="pinecone",
+                status="misconfigured",
+                configured=True,
+                detail="Index has integrated embedding enabled; a bring-your-own-vectors index is required",
+            )
+        if index.get("vector_type") != "dense":
+            return DependencyProbe(
+                name="pinecone",
+                status="misconfigured",
+                configured=True,
+                detail="Index must use dense vectors",
+            )
+        if index.get("dimension") != config.embedding_dimension:
+            return DependencyProbe(
+                name="pinecone",
+                status="misconfigured",
+                configured=True,
+                detail=(
+                    f"Index dimension {index.get('dimension')} does not match configured embedding dimension "
+                    f"{config.embedding_dimension}"
+                ),
+            )
+        configured_host = urlsplit(config.pinecone_host).hostname
+        described_host = urlsplit(f"https://{str(index.get('host') or '').removeprefix('https://')}").hostname
+        if configured_host != described_host:
+            return DependencyProbe(
+                name="pinecone",
+                status="misconfigured",
+                configured=True,
+                detail="PINECONE_HOST does not belong to PINECONE_INDEX_NAME",
+            )
+        if not (index.get("status") or {}).get("ready", False):
+            return DependencyProbe(
+                name="pinecone",
+                status="unhealthy",
+                configured=True,
+                detail="Index is not ready",
+            )
+        stats_response = await client.post(
+            f"{config.pinecone_host.rstrip('/')}/describe_index_stats",
+            headers={"Api-Key": config.pinecone_api_key, "Content-Type": "application/json"},
+            json={},
+        )
+        if not stats_response.is_success:
+            return DependencyProbe(
+                name="pinecone",
+                status="unhealthy",
+                configured=True,
+                detail=f"Index data-plane check returned HTTP {stats_response.status_code}",
+            )
+        return DependencyProbe(name="pinecone", status="healthy", configured=True)
+    except (httpx.HTTPError, ValueError):
+        return DependencyProbe(
+            name="pinecone",
+            status="unreachable",
+            configured=True,
+            detail="Index configuration or data plane could not be reached",
+        )
 
 
 async def _probe(

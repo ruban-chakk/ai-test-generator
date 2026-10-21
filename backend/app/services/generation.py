@@ -191,8 +191,21 @@ class PineconeVectorStore:
                 headers={"Api-Key": self._api_key, "Content-Type": "application/json"},
                 json=payload,
             )
+            if not response.is_success:
+                provider_message = response.text.lower()
+                if response.status_code == 400 and "document schema" in provider_message:
+                    raise GenerationConfigurationError(
+                        "The configured Pinecone index uses a document schema. "
+                        "Create a bring-your-own-vectors index without integrated embedding for this application."
+                    )
+                if response.status_code == 400 and "dimension" in provider_message:
+                    raise GenerationConfigurationError(
+                        "The configured Pinecone index dimension does not match the embedding model output."
+                    )
             response.raise_for_status()
             return response.json() if response.content else {}
+        except GenerationConfigurationError:
+            raise
         except (httpx.HTTPError, ValueError) as exc:
             raise GenerationProviderError("Pinecone request failed") from exc
         finally:
@@ -253,10 +266,11 @@ class GenerationService:
         title: str,
         description: str,
         external_id: str | None,
+        requirement_version: int = 1,
     ) -> GenerationResult:
         source_text = f"Title: {title}\nDescription: {description}"
         embedding = await self._language_model.embed(source_text)
-        vector_id = f"requirement:{requirement_id}"
+        vector_id = f"requirement:{requirement_id}:v{requirement_version}"
         await self._vector_store.upsert(
             vector_id,
             embedding,
@@ -265,6 +279,7 @@ class GenerationService:
                 "requirement_id": requirement_id,
                 "project_id": project_id or "unassigned",
                 "external_id": external_id or "",
+                "version": requirement_version,
                 "text": source_text,
             },
         )
@@ -308,6 +323,7 @@ class GenerationService:
         feedback_text: str,
         target_context: str,
         action: str,
+        requirement_version: int = 1,
     ) -> GenerationResult:
         query_text = (
             f"Requirement title: {title}\nRequirement description: {description}\n"
@@ -335,7 +351,7 @@ class GenerationService:
         draft = await self._language_model.generate(system_prompt, user_prompt)
         return GenerationResult(
             draft=draft,
-            requirement_vector_id=f"requirement:{requirement_id}",
+            requirement_vector_id=f"requirement:{requirement_id}:v{requirement_version}",
             retrieved_context=contexts,
             model=self._language_model.model,
         )

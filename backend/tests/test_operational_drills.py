@@ -44,6 +44,18 @@ def test_recovery_drill_rejects_nonisolated_or_same_target_and_redacts_password(
 
 def test_acceptance_probe_reports_all_configured_dependencies_without_exposing_secrets() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.pinecone.io":
+            if request.headers["X-Pinecone-API-Version"] == "2026-07":
+                return httpx.Response(200, json={"schema": None})
+            return httpx.Response(
+                200,
+                json={
+                    "dimension": 1536,
+                    "vector_type": "dense",
+                    "host": "pinecone.example",
+                    "status": {"ready": True},
+                },
+            )
         return httpx.Response(200, json={})
 
     config = Settings(
