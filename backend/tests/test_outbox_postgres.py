@@ -86,6 +86,11 @@ class RecordingExecutionClient:
 
 async def seed_event(session_factory: async_sessionmaker) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     async with session_factory() as db:
+        # The CI database is shared by PostgreSQL integration tests. Earlier
+        # workflow tests may intentionally leave provider events pending; this
+        # suite owns the queue assertions and must start from an empty queue.
+        await db.execute(delete(OutboxEvent))
+        await db.commit()
         project = Project(name=f"outbox-test-{uuid.uuid4()}", status="active")
         db.add(project)
         await db.flush()
@@ -199,6 +204,8 @@ def test_outbox_worker_indexes_immutable_requirement_version_snapshot() -> None:
         indexer = RecordingIndexer()
         try:
             async with session_factory() as db:
+                await db.execute(delete(OutboxEvent))
+                await db.commit()
                 project = Project(name=f"requirement-version-{uuid.uuid4()}", status="active")
                 db.add(project)
                 await db.flush()
