@@ -8,7 +8,7 @@ This project is an enterprise-grade AI test case generation platform built with:
 - PostgreSQL for structured metadata and audit data
 - Pinecone for embeddings-based retrieval and similarity search
 - LLM provider for embeddings and generation
-- Docker for local development of PostgreSQL and Pinecone
+- Docker for local PostgreSQL and application services; Pinecone is an externally provisioned data-plane service
 
 The architecture is designed for enterprise quality, auditability, and scalability.
 
@@ -29,7 +29,7 @@ The UI exposes a rich card-based experience with collapsible hierarchies, tag ch
 ### 2. Backend API
 
 The Python backend is responsible for:
-- ingesting requirements from Jira folder uploads or manual entry
+- ingesting requirements from Jira Cloud JQL or manual entry
 - storing metadata in PostgreSQL
 - coordinating LLM-driven generation and RAG retrieval
 - writing and updating Pinecone embeddings
@@ -48,6 +48,7 @@ PostgreSQL stores:
 - Approval records and version history
 - User and role information
 - Audit logs and operation metadata
+- Organizations, scoped memberships, invitations, project cost centers, effective AI configuration, and usage cost records
 
 #### Pinecone
 
@@ -66,16 +67,19 @@ The AI pipeline includes:
 - retrieval of closest relevant documents from Pinecone
 - prompt assembly using retrieved context and requirement data
 - generation of test scenarios, cases, and steps
-- embedding and indexing of generated output for future retrieval
+- embedding generated and edited test cases into a current-record Search projection in every workflow state
+- retaining immutable approved-version vectors as the only test-case evidence eligible for generation RAG
 
 The pipeline supports feedback-informed revision by including user feedback and approved test cases as retrieval context.
+Dedicated Search is intentionally broader: it queries current test-case projections across all states and can filter
+them to approved or unapproved records without weakening the generation retrieval boundary.
 
 ### 5. Integrations
 
 The initial enterprise design includes:
-- Jira folder/document ingestion as the first integration point
+- Jira Cloud JQL ingestion through the REST API
 - Test case repository persistence for approved cases
-- Optional future Jira API and enterprise tool integration
+- Xray Cloud, TestRail, and Zephyr Cloud adapters publish immutable approved versions using stable delivery references
 
 ## Data flow
 
@@ -93,7 +97,7 @@ The initial enterprise design includes:
 
 A Docker Compose environment should provision:
 - `postgres` for metadata storage
-- `pinecone` for local vector search (Pinecone local emulator or compatible service)
+- an externally provisioned Pinecone index configured by data-plane host
 - optional backend and frontend services for development
 
 This keeps the enterprise stack reproducible in development and testing.
@@ -106,6 +110,29 @@ Key enterprise capabilities:
 - secure storage and transport for sensitive requirement/test data
 - versioning of approved test cases for traceability
 - feedback traceability from requirement to test case revisions
+- non-inheriting app, organization, and project administrator scopes enforced by API authorization checks
+- secret references instead of raw provider credentials in browser-visible configuration records
+- single-use invitation tokens stored only as SHA-256 hashes and returned only at creation time
+
+## Administration and AI cost
+
+Configuration resolves from project to organization to application scope. A lower scope can override model names,
+vector routing, evaluation weights, and pricing, but it never gains permission to mutate a higher scope. Provider usage
+is persisted with organization, project, actor, operation, model, input/output tokens, the applied rate snapshot,
+pricing source, and calculated micro-dollar cost. Scoped rates override a versioned catalog fallback; unknown models
+remain visibly unpriced. The cost ledger is authoritative for dashboards; browser calculations are presentation-only.
+
+DeepEval feedback links directly to the immutable quality-evaluation record. Revision generation receives the target,
+requirement, linked metric evidence, reviewer instruction, and project RAG context. Regeneration and subsequent
+evaluation remain separate durable commands so a judge outage cannot roll back an already completed revision.
+The browser must explicitly opt in before linking that evaluation; ordinary feedback has no evaluation foreign key and
+the revision prompt receives no DeepEval payload. New generated versions and manual edits atomically enqueue a
+`test_case.quality_evaluation_requested` outbox event. The worker records the source event on the evaluation with a
+unique constraint, making retries idempotent while keeping draft persistence independent of the external judge.
+
+Manual editing uses optimistic version checks and replaces the full ordered step collection in one database transaction.
+An edit resets the mutable case to draft, invalidates its prior approval workflow, and queues evaluation; immutable
+approved `test_case_versions` remain unchanged for audit and repository traceability.
 
 ## Scalability considerations
 
@@ -119,3 +146,11 @@ Key enterprise capabilities:
 - Monitor API latency, queue times, LLM call success, and vector search performance.
 - Alert on failed generation, feedback processing, or indexing operations.
 - Track repository sync success and Pinecone index health.
+### Prompt and configuration governance
+
+Prompt templates are stored as versioned `PromptConfiguration` records with
+application, organization, and project scopes. Runtime resolution is
+project-first, then organization, then application default. Configuration
+mutations are committed with an `AuditLog` row containing actor, timestamp,
+scope, old value, and new value in the same transaction. The resolver is used
+by generation, feedback regeneration, and LLM-as-judge evaluation.

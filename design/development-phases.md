@@ -8,7 +8,7 @@
 - Plan the initial RAG prompt templates, retrieval schema, and feedback semantics.
 
 ## Phase 1: Enterprise foundation
-- Implement secure requirement ingestion from file/Jira folder.
+- Implement secure requirement ingestion from manual entry and Jira Cloud JQL.
 - Build PostgreSQL schema and backend models with enterprise data governance.
 - Add Pinecone integration for embedding storage and retrieval.
 - Create a React UI for requirement review, scenario management, and traceability.
@@ -16,32 +16,47 @@
 - Store generated drafts in the database with status and audit metadata.
 
 ## Phase 2: Review, approval, and governance
-- Completed: Approval/rejection actions at requirement, scenario, and test case levels.
-- Completed: UI controls for approve/reject, version status, guardrail validation, and audit history.
-- Completed: Approved test cases are locked, assigned repository metadata, and prepared for vector indexing with stable vector IDs.
-- Completed: Approved test case version snapshots and approval records are stored for traceability.
-- Completed: Test case repository persistence workflow and change control guardrails are in place.
+- Prototype: Approval/rejection actions at requirement, scenario, and test case levels.
+- Prototype: UI controls for approve/reject, version status, guardrail validation, and audit history.
+- Implemented: Approved test cases are locked and indexed through a retryable transactional outbox.
+- Implemented: Test case version snapshots and approval records are stored for traceability.
+- Implemented: database-backed users, revocable bearer/HttpOnly-cookie sessions, authenticated audit actors,
+  global RBAC, and project membership checks on requirement/test workflow endpoints.
+- Implemented: Project-scoped approved cases are delivered through a credential-driven, idempotent HTTP repository adapter.
+- Implemented: standards-based OIDC federation with signed browser state, nonce validation, domain allowlisting,
+  and least-privilege optional provisioning.
+- Implemented: retry-safe Xray Cloud and TestRail repository adapters in addition to the generic HTTP adapter.
 
 ## Phase 3: Feedback, quality, and traceability
-- Completed: Feedback modal for requirement, scenario, and test case comments.
-- Completed: Feedback is stored in PostgreSQL with stable vector IDs for later retrieval embedding.
-- Completed: Revision pipeline processes feedback context into traceable revision records.
-- Completed: Feedback actions support generating new cases, revising existing content, and deprecating outdated cases.
-- Completed: Feedback history, resolution state, revision trace, and audit trail are captured for continuous improvement.
-- Completed: Quality evaluation metrics and guardrail scores are stored for generated and reviewed content.
+- Prototype: Feedback modal and PostgreSQL persistence at requirement, scenario, and test case levels.
+- Implemented: approved-case and feedback embedding/indexing through an idempotent transactional outbox worker.
+- Implemented: Feedback-informed regeneration retrieves project-scoped vector context and produces schema-validated drafts.
+- Prototype: Revision records and actions for new, revised, and deprecated cases.
+- Implemented: Feedback history, resolution state, revision trace, and audit records.
+- Prototype: Rule-based quality evaluation metrics and guardrail scores.
 
 ## Phase 4: Impact analysis and enterprise risk
-- Completed: Similarity search across existing approved repository test cases.
-- Completed: Duplicate threshold is defined at 80% and candidate duplicates are identified.
-- Completed: Deprecation and update recommendation logic with policy actions.
-- Completed: Impact analysis results are surfaced in the requirement detail UI.
-- Completed: New requirements are automatically compared against approved repository content.
-- Completed: Risk and coverage insights are available for enterprise stakeholders.
+- Implemented: project-scoped embedding similarity search and the 80% duplicate threshold.
+- Prototype: Heuristic deprecation/update recommendations and risk/coverage scores.
+- Implemented: Impact analysis results are surfaced in the requirement detail UI.
+- Implemented: project-scoped labeled threshold calibration with reproducible metrics, explicit application, and
+  retained aggregate evidence. Deprecation decisions remain human-approved.
 
 ## Phase 5: Integration, scale, and compliance
-- Completed: Jira import automation and test repository sync workflow.
-- Completed: NLP cleanup and validation for messy requirement text.
-- Completed: Automated quality evaluation suite for generated and reviewed content.
-- Completed: Analytics, audit logging, operational metrics, and monitoring summary.
-- Completed: Security, compliance, and enterprise governance policy controls.
-- Completed: Operations UI for integrations, sync, cleanup, evals, monitoring, and policies.
+- Implemented: Project-scoped Jira Cloud JQL ingestion with paginated issue upserts and vector-index outbox events.
+- Implemented: Idempotent JSON/CSV historical test-case ingestion with immutable version snapshots and vector
+  reconciliation/backfill tooling.
+- Implemented: Project-scoped repository sync queues per-case delivery events and records truthful queued/completed/failed status.
+- Prototype: NLP cleanup, validation, quality scoring, metrics, and monitoring summaries.
+- Prototype: Governance policy storage and operations UI.
+- Implemented: real dependency probes, liveness/readiness endpoints, outbox inspection, and admin retry controls.
+- Implemented: bounded file ingestion, project-scoped semantic search, component tests, and a browser critical path.
+- Implemented: project-scoped automated execution of approved immutable test-case versions through a retryable,
+  credential-driven runner contract, with durable run history and UI controls.
+- Implemented: deduplicated PostgreSQL alerts for failed execution and exhausted delivery, retry-safe webhook
+  routing, operations visibility, and audited acknowledgement.
+- Implemented: atomic PostgreSQL-backed limits shared across API replicas for authenticated and authentication
+  traffic, with hashed bucket subjects and standard retry guidance.
+- Implemented: tenant-specific compliance controls/exports, semantic calibration, expanded browser coverage,
+  bounded load testing, and guarded backup/restore recovery exercises.
+- Deployment gate: validate configured providers against each target enterprise tenant.

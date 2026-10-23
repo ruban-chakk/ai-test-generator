@@ -2,10 +2,12 @@ fastapi
 uvicorn[standard]
 sqlalchemy[asyncio]>=2.0
 asyncpg
+psycopg[binary]>=3.2,<4
 alembic
 python-dotenv
-pydantic<2
-pydantic-core<2
-pinecone-client
+pydantic>=2.11,<3
+pydantic-settings>=2.7,<3
+PyJWT[crypto]>=2.10,<3
+pwdlib[argon2]>=0.3,<1
 httpx
 python-multipart

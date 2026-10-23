@@ -1,0 +1,253 @@
+import asyncio
+
+import httpx
+import pytest
+
+from app.core.config import Settings
+from app.services.generation import (
+    GeneratedDraft,
+    GeneratedScenario,
+    GeneratedStep,
+    GeneratedTestCase,
+    GenerationConfigurationError,
+    GenerationService,
+    PineconeVectorStore,
+    RetrievedContext,
+    build_generation_service,
+    rerank_generation_contexts,
+    _strict_json_schema,
+)
+
+
+class FakeLanguageModel:
+    model = "test-model"
+
+    def __init__(self) -> None:
+        self.generated_prompts: list[tuple[str, str]] = []
+
+    async def embed(self, text: str) -> list[float]:
+        assert "Password reset" in text
+        return [0.1, 0.2, 0.3]
+
+    async def generate(self, system_prompt: str, user_prompt: str) -> GeneratedDraft:
+        self.generated_prompts.append((system_prompt, user_prompt))
+        return GeneratedDraft(
+            scenarios=[
+                GeneratedScenario(
+                    title="Reset an active account password",
+                    description="Validate the supported password reset workflow.",
+                    priority="high",
+                    severity="major",
+                    category="functional",
+                    type="regression",
+                    test_cases=[
+                        GeneratedTestCase(
+                            title="Reset with a valid one-time link",
+                            description="A user resets a password with an unexpired link.",
+                            prerequisite="An active account and reset link exist.",
+                            priority="high",
+                            severity="major",
+                            category="functional",
+                            type="positive",
+                            steps=[
+                                GeneratedStep(
+                                    step_number=1,
+                                    action="Open the unexpired password reset link.",
+                                    expected_result="The password reset form is displayed.",
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ]
+        )
+
+
+class FakeVectorStore:
+    def __init__(self) -> None:
+        self.upserts: list[tuple[str, list[float], dict]] = []
+
+    async def upsert(self, vector_id: str, values: list[float], metadata: dict) -> None:
+        self.upserts.append((vector_id, values, metadata))
+
+    async def query(
+        self,
+        values: list[float],
+        *,
+        top_k: int,
+        project_id: str | None,
+    ) -> list[RetrievedContext]:
+        assert values == [0.1, 0.2, 0.3]
+        assert top_k == 40
+        assert project_id == "project-1"
+        return [
+            RetrievedContext(
+                id="test-case:historical-1",
+                score=0.91,
+                text="Approved reset-link expiry coverage",
+                metadata={"entity_type": "test_case", "status": "approved"},
+            ),
+            RetrievedContext(
+                id="test-case:draft-1",
+                score=0.99,
+                text="Draft evidence must never enter the generation prompt",
+                metadata={"entity_type": "test_case", "status": "draft"},
+            )
+        ]
+
+
+def test_generation_service_embeds_retrieves_and_generates_structured_draft() -> None:
+    language_model = FakeLanguageModel()
+    vector_store = FakeVectorStore()
+    service = GenerationService(language_model, vector_store)
+
+    result = asyncio.run(
+        service.generate(
+            requirement_id="requirement-1",
+            project_id="project-1",
+            title="Password reset",
+            description="A user must be able to reset a forgotten password.",
+            external_id="AUTH-42",
+        )
+    )
+
+    assert result.requirement_vector_id == "requirement:requirement-1:v1"
+    assert result.model == "test-model"
+    assert result.draft.scenarios[0].test_cases[0].steps[0].step_number == 1
+    assert vector_store.upserts == []
+    system_prompt, user_prompt = language_model.generated_prompts[0]
+    assert "untrusted data" in system_prompt
+    assert "Approved reset-link expiry coverage" in user_prompt
+    assert "Draft evidence must never enter the generation prompt" not in user_prompt
+
+
+def test_generated_test_case_rejects_non_contiguous_steps() -> None:
+    with pytest.raises(ValueError, match="contiguous"):
+        GeneratedTestCase(
+            title="Validate reset link",
+            description="Validate the reset link behavior.",
+            priority="high",
+            severity="major",
+            category="functional",
+            type="negative",
+            steps=[
+                GeneratedStep(
+                    step_number=2,
+                    action="Open an expired password reset link.",
+                    expected_result="The link is rejected as expired.",
+                )
+            ],
+        )
+
+
+def test_structured_output_schema_is_strict_for_every_nested_object() -> None:
+    schema = _strict_json_schema(GeneratedDraft.model_json_schema())
+
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["scenarios"]
+    for definition in schema["$defs"].values():
+        assert definition["additionalProperties"] is False
+        assert set(definition["required"]) == set(definition["properties"])
+
+
+def test_generation_contexts_fuse_keyword_evidence_and_collapse_chunks() -> None:
+    semantic = [
+        RetrievedContext(
+            id="test_case:1:v2",
+            score=0.80,
+            text="Reset link validation overview.",
+            metadata={
+                "entity_type": "test_case",
+                "entity_id": "case-1",
+                "parent_vector_id": "test_case:1:v2",
+            },
+        ),
+        RetrievedContext(
+            id="test_case:1:v2:chunk:1",
+            score=0.78,
+            text="Expired links are rejected and an audit event is recorded.",
+            metadata={
+                "entity_type": "test_case",
+                "entity_id": "case-1",
+                "parent_vector_id": "test_case:1:v2",
+            },
+        ),
+    ]
+    keyword = [
+        RetrievedContext(
+            id="test_case:1:v2",
+            score=0.90,
+            text="Expired links are rejected and an audit event is recorded.",
+            metadata={"entity_type": "test_case", "entity_id": "case-1"},
+        )
+    ]
+
+    results = rerank_generation_contexts("expired link audit", semantic, keyword, limit=8)
+
+    assert len(results) == 1
+    assert results[0].id == "test_case:1:v2"
+    assert results[0].metadata["retrieval_mode"] == "hybrid"
+    assert len(results[0].metadata["matched_chunk_ids"]) == 2
+    assert "audit event" in results[0].text
+
+
+def test_feedback_generation_retrieves_context_without_overwriting_requirement_vector() -> None:
+    language_model = FakeLanguageModel()
+    vector_store = FakeVectorStore()
+    service = GenerationService(language_model, vector_store)
+
+    result = asyncio.run(
+        service.generate_from_feedback(
+            requirement_id="requirement-1",
+            project_id="project-1",
+            title="Password reset",
+            description="A user must be able to reset a forgotten password.",
+            external_id="AUTH-42",
+            feedback_text="Add an expired-link boundary case.",
+            target_context="Existing happy-path reset case.",
+            action="revise",
+        )
+    )
+
+    assert result.requirement_vector_id == "requirement:requirement-1:v1"
+    assert vector_store.upserts == []
+    system_prompt, user_prompt = language_model.generated_prompts[0]
+    assert "untrusted data" in system_prompt
+    assert "Add an expired-link boundary case." in user_prompt
+    assert "Approved reset-link expiry coverage" in user_prompt
+
+
+def test_generation_service_fails_closed_without_provider_credentials() -> None:
+    config = Settings(
+        _env_file=None,
+        llm_api_key="",
+        pinecone_api_key="",
+        pinecone_host="",
+    )
+
+    with pytest.raises(GenerationConfigurationError, match="LLM_API_KEY"):
+        build_generation_service(config)
+
+
+def test_pinecone_document_schema_error_has_actionable_configuration_guidance() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            400,
+            json={
+                "message": "This index has a document schema, so writes must go through the documents API."
+            },
+        )
+    )
+
+    async def scenario() -> None:
+        config = Settings(
+            _env_file=None,
+            pinecone_api_key="pinecone-secret",
+            pinecone_host="https://pinecone.example",
+        )
+        async with httpx.AsyncClient(transport=transport) as client:
+            store = PineconeVectorStore(config, client)
+            await store.upsert("requirement:1", [0.1, 0.2], {"text": "Requirement"})
+
+    with pytest.raises(GenerationConfigurationError, match="bring-your-own-vectors"):
+        asyncio.run(scenario())

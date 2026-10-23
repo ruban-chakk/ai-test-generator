@@ -1,9 +1,8 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   approveRequirement,
   approveScenario,
-  approveTestCase,
   createFeedback,
   createScenarioForRequirement,
   createTestCaseForScenario,
@@ -13,15 +12,17 @@ import {
   getAudit,
   getApprovals,
   getFeedback,
+  getImpactAnalyses,
   getQualityEvaluations,
   getRevisions,
   getRequirementImpact,
+  getScenarioImpact,
+  getTestCaseImpact,
   getTestCaseVersions,
   generateRequirementDraft,
   getRequirement,
   rejectRequirement,
   rejectScenario,
-  rejectTestCase,
   ApprovalRecordSummary,
   AuditLogSummary,
   FeedbackSummary,
@@ -35,6 +36,20 @@ import {
   processFeedbackRevision,
   validateTarget,
 } from '../api';
+
+function CustomFields({ fields }: { fields?: Record<string, unknown> }) {
+  if (!fields || !Object.keys(fields).length) return null;
+  return (
+    <dl className="detail-list" aria-label="Custom fields">
+      {Object.entries(fields).map(([name, value]) => (
+        <div className="detail-row" key={name}>
+          <dt>{name.replace(/_/g, ' ')}</dt>
+          <dd>{typeof value === 'string' ? value : JSON.stringify(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
 
 const defaultScenarioValues = {
   title: '',
@@ -62,6 +77,7 @@ export default function RequirementDetailPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   const [scenarioForm, setScenarioForm] = useState(defaultScenarioValues);
   const [scenarioSaving, setScenarioSaving] = useState(false);
@@ -79,6 +95,7 @@ export default function RequirementDetailPage() {
   const [feedbackComment, setFeedbackComment] = useState('');
   const [feedbackCreatedBy, setFeedbackCreatedBy] = useState('system');
   const [feedbackSaving, setFeedbackSaving] = useState(false);
+  const [feedbackIncludeEvaluation, setFeedbackIncludeEvaluation] = useState(false);
   const [feedbackModalOpen, setFeedbackModalOpen] = useState(false);
   const [feedbackList, setFeedbackList] = useState<FeedbackSummary[]>([]);
   const [approvalRecords, setApprovalRecords] = useState<ApprovalRecordSummary[]>([]);
@@ -87,6 +104,7 @@ export default function RequirementDetailPage() {
   const [revisionRecords, setRevisionRecords] = useState<RevisionRecordSummary[]>([]);
   const [qualityRecords, setQualityRecords] = useState<QualityEvaluationSummary[]>([]);
   const [impactAnalysis, setImpactAnalysis] = useState<ImpactAnalysisSummary | null>(null);
+  const [impactTarget, setImpactTarget] = useState<{ level: 'requirement' | 'scenario' | 'test_case'; id: string } | null>(null);
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
   const [validationSaving, setValidationSaving] = useState(false);
   const [revisionSaving, setRevisionSaving] = useState<string | null>(null);
@@ -109,7 +127,18 @@ export default function RequirementDetailPage() {
         const data = await getRequirement(requirementId);
         setRequirement(data);
         setFeedbackTarget({ level: 'requirement', id: requirementId });
-        await refreshHistory(requirementId, 'requirement');
+        setLoading(false);
+        void refreshHistory(requirementId, 'requirement');
+        void getImpactAnalyses(requirementId, 'requirement').then((analyses) => {
+          const latest = analyses[0];
+          if (latest) {
+            setImpactAnalysis(latest);
+            setImpactTarget({ level: latest.target_level, id: latest.target_id || requirementId });
+          }
+        }).catch(() => {
+          // Impact history is supplementary; keep the requirement page usable
+          // when an older installation has no impact records yet.
+        });
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unable to load requirement');
       } finally {
@@ -140,7 +169,7 @@ export default function RequirementDetailPage() {
     targetLevel: 'requirement' | 'scenario' | 'test_case',
   ) => {
     try {
-      setError(null);
+      setHistoryError(null);
       const [feedbackData, approvalsData, auditData, versionData, revisionsData, qualityData] = await Promise.all([
         getFeedback(targetLevel, targetId),
         getApprovals(targetLevel, targetId),
@@ -156,7 +185,7 @@ export default function RequirementDetailPage() {
       setRevisionRecords(revisionsData);
       setQualityRecords(qualityData);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to load review history');
+      setHistoryError(err instanceof Error ? err.message : 'Unable to load review history');
     }
   };
 
@@ -166,6 +195,7 @@ export default function RequirementDetailPage() {
     openModal = false,
   ) => {
     setFeedbackTarget({ level, id: targetId });
+    setFeedbackIncludeEvaluation(false);
     setValidationResult(null);
     if (openModal) setFeedbackModalOpen(true);
     refreshHistory(targetId, level);
@@ -189,8 +219,9 @@ export default function RequirementDetailPage() {
     }
   };
 
-  const handleEvaluateQuality = async () => {
-    if (!feedbackTarget) {
+  const handleEvaluateQuality = async (targetOverride?: { level: 'requirement' | 'scenario' | 'test_case'; id: string }) => {
+    const target = targetOverride ?? feedbackTarget;
+    if (!target) {
       setError('Select a review target first');
       return;
     }
@@ -198,8 +229,9 @@ export default function RequirementDetailPage() {
     try {
       setQualitySaving(true);
       setError(null);
-      await evaluateQuality(feedbackTarget.level, feedbackTarget.id);
-      await refreshHistory(feedbackTarget.id, feedbackTarget.level);
+      await evaluateQuality(target.level, target.id);
+      setFeedbackTarget(target);
+      await refreshHistory(target.id, target.level);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to evaluate quality');
     } finally {
@@ -207,8 +239,10 @@ export default function RequirementDetailPage() {
     }
   };
 
-  const handleRunImpactAnalysis = async () => {
-    if (!id) {
+  const handleRunImpactAnalysis = async (
+    target: { level: 'requirement' | 'scenario' | 'test_case'; id: string } = { level: 'requirement', id: id ?? '' },
+  ) => {
+    if (!target.id) {
       setError('Requirement ID is missing');
       return;
     }
@@ -216,9 +250,14 @@ export default function RequirementDetailPage() {
     try {
       setImpactSaving(true);
       setError(null);
-      const result = await getRequirementImpact(id);
+      const result = target.level === 'requirement'
+        ? await getRequirementImpact(target.id)
+        : target.level === 'scenario'
+          ? await getScenarioImpact(target.id)
+          : await getTestCaseImpact(target.id);
       setImpactAnalysis(result);
-      await refreshHistory(id, 'requirement');
+      setImpactTarget(target);
+      await refreshHistory(target.id, target.level);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to run impact analysis');
     } finally {
@@ -242,9 +281,8 @@ export default function RequirementDetailPage() {
         });
       }
       await refreshRequirement();
-      if (id) {
-        const result = await getRequirementImpact(id);
-        setImpactAnalysis(result);
+      if (impactTarget) {
+        await handleRunImpactAnalysis(impactTarget);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to apply impact action');
@@ -266,12 +304,14 @@ export default function RequirementDetailPage() {
       await createFeedback({
         target_level: feedbackTarget.level,
         target_id: feedbackTarget.id,
-        source: 'user',
+        source: feedbackIncludeEvaluation ? 'deepeval-review' : 'user',
         feedback_type: feedbackType,
         comment: feedbackComment,
         created_by: feedbackCreatedBy,
+        quality_evaluation_id: feedbackIncludeEvaluation ? qualityRecords[0]?.id : undefined,
       });
       setFeedbackComment('');
+      setFeedbackIncludeEvaluation(false);
       setFeedbackModalOpen(false);
       await refreshHistory(feedbackTarget.id, feedbackTarget.level);
     } catch (err) {
@@ -357,25 +397,6 @@ export default function RequirementDetailPage() {
       await refreshHistory(scenarioId, 'scenario');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to update scenario');
-    } finally {
-      setActionSaving(false);
-    }
-  };
-
-  const handleTestCaseApproval = async (testCaseId: string, action: 'approve' | 'reject') => {
-    try {
-      setActionSaving(true);
-      setError(null);
-      if (action === 'approve') {
-        await approveTestCase(testCaseId, { approved_by: 'system' });
-      } else {
-        await rejectTestCase(testCaseId, { approved_by: 'system' });
-      }
-      setFeedbackTarget({ level: 'test_case', id: testCaseId });
-      await refreshRequirement();
-      await refreshHistory(testCaseId, 'test_case');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to update test case');
     } finally {
       setActionSaving(false);
     }
@@ -495,6 +516,10 @@ export default function RequirementDetailPage() {
     </div>
   );
 
+  const linkedTestCases = requirement?.scenarios?.flatMap((scenario) =>
+    (scenario.test_cases ?? []).map((testCase) => ({ ...testCase, scenarioTitle: scenario.title, scenarioId: scenario.id })),
+  ) ?? [];
+
   return (
     <main className="page-container">
       <header className="page-header">
@@ -558,24 +583,41 @@ export default function RequirementDetailPage() {
               >
                 Reject Requirement
               </button>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => handleEvaluateQuality({ level: 'requirement', id: requirement.id })}
+                disabled={qualitySaving}
+              >
+                {qualitySaving ? 'Evaluating…' : 'Run suite evaluation'}
+              </button>
             </div>
           </div>
 
           <article className="detail-card">
             <h2>Description</h2>
             <p>{requirement.description}</p>
+            <CustomFields fields={requirement.metadata_json?.custom_fields as Record<string, unknown> | undefined} />
+          </article>
+
+          <article className="detail-card linked-tests-panel">
+            <div className="section-heading">
+              <div><h2>Linked test cases</h2><p>{linkedTestCases.length} test case{linkedTestCases.length === 1 ? '' : 's'} across {requirement.scenarios?.length ?? 0} scenarios.</p></div>
+              <Link className="primary-button" to={`/requirements/${requirement.id}/test-cases`}>Review all tests</Link>
+            </div>
+            {linkedTestCases.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>Test case</th><th>Scenario</th><th>Source</th><th>Status</th><th>Version</th><th>Impact</th></tr></thead><tbody>{linkedTestCases.map((testCase) => <tr key={testCase.id}><td><Link className="table-primary-link" to={`/requirements/${requirement.id}/test-cases?case=${testCase.id}`}>{testCase.title}</Link><span className="table-description">{testCase.external_id ?? testCase.id}</span></td><td><div className="impact-inline-cell"><span>{testCase.scenarioTitle}</span><button className="text-button" type="button" onClick={() => handleRunImpactAnalysis({ level: 'scenario', id: testCase.scenarioId })}>Analyze scenario</button></div></td><td><span className="chip">{testCase.source ?? 'generated'}</span></td><td><span className={`status-pill status-${testCase.status}`}>{testCase.status}</span></td><td>v{testCase.version}</td><td><button className="text-button" type="button" onClick={() => handleRunImpactAnalysis({ level: 'test_case', id: testCase.id })}>Analyze case</button></td></tr>)}</tbody></table></div> : <div className="empty-state compact-empty"><h3>No linked test cases</h3><p>Generate a draft or add a test case to a scenario.</p></div>}
           </article>
 
           <article className="detail-card impact-panel">
             <div className="impact-heading">
               <div>
-                <h2>Impact analysis</h2>
-                <p className="case-meta">Compares this requirement against approved repository test cases.</p>
+                <h2>Impact analysis{impactTarget ? ` · ${impactTarget.level.replace('_', ' ')}` : ''}</h2>
+                <p className="case-meta">Checks approved cases for duplicates, deprecations, and required updates.</p>
               </div>
               <button
                 className="primary-button"
                 type="button"
-                onClick={handleRunImpactAnalysis}
+                onClick={() => handleRunImpactAnalysis({ level: 'requirement', id: requirement.id })}
                 disabled={impactSaving}
               >
                 {impactSaving ? 'Analyzing...' : 'Run impact'}
@@ -620,6 +662,11 @@ export default function RequirementDetailPage() {
 
           <article className="detail-card">
             <h2>Review history</h2>
+            {historyError ? (
+              <div className="status-message status-warning">
+                Review history is unavailable: {historyError}
+              </div>
+            ) : null}
             <div className="governance-strip">
               <div>
                 <span className="detail-label">Selected target</span>
@@ -640,7 +687,7 @@ export default function RequirementDetailPage() {
               <button
                 className="secondary-button"
                 type="button"
-                onClick={handleEvaluateQuality}
+                onClick={() => handleEvaluateQuality()}
                 disabled={qualitySaving}
               >
                 {qualitySaving ? 'Scoring...' : 'Evaluate quality'}
@@ -844,7 +891,7 @@ export default function RequirementDetailPage() {
             </form>
           </article>
 
-          <article className="detail-card">
+          <article className="detail-card" id="test-cases">
             <h2>Scenarios</h2>
             {requirement.scenarios?.length ? (
               requirement.scenarios.map((scenario) => (
@@ -877,6 +924,14 @@ export default function RequirementDetailPage() {
                         onClick={() => handleSelectFeedbackTarget('scenario', scenario.id, true)}
                       >
                         Add Feedback
+                      </button>
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        onClick={() => handleEvaluateQuality({ level: 'scenario', id: scenario.id })}
+                        disabled={qualitySaving}
+                      >
+                        {qualitySaving ? 'Evaluating…' : 'Run scenario evaluation'}
                       </button>
                       <button
                         className="secondary-button"
@@ -931,55 +986,88 @@ export default function RequirementDetailPage() {
                   )}
 
                   {scenario.test_cases?.length ? (
-                    <div className="case-list">
-                      {scenario.test_cases.map((testCase) => (
-                        <div key={testCase.id} className="case-card">
-                          <div className="case-card-header">
-                            <h4>{testCase.title}</h4>
-                            <div className="case-actions">
-                              <button
-                                className="secondary-button"
-                                type="button"
-                                onClick={() => handleTestCaseApproval(testCase.id, 'approve')}
-                                disabled={actionSaving}
-                              >
-                                Approve
-                              </button>
-                              <button
-                                className="secondary-button"
-                                type="button"
-                                onClick={() => handleTestCaseApproval(testCase.id, 'reject')}
-                                disabled={actionSaving}
-                              >
-                                Reject
-                              </button>
-                              <button
-                                className="secondary-button"
-                                type="button"
-                                onClick={() => handleSelectFeedbackTarget('test_case', testCase.id, true)}
-                              >
-                                Add Feedback
-                              </button>
-                            </div>
-                          </div>
-                          <p>{testCase.description}</p>
-                          <p className="case-meta">
-                            {testCase.type} · {testCase.severity} · {testCase.status} · v{testCase.version} ·{' '}
-                            {testCase.locked ? 'locked' : 'editable'} · {testCase.repository_status}
-                          </p>
-                          {testCase.repository_synced_at ? (
-                            <p className="case-meta">
-                              Repository sync: {new Date(testCase.repository_synced_at).toLocaleString()}
-                            </p>
-                          ) : null}
-                          {testCase.steps?.map((step) => (
-                            <div key={step.step_number} className="case-step">
-                              <strong>Step {step.step_number}:</strong> {step.action}
-                              <div className="expected-result">Expected: {step.expected_result}</div>
-                            </div>
+                    <div className="table-scroll case-table-wrap">
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Test Case</th>
+                            <th scope="col">Type</th>
+                            <th scope="col">Severity</th>
+                            <th scope="col">Status</th>
+                            <th scope="col">Repository</th>
+                            <th scope="col">Steps</th>
+                            <th scope="col" className="actions-column">
+                              Action
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scenario.test_cases.map((testCase) => (
+                            <tr key={testCase.id}>
+                              <td>
+                                <strong>{testCase.title}</strong>
+                                <span className="table-description">{testCase.description}</span>
+                                {testCase.prerequisite ? (
+                                  <span className="table-description">Prerequisite: {testCase.prerequisite}</span>
+                                ) : null}
+                                <CustomFields fields={testCase.custom_fields_json} />
+                              </td>
+                              <td>{testCase.type ?? '—'}</td>
+                              <td>{testCase.severity ?? '—'}</td>
+                              <td>
+                                <span className="status-pill">{testCase.status}</span>
+                                <span className="table-description">
+                                  v{testCase.version} · {testCase.locked ? 'locked' : 'editable'}
+                                </span>
+                              </td>
+                              <td>
+                                {testCase.repository_status}
+                                {testCase.repository_synced_at ? (
+                                  <span className="table-description">
+                                    Synced {new Date(testCase.repository_synced_at).toLocaleString()}
+                                  </span>
+                                ) : null}
+                              </td>
+                              <td>
+                                {testCase.steps?.length ? (
+                                  <ol className="step-list">
+                                    {testCase.steps.map((step) => (
+                                      <li key={step.step_number}>
+                                        <strong>{step.action}</strong>
+                                        <span>{step.expected_result}</span>
+                                      </li>
+                                    ))}
+                                  </ol>
+                                ) : (
+                                  '—'
+                                )}
+                              </td>
+                              <td>
+                                <div className="table-actions">
+                                  <Link className="secondary-button" to={`/requirements/${requirement.id}/test-cases`}>
+                                    Evaluate &amp; approve
+                                  </Link>
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => handleEvaluateQuality({ level: 'test_case', id: testCase.id })}
+                                    disabled={qualitySaving}
+                                  >
+                                    {qualitySaving ? 'Evaluating…' : 'Run evaluation'}
+                                  </button>
+                                  <button
+                                    className="secondary-button"
+                                    type="button"
+                                    onClick={() => handleSelectFeedbackTarget('test_case', testCase.id, true)}
+                                  >
+                                    Add Feedback
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
                           ))}
-                        </div>
-                      ))}
+                        </tbody>
+                      </table>
                     </div>
                   ) : (
                     <p>No test cases created yet for this scenario.</p>
@@ -1032,6 +1120,17 @@ export default function RequirementDetailPage() {
                   onChange={(event) => setFeedbackCreatedBy(event.target.value)}
                   required
                 />
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={feedbackIncludeEvaluation}
+                  disabled={!qualityRecords[0]}
+                  onChange={(event) => setFeedbackIncludeEvaluation(event.target.checked)}
+                />
+                <span>Include evaluation data with this feedback
+                  <small>{qualityRecords[0] ? ' The latest score, metric evidence, and issues will be sent to the LLM.' : ' Run evaluation first to enable this option.'}</small>
+                </span>
               </label>
               <div className="detail-actions">
                 <button className="primary-button" type="submit" disabled={feedbackSaving}>

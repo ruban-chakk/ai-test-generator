@@ -9,6 +9,7 @@
 - `description`
 - `source` (`jira` / `upload` / `manual`)
 - `status` (`draft` / `generated` / `reviewed` / `archived`)
+- `version`
 - `created_at`
 - `updated_at`
 - `vector_id`
@@ -16,6 +17,7 @@
 ### TestScenario
 - `id` (uuid)
 - `requirement_id` (fk -> Requirement.id)
+- `external_id` (optional historical repository identity)
 - `title`
 - `description`
 - `priority` (`low` / `medium` / `high` / `critical`)
@@ -32,6 +34,8 @@
 - `id` (uuid)
 - `scenario_id` (fk -> TestScenario.id)
 - `requirement_id` (fk -> Requirement.id)
+- `external_id` (optional historical repository identity)
+- `source` (`generated` / `historical_import`)
 - `title`
 - `description`
 - `prerequisite`
@@ -76,6 +80,20 @@
 - `status`
 - `notes`
 
+### ImportMappingProfile
+- `id` (uuid)
+- `project_id` (fk -> Project.id)
+- `name`
+- `entity_type` (`requirement` / `test_case`)
+- `configuration` (validated JSON mapping, transforms, custom fields, and import policies)
+- `active`
+- `created_by`
+- `created_at`
+- `updated_at`
+
+Company-specific requirement fields are stored under `Requirement.metadata.custom_fields`. Company-specific test-case
+fields are stored in `TestCase.custom_fields` and copied into every immutable `TestCaseVersion` snapshot.
+
 ## Relationships
 
 - Requirement 1..* TestScenario
@@ -93,5 +111,8 @@
 ## Versioning rules
 
 - Every approved test case increments version.
+- Every Jira requirement content change increments version and preserves an immutable requirement snapshot.
 - Revisions create a new version while preserving older versions.
 - Deprecated cases remain available for audit but are excluded from active generation.
+- Every immutable test-case version has its own stable `test_case:<id>:v<version>` vector ID and is indexed from
+  the stored snapshot rather than the mutable current row.

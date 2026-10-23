@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   postgres:
     image: postgres:15
@@ -9,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ai_test_gen_pass
       POSTGRES_DB: ai_test_gen
     ports:
-      - '5432:5432'
+      - '${POSTGRES_PORT:-5433}:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -17,19 +15,17 @@ services:
       interval: 10s
       retries: 5
 
-  pinecone:
-    image: pinecone/pinecone:latest
-    container_name: ai-testgen-pinecone
+  migrate:
+    build:
+      context: ./backend
+    container_name: ai-testgen-migrate
+    command: ["alembic", "upgrade", "head"]
     environment:
-      PINECONE_API_KEY: ${PINECONE_API_KEY}
-      PINECONE_ENV: ${PINECONE_ENV}
-    ports:
-      - '8260:8260'
-      - '443:443'
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8260/health || exit 1"]
-      interval: 10s
-      retries: 5
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   backend:
     build:
@@ -37,13 +33,233 @@ services:
     container_name: ai-testgen-backend
     environment:
       - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
-      - PINECONE_API_KEY=${PINECONE_API_KEY}
-      - PINECONE_ENV=${PINECONE_ENV}
+      - AUTH_JWT_SECRET=${AUTH_JWT_SECRET:-}
+      - AUTH_ALLOWED_ORIGINS=${AUTH_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
+      - EVAL_LLM_ENABLED=${EVAL_LLM_ENABLED:-false}
+      - EVAL_LLM_MODEL=${EVAL_LLM_MODEL:-}
+      - EVAL_PASS_SCORE=${EVAL_PASS_SCORE:-80}
+      - EVAL_REQUIRE_CITATIONS=${EVAL_REQUIRE_CITATIONS:-true}
+      - EVAL_RUBRIC_VERSION=${EVAL_RUBRIC_VERSION:-test-case-v2}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-1536}
+      - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-ai-testgen-embeddings}
+      - PINECONE_HOST=${PINECONE_HOST:-}
+      - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
+      - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
+      - PINECONE_API_VERSION=${PINECONE_API_VERSION:-2026-07}
+      - VECTOR_MAINTENANCE_INTERVAL_SECONDS=${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
+      - VECTOR_MAINTENANCE_REPAIR_MISSING=${VECTOR_MAINTENANCE_REPAIR_MISSING:-true}
+      - VECTOR_MAINTENANCE_DELETE_ORPHANS=${VECTOR_MAINTENANCE_DELETE_ORPHANS:-false}
+      - VECTOR_CHUNKING_ENABLED=${VECTOR_CHUNKING_ENABLED:-true}
+      - VECTOR_CHUNK_TARGET_TOKENS=${VECTOR_CHUNK_TARGET_TOKENS:-700}
+      - VECTOR_CHUNK_MAX_TOKENS=${VECTOR_CHUNK_MAX_TOKENS:-1000}
+      - VECTOR_CHUNK_OVERLAP_TOKENS=${VECTOR_CHUNK_OVERLAP_TOKENS:-80}
+      - RAG_CANDIDATE_LIMIT=${RAG_CANDIDATE_LIMIT:-40}
+      - RAG_CONTEXT_LIMIT=${RAG_CONTEXT_LIMIT:-8}
+      - RAG_SEMANTIC_WEIGHT=${RAG_SEMANTIC_WEIGHT:-0.65}
+      - RAG_KEYWORD_WEIGHT=${RAG_KEYWORD_WEIGHT:-0.25}
+      - RAG_SOURCE_WEIGHT=${RAG_SOURCE_WEIGHT:-0.10}
+      - JIRA_BASE_URL=${JIRA_BASE_URL:-}
+      - JIRA_EMAIL=${JIRA_EMAIL:-}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+      - JIRA_TIMEOUT_SECONDS=${JIRA_TIMEOUT_SECONDS:-30}
+      - TEST_REPOSITORY_BASE_URL=${TEST_REPOSITORY_BASE_URL:-}
+      - TEST_REPOSITORY_TOKEN=${TEST_REPOSITORY_TOKEN:-}
+      - TEST_REPOSITORY_PROVIDER=${TEST_REPOSITORY_PROVIDER:-generic}
+      - XRAY_CLIENT_ID=${XRAY_CLIENT_ID:-}
+      - XRAY_CLIENT_SECRET=${XRAY_CLIENT_SECRET:-}
+      - TESTRAIL_USERNAME=${TESTRAIL_USERNAME:-}
+      - TESTRAIL_API_KEY=${TESTRAIL_API_KEY:-}
+      - TESTRAIL_PROJECT_ID=${TESTRAIL_PROJECT_ID:-}
+      - TESTRAIL_SECTION_ID=${TESTRAIL_SECTION_ID:-}
+      - TESTRAIL_SUITE_ID=${TESTRAIL_SUITE_ID:-}
+      - ZEPHYR_BASE_URL=${ZEPHYR_BASE_URL:-https://api.zephyrscale.smartbear.com/v2}
+      - ZEPHYR_API_TOKEN=${ZEPHYR_API_TOKEN:-}
+      - EXECUTION_RUNNER_BASE_URL=${EXECUTION_RUNNER_BASE_URL:-}
+      - EXECUTION_RUNNER_TOKEN=${EXECUTION_RUNNER_TOKEN:-}
+      - EXECUTION_RUNNER_TIMEOUT_SECONDS=${EXECUTION_RUNNER_TIMEOUT_SECONDS:-120}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - ALERT_WEBHOOK_TOKEN=${ALERT_WEBHOOK_TOKEN:-}
+      - ALERT_WEBHOOK_TIMEOUT_SECONDS=${ALERT_WEBHOOK_TIMEOUT_SECONDS:-10}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+      - API_RATE_LIMIT_PER_MINUTE=${API_RATE_LIMIT_PER_MINUTE:-120}
+      - AUTH_RATE_LIMIT_PER_MINUTE=${AUTH_RATE_LIMIT_PER_MINUTE:-10}
+      - UPLOAD_MAX_BYTES=${UPLOAD_MAX_BYTES:-2000000}
+      - UPLOAD_MAX_REQUIREMENTS=${UPLOAD_MAX_REQUIREMENTS:-100}
+      - UPLOAD_MAX_TEST_CASES=${UPLOAD_MAX_TEST_CASES:-500}
+      - MAPPED_UPLOAD_MAX_BYTES=${MAPPED_UPLOAD_MAX_BYTES:-10000000}
+      - MAPPED_IMPORT_MAX_RECORDS=${MAPPED_IMPORT_MAX_RECORDS:-20000}
+      - MAPPED_JOB_UPLOAD_MAX_BYTES=${MAPPED_JOB_UPLOAD_MAX_BYTES:-250000000}
+      - MAPPED_JOB_MAX_RECORDS=${MAPPED_JOB_MAX_RECORDS:-1000000}
+      - MAPPED_JOB_BATCH_SIZE=${MAPPED_JOB_BATCH_SIZE:-250}
+      - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
+      - HEALTH_PROBE_TIMEOUT_SECONDS=${HEALTH_PROBE_TIMEOUT_SECONDS:-5}
+      - OIDC_ENABLED=${OIDC_ENABLED:-false}
+      - OIDC_ISSUER=${OIDC_ISSUER:-}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+      - OIDC_AUTHORIZATION_ENDPOINT=${OIDC_AUTHORIZATION_ENDPOINT:-}
+      - OIDC_TOKEN_ENDPOINT=${OIDC_TOKEN_ENDPOINT:-}
+      - OIDC_JWKS_URI=${OIDC_JWKS_URI:-}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI:-http://localhost:8000/api/v1/auth/oidc/callback}
+      - OIDC_FRONTEND_REDIRECT_URL=${OIDC_FRONTEND_REDIRECT_URL:-http://localhost:5173/requirements}
+      - OIDC_ALLOWED_EMAIL_DOMAINS=${OIDC_ALLOWED_EMAIL_DOMAINS:-}
+      - OIDC_AUTO_PROVISION=${OIDC_AUTO_PROVISION:-false}
     ports:
-      - '8000:8000'
+      - '${BACKEND_PORT:-8000}:8000'
     depends_on:
-      - postgres
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - import_spool:/var/lib/ai-test-generator/imports
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ai-testgen-frontend
+    ports:
+      - '${FRONTEND_PORT:-5173}:80'
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: on-failure
+
+  indexer:
+    build:
+      context: ./backend
+    container_name: ai-testgen-indexer
+    command: ["python", "scripts/process_outbox.py"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
+      - EVAL_LLM_ENABLED=${EVAL_LLM_ENABLED:-false}
+      - EVAL_LLM_MODEL=${EVAL_LLM_MODEL:-}
+      - EVAL_PASS_SCORE=${EVAL_PASS_SCORE:-80}
+      - EVAL_REQUIRE_CITATIONS=${EVAL_REQUIRE_CITATIONS:-true}
+      - EVAL_RUBRIC_VERSION=${EVAL_RUBRIC_VERSION:-test-case-v2}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-1536}
+      - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-ai-testgen-embeddings}
+      - PINECONE_HOST=${PINECONE_HOST:-}
+      - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
+      - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
+      - PINECONE_API_VERSION=${PINECONE_API_VERSION:-2026-07}
+      - VECTOR_CHUNKING_ENABLED=${VECTOR_CHUNKING_ENABLED:-true}
+      - VECTOR_CHUNK_TARGET_TOKENS=${VECTOR_CHUNK_TARGET_TOKENS:-700}
+      - VECTOR_CHUNK_MAX_TOKENS=${VECTOR_CHUNK_MAX_TOKENS:-1000}
+      - VECTOR_CHUNK_OVERLAP_TOKENS=${VECTOR_CHUNK_OVERLAP_TOKENS:-80}
+      - RAG_CANDIDATE_LIMIT=${RAG_CANDIDATE_LIMIT:-40}
+      - RAG_CONTEXT_LIMIT=${RAG_CONTEXT_LIMIT:-8}
+      - RAG_SEMANTIC_WEIGHT=${RAG_SEMANTIC_WEIGHT:-0.65}
+      - RAG_KEYWORD_WEIGHT=${RAG_KEYWORD_WEIGHT:-0.25}
+      - RAG_SOURCE_WEIGHT=${RAG_SOURCE_WEIGHT:-0.10}
+      - MAPPED_JOB_MAX_RECORDS=${MAPPED_JOB_MAX_RECORDS:-1000000}
+      - MAPPED_JOB_BATCH_SIZE=${MAPPED_JOB_BATCH_SIZE:-250}
+      - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
+      - TEST_REPOSITORY_BASE_URL=${TEST_REPOSITORY_BASE_URL:-}
+      - TEST_REPOSITORY_TOKEN=${TEST_REPOSITORY_TOKEN:-}
+      - TEST_REPOSITORY_PROVIDER=${TEST_REPOSITORY_PROVIDER:-generic}
+      - TEST_REPOSITORY_TIMEOUT_SECONDS=${TEST_REPOSITORY_TIMEOUT_SECONDS:-30}
+      - XRAY_CLIENT_ID=${XRAY_CLIENT_ID:-}
+      - XRAY_CLIENT_SECRET=${XRAY_CLIENT_SECRET:-}
+      - XRAY_AUTH_URL=${XRAY_AUTH_URL:-https://xray.cloud.getxray.app/api/v2/authenticate}
+      - XRAY_GRAPHQL_URL=${XRAY_GRAPHQL_URL:-https://xray.cloud.getxray.app/api/v2/graphql}
+      - ZEPHYR_BASE_URL=${ZEPHYR_BASE_URL:-https://api.zephyrscale.smartbear.com/v2}
+      - ZEPHYR_API_TOKEN=${ZEPHYR_API_TOKEN:-}
+      - TESTRAIL_USERNAME=${TESTRAIL_USERNAME:-}
+      - TESTRAIL_API_KEY=${TESTRAIL_API_KEY:-}
+      - TESTRAIL_PROJECT_ID=${TESTRAIL_PROJECT_ID:-}
+      - TESTRAIL_SECTION_ID=${TESTRAIL_SECTION_ID:-}
+      - TESTRAIL_SUITE_ID=${TESTRAIL_SUITE_ID:-}
+      - EXECUTION_RUNNER_BASE_URL=${EXECUTION_RUNNER_BASE_URL:-}
+      - EXECUTION_RUNNER_TOKEN=${EXECUTION_RUNNER_TOKEN:-}
+      - EXECUTION_RUNNER_TIMEOUT_SECONDS=${EXECUTION_RUNNER_TIMEOUT_SECONDS:-120}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - ALERT_WEBHOOK_TOKEN=${ALERT_WEBHOOK_TOKEN:-}
+      - ALERT_WEBHOOK_TIMEOUT_SECONDS=${ALERT_WEBHOOK_TIMEOUT_SECONDS:-10}
+      - OUTBOX_BATCH_SIZE=${OUTBOX_BATCH_SIZE:-25}
+      - OUTBOX_MAX_ATTEMPTS=${OUTBOX_MAX_ATTEMPTS:-8}
+      - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - import_spool:/var/lib/ai-test-generator/imports
+
+  import-worker:
+    build:
+      context: ./backend
+    container_name: ai-testgen-import-worker
+    command: ["python", "scripts/process_mapped_imports.py"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - MAPPED_JOB_MAX_RECORDS=${MAPPED_JOB_MAX_RECORDS:-1000000}
+      - MAPPED_JOB_BATCH_SIZE=${MAPPED_JOB_BATCH_SIZE:-250}
+      - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
+      - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+    volumes:
+      - import_spool:/var/lib/ai-test-generator/imports
+
+  vector-maintenance:
+    build:
+      context: ./backend
+    container_name: ai-testgen-vector-maintenance
+    command: ["python", "scripts/maintain_vectors.py", "--interval-seconds", "${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-ai-testgen-embeddings}
+      - PINECONE_HOST=${PINECONE_HOST:-}
+      - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
+      - VECTOR_MAINTENANCE_INTERVAL_SECONDS=${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
+      - VECTOR_MAINTENANCE_REPAIR_MISSING=${VECTOR_MAINTENANCE_REPAIR_MISSING:-true}
+      - VECTOR_MAINTENANCE_DELETE_ORPHANS=${VECTOR_MAINTENANCE_DELETE_ORPHANS:-false}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  integration-scheduler:
+    build:
+      context: ./backend
+    container_name: ai-testgen-integration-scheduler
+    command: ["python", "scripts/process_integration_schedules.py"]
+    profiles: ["workers"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - JIRA_BASE_URL=${JIRA_BASE_URL:-}
+      - JIRA_EMAIL=${JIRA_EMAIL:-}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+      - JIRA_TIMEOUT_SECONDS=${JIRA_TIMEOUT_SECONDS:-30}
+      - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
 
 volumes:
   postgres_data:
+  import_spool:

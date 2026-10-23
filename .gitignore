@@ -6,6 +6,13 @@ build/
 __pycache__/
 frontend/node_modules/
 frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
 backend/.venv/
 backend/__pycache__/
+*.egg-info/
+.pytest_cache/
 .DS_Store
+.postqode/
+data/
+scripts/__pycache__/

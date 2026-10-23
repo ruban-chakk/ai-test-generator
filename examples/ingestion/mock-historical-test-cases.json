@@ -1,0 +1,414 @@
+{
+  "test_cases": [
+    {
+      "external_id": "TC-SHOP-101-001",
+      "requirement_external_id": "SHOP-101",
+      "scenario_external_id": "SC-SHOP-101-AUTH",
+      "scenario_title": "Customer authentication",
+      "scenario_description": "Validate successful and unsuccessful customer sign-in behavior.",
+      "title": "Sign in with valid customer credentials",
+      "description": "Verify that an active customer can authenticate and reach the account page.",
+      "prerequisite": "An active customer account exists and is not locked.",
+      "priority": "high",
+      "severity": "critical",
+      "category": "authentication",
+      "type": "functional",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-01-15T10:30:00Z",
+      "approved_by": "qa.lead@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Open the sign-in page.",
+          "expected_result": "The email and password fields and the Sign in button are displayed."
+        },
+        {
+          "step_number": 2,
+          "action": "Enter the active customer's email address and valid password.",
+          "expected_result": "The credentials are accepted without displaying the password in plain text."
+        },
+        {
+          "step_number": 3,
+          "action": "Select Sign in.",
+          "expected_result": "The customer is authenticated and redirected to the account page."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-101-002",
+      "requirement_external_id": "SHOP-101",
+      "scenario_external_id": "SC-SHOP-101-AUTH",
+      "scenario_title": "Customer authentication",
+      "scenario_description": "Validate successful and unsuccessful customer sign-in behavior.",
+      "title": "Lock an account after five failed sign-in attempts",
+      "description": "Verify the temporary lockout policy and generic authentication error messaging.",
+      "prerequisite": "An active customer account exists with zero failed sign-in attempts.",
+      "priority": "high",
+      "severity": "critical",
+      "category": "security",
+      "type": "negative",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-01-15T10:35:00Z",
+      "approved_by": "qa.lead@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Submit the registered email with an incorrect password five consecutive times.",
+          "expected_result": "Every attempt returns the same generic invalid-credentials message."
+        },
+        {
+          "step_number": 2,
+          "action": "Immediately submit the registered email with the correct password.",
+          "expected_result": "Authentication is rejected because the account is locked for 15 minutes."
+        },
+        {
+          "step_number": 3,
+          "action": "Inspect the authentication audit event.",
+          "expected_result": "The lockout is recorded without logging either password."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-102-001",
+      "requirement_external_id": "SHOP-102",
+      "scenario_external_id": "SC-SHOP-102-SEARCH",
+      "scenario_title": "Catalog search relevance",
+      "scenario_description": "Validate product discovery, relevance ordering, and empty search behavior.",
+      "title": "Rank an exact SKU match above text matches",
+      "description": "Verify that an exact SKU match is the first catalog search result.",
+      "prerequisite": "The catalog contains SKU CAM-100 and other products containing camera-related text.",
+      "priority": "medium",
+      "severity": "major",
+      "category": "catalog",
+      "type": "functional",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-01-16T09:00:00Z",
+      "approved_by": "qa.lead@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Search for '  cam-100  ' using mixed case and surrounding spaces.",
+          "expected_result": "The query is normalized and matching products are returned."
+        },
+        {
+          "step_number": 2,
+          "action": "Review the first result.",
+          "expected_result": "SKU CAM-100 appears first with name, current price, stock state, and product URL."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-102-002",
+      "requirement_external_id": "SHOP-102",
+      "scenario_external_id": "SC-SHOP-102-SEARCH",
+      "scenario_title": "Catalog search relevance",
+      "scenario_description": "Validate product discovery, relevance ordering, and empty search behavior.",
+      "title": "Display a no-results message for an unmatched query",
+      "description": "Verify that an unmatched search does not display stale products.",
+      "prerequisite": "The catalog contains no product matching the unique query.",
+      "priority": "medium",
+      "severity": "minor",
+      "category": "catalog",
+      "type": "negative",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-01-16T09:05:00Z",
+      "approved_by": "qa.lead@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Search for 'nonexistent-product-987654'.",
+          "expected_result": "No product results are returned."
+        },
+        {
+          "step_number": 2,
+          "action": "Review the results area.",
+          "expected_result": "A clear no-results message is displayed and no stale result cards remain."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-103-001",
+      "requirement_external_id": "SHOP-103",
+      "scenario_external_id": "SC-SHOP-103-CART",
+      "scenario_title": "Shopping-cart quantity management",
+      "scenario_description": "Validate cart quantity changes, totals, removal, and stock boundaries.",
+      "title": "Update cart quantity and totals",
+      "description": "Verify that changing a line quantity recalculates the line subtotal and cart total.",
+      "prerequisite": "The cart contains one product priced at 25.00 with at least five units in stock.",
+      "priority": "high",
+      "severity": "major",
+      "category": "cart",
+      "type": "functional",
+      "status": "approved",
+      "version": 2,
+      "approved_at": "2026-02-01T11:00:00+00:00",
+      "approved_by": "commerce.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Change the cart line quantity from 1 to 3.",
+          "expected_result": "The quantity is accepted and the line subtotal changes to 75.00."
+        },
+        {
+          "step_number": 2,
+          "action": "Review the cart summary.",
+          "expected_result": "The cart total is recalculated using the updated line subtotal."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-103-002",
+      "requirement_external_id": "SHOP-103",
+      "scenario_external_id": "SC-SHOP-103-CART",
+      "scenario_title": "Shopping-cart quantity management",
+      "scenario_description": "Validate cart quantity changes, totals, removal, and stock boundaries.",
+      "title": "Reject a quantity greater than available stock",
+      "description": "Verify server-side stock validation when the requested quantity is unavailable.",
+      "prerequisite": "The cart contains a product with exactly three units currently available.",
+      "priority": "high",
+      "severity": "major",
+      "category": "cart",
+      "type": "boundary",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-02-01T11:05:00+00:00",
+      "approved_by": "commerce.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Change the cart line quantity to 4.",
+          "expected_result": "The server rejects the update and reports that only three units are available."
+        },
+        {
+          "step_number": 2,
+          "action": "Reload the cart.",
+          "expected_result": "The previously valid quantity and totals remain unchanged."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-104-001",
+      "requirement_external_id": "SHOP-104",
+      "scenario_external_id": "SC-SHOP-104-PAYMENT",
+      "scenario_title": "Credit-card checkout",
+      "scenario_description": "Validate successful, declined, and repeated credit-card checkout requests.",
+      "title": "Place an order after an approved card payment",
+      "description": "Verify successful order creation using a tokenized card payment.",
+      "prerequisite": "The customer has an in-stock cart, delivery address, billing address, and an approved payment token.",
+      "priority": "critical",
+      "severity": "critical",
+      "category": "checkout",
+      "type": "end-to-end",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-02-10T13:00:00Z",
+      "approved_by": "payments.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Submit checkout with all required addresses, an approved payment token, and a new idempotency key.",
+          "expected_result": "The payment is approved and exactly one order is created."
+        },
+        {
+          "step_number": 2,
+          "action": "Open the created order.",
+          "expected_result": "The order contains the purchased lines, calculated totals, payment reference, and Placed status."
+        },
+        {
+          "step_number": 3,
+          "action": "Inspect persisted payment data.",
+          "expected_result": "No raw card number or security code is stored."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-104-002",
+      "requirement_external_id": "SHOP-104",
+      "scenario_external_id": "SC-SHOP-104-PAYMENT",
+      "scenario_title": "Credit-card checkout",
+      "scenario_description": "Validate successful, declined, and repeated credit-card checkout requests.",
+      "title": "Prevent duplicate orders for a repeated checkout request",
+      "description": "Verify checkout idempotency when the client retries after a timeout.",
+      "prerequisite": "A valid checkout request and a fixed idempotency key are available.",
+      "priority": "critical",
+      "severity": "critical",
+      "category": "checkout",
+      "type": "resilience",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-02-10T13:10:00Z",
+      "approved_by": "payments.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Submit a valid checkout request with idempotency key checkout-retry-001.",
+          "expected_result": "The payment is charged and one order is created."
+        },
+        {
+          "step_number": 2,
+          "action": "Submit the identical request again with idempotency key checkout-retry-001.",
+          "expected_result": "The original order response is returned without another charge or order."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-104-003",
+      "requirement_external_id": "SHOP-104",
+      "scenario_external_id": "SC-SHOP-104-PAYMENT",
+      "scenario_title": "Credit-card checkout",
+      "scenario_description": "Validate successful, declined, and repeated credit-card checkout requests.",
+      "title": "Preserve the cart after a declined payment",
+      "description": "Verify that a customer can correct payment details and retry checkout.",
+      "prerequisite": "The customer has a valid cart and a payment token configured to be declined.",
+      "priority": "high",
+      "severity": "major",
+      "category": "checkout",
+      "type": "negative",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-02-10T13:15:00Z",
+      "approved_by": "payments.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Submit checkout using the declined payment token.",
+          "expected_result": "No order is created and a recoverable payment-declined message is displayed."
+        },
+        {
+          "step_number": 2,
+          "action": "Return to the cart.",
+          "expected_result": "All original cart lines and quantities are preserved."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-105-001",
+      "requirement_external_id": "SHOP-105",
+      "scenario_external_id": "SC-SHOP-105-PROMO",
+      "scenario_title": "Checkout promotions",
+      "scenario_description": "Validate promotional-code eligibility and total recalculation.",
+      "title": "Apply an eligible promotional code",
+      "description": "Verify a valid promotion updates the discount, tax basis, and final total.",
+      "prerequisite": "The cart is eligible for active code SAVE10, which grants a ten-percent discount.",
+      "priority": "high",
+      "severity": "major",
+      "category": "pricing",
+      "type": "functional",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-02-18T08:30:00Z",
+      "approved_by": "pricing.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Enter ' save10 ' in the promotional-code field and apply it.",
+          "expected_result": "The code is normalized, recognized, and applied to the cart."
+        },
+        {
+          "step_number": 2,
+          "action": "Review the order summary.",
+          "expected_result": "The discount, taxable amount, tax, and final total are recalculated and displayed."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-105-LEGACY-001",
+      "requirement_external_id": "SHOP-105",
+      "scenario_external_id": "SC-SHOP-105-LEGACY",
+      "scenario_title": "Legacy stacked promotions",
+      "scenario_description": "Historical coverage for the retired behavior that allowed two promotional codes.",
+      "title": "Stack two promotional codes",
+      "description": "Deprecated after the business rule changed to allow only one active promotional code.",
+      "prerequisite": "Two legacy stackable promotional codes exist.",
+      "priority": "low",
+      "severity": "minor",
+      "category": "pricing",
+      "type": "legacy",
+      "status": "deprecated",
+      "version": 3,
+      "approved_at": "2025-06-20T08:30:00Z",
+      "approved_by": "pricing.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Apply the first promotional code.",
+          "expected_result": "The first discount is applied."
+        },
+        {
+          "step_number": 2,
+          "action": "Apply the second promotional code.",
+          "expected_result": "The legacy system applies a second discount."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-106-001",
+      "requirement_external_id": "SHOP-106",
+      "scenario_external_id": "SC-SHOP-106-CANCEL",
+      "scenario_title": "Order cancellation and refund",
+      "scenario_description": "Validate cancellation eligibility, audit evidence, refund behavior, and idempotency.",
+      "title": "Cancel a processing order and request one refund",
+      "description": "Verify that an eligible paid order is cancelled and refunded exactly once.",
+      "prerequisite": "A paid order exists in Processing status and has not been shipped or refunded.",
+      "priority": "critical",
+      "severity": "critical",
+      "category": "orders",
+      "type": "end-to-end",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-03-01T14:00:00Z",
+      "approved_by": "orders.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Cancel the processing order with reason 'Ordered by mistake'.",
+          "expected_result": "The order changes to Cancelled and records the actor, timestamp, and reason."
+        },
+        {
+          "step_number": 2,
+          "action": "Review the payment activity.",
+          "expected_result": "One refund request references the original captured payment."
+        },
+        {
+          "step_number": 3,
+          "action": "Repeat the same cancellation request.",
+          "expected_result": "The request returns the existing cancellation result and no second refund is issued."
+        }
+      ]
+    },
+    {
+      "external_id": "TC-SHOP-106-002",
+      "requirement_external_id": "SHOP-106",
+      "scenario_external_id": "SC-SHOP-106-CANCEL",
+      "scenario_title": "Order cancellation and refund",
+      "scenario_description": "Validate cancellation eligibility, audit evidence, refund behavior, and idempotency.",
+      "title": "Reject cancellation of a shipped order",
+      "description": "Verify that shipment prevents cancellation and refund creation.",
+      "prerequisite": "A paid order exists in Shipped status.",
+      "priority": "high",
+      "severity": "major",
+      "category": "orders",
+      "type": "negative",
+      "status": "approved",
+      "version": 1,
+      "approved_at": "2026-03-01T14:05:00Z",
+      "approved_by": "orders.qa@example.test",
+      "steps": [
+        {
+          "step_number": 1,
+          "action": "Attempt to cancel the shipped order.",
+          "expected_result": "Cancellation is rejected with a message explaining that shipped orders are ineligible."
+        },
+        {
+          "step_number": 2,
+          "action": "Review the order and payment activity.",
+          "expected_result": "The order remains Shipped and no refund request is created."
+        }
+      ]
+    }
+  ]
+}

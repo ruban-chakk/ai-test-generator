@@ -1,8 +1,12 @@
 import { FormEvent, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { createRequirement } from '../api';
+import { createRequirement, ProjectSummary } from '../api';
 
-export default function RequirementCreatePage() {
+interface Props {
+  selectedProject: ProjectSummary | null;
+}
+
+export default function RequirementCreatePage({ selectedProject }: Props) {
   const navigate = useNavigate();
   const [externalId, setExternalId] = useState('');
   const [title, setTitle] = useState('');
@@ -11,13 +15,14 @@ export default function RequirementCreatePage() {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
     setSaving(true);
 
     try {
       const requirement = await createRequirement({
+        project_id: selectedProject?.id,
         external_id: externalId || undefined,
         title,
         description,
@@ -37,12 +42,18 @@ export default function RequirementCreatePage() {
         <div>
           <p className="eyebrow">New requirement</p>
           <h1>Create requirement</h1>
+          <span className="header-subtitle">
+            {selectedProject ? selectedProject.name : 'Select a project first'}
+          </span>
         </div>
         <button className="secondary-button" onClick={() => navigate('/requirements')}>
           Cancel
         </button>
       </header>
 
+      {!selectedProject ? (
+        <div className="status-message">Create or select a project before adding requirements.</div>
+      ) : (
       <form className="form-card" onSubmit={handleSubmit}>
         <div className="form-row">
           <label htmlFor="externalId">External ID</label>
@@ -93,6 +104,7 @@ export default function RequirementCreatePage() {
           </button>
         </div>
       </form>
+      )}
     </main>
   );
 }
