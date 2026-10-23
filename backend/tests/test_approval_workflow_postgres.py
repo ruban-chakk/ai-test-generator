@@ -82,7 +82,11 @@ def test_test_case_requires_version_bound_evaluation_before_final_approval(monke
 
     monkeypatch.setattr(routes_module, "settings", environment_settings)
     monkeypatch.setattr(routes_module, "_effective_ai_settings", effective_settings)
-    monkeypatch.setattr(routes_module, "build_test_case_evaluation_service", lambda _config: FakeEvaluationService())
+    monkeypatch.setattr(
+        routes_module,
+        "build_test_case_evaluation_service",
+        lambda _config, **_kwargs: FakeEvaluationService(),
+    )
     monkeypatch.setattr(routes_module, "_record_ai_usage", lambda *_args, **_kwargs: None)
 
     async def scenario() -> None:

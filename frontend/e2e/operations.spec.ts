@@ -10,6 +10,8 @@ test('admin can inspect operations and import a requirement file', async ({ page
 
     if (path.endsWith('/auth/me')) {
       body = { id: 'user-1', username: 'admin', email: 'admin@example.com', role: 'admin', active: true };
+    } else if (path.includes('/admin/context')) {
+      body = { is_app_admin: true, organization_admin_ids: [], project_admin_ids: [] };
     } else if (path.endsWith('/projects')) {
       body = [{ id: 'project-1', name: 'Payments', status: 'active', requirement_count: 2, test_case_count: 4 }];
     } else if (path.endsWith('/monitoring/summary')) {
@@ -64,13 +66,35 @@ test('admin can inspect operations and import a requirement file', async ({ page
     return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
   });
 
-  await page.goto('/operations');
-  await expect(page.getByRole('heading', { name: 'Integrations and governance' })).toBeVisible();
-  await expect(page.getByText('Overall: degraded')).toBeVisible();
-  await expect(page.getByText('GenerationProviderError')).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Project compliance' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Semantic calibration' })).toBeVisible();
+  await page.goto('/requirements');
+  await expect(page.getByRole('link', { name: 'Operations' })).toBeVisible();
+  await page.getByRole('link', { name: 'Operations' }).click();
+  await expect(page.getByRole('heading', { name: 'Operations' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Monitoring' })).toBeVisible();
 
+  await page.getByRole('link', { name: 'Monitoring' }).click();
+  await expect(page.getByRole('heading', { name: 'Monitoring', level: 1 })).toBeVisible();
+
+  await page.getByRole('link', { name: 'All operations' }).click();
+  await page.getByRole('link', { name: 'Dependency health' }).click();
+  await expect(page.getByRole('heading', { name: 'Dependency health', level: 1 })).toBeVisible();
+  await expect(page.getByText('Overall: degraded')).toBeVisible();
+
+  await page.getByRole('link', { name: 'All operations' }).click();
+  await page.getByRole('link', { name: 'Outbox delivery' }).click();
+  await expect(page.getByText('GenerationProviderError')).toBeVisible();
+
+  await page.getByRole('link', { name: 'All operations' }).click();
+  await page.getByRole('link', { name: 'Project compliance' }).click();
+  await expect(page.getByRole('heading', { name: 'Project compliance', level: 1 })).toBeVisible();
+
+  await page.getByRole('link', { name: 'All operations' }).click();
+  await page.getByRole('link', { name: 'Semantic calibration' }).click();
+  await expect(page.getByRole('heading', { name: 'Semantic calibration', level: 1 })).toBeVisible();
+
+  await page.getByRole('link', { name: 'All operations' }).click();
+  await page.getByRole('link', { name: 'Requirement files' }).click();
+  await expect(page.getByRole('heading', { name: 'Requirement files' })).toBeVisible();
   await page.getByLabel('Requirement file').setInputFiles({
     name: 'refunds.md',
     mimeType: 'text/markdown',

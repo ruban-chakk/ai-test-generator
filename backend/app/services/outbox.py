@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import json
+import logging
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,8 @@ from app.services.alerts import ALERT_DELIVERY_REQUESTED, AlertWebhookClient, cr
 from app.services.execution import ExecutableTestCase, ExecutionResult, TestExecutionClient
 from app.services.integrations import RepositoryClient, RepositoryTestCase, build_test_repository_client
 from app.services.indexing import IndexableArtifact, IndexingResult, IndexingService, build_indexing_service
+
+logger = logging.getLogger(__name__)
 
 
 TEST_CASE_INDEX_REQUESTED = "test_case.index_requested"
@@ -257,7 +260,8 @@ class OutboxProcessor:
                 alert, idempotency_key = operation[1]
                 await self._alert_client.deliver(alert, idempotency_key=idempotency_key)
         except Exception as exc:
-            await self._record_failure(event_id, type(exc).__name__)
+            logger.exception("Outbox event %s failed", event_id)
+            await self._record_failure(event_id, f"{type(exc).__name__}: {exc}")
             return
 
         async with self._session_factory() as db:
