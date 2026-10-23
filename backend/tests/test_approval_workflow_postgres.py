@@ -209,6 +209,7 @@ def test_test_case_requires_version_bound_evaluation_before_final_approval(monke
                 run_ids = select(ApprovalWorkflowRun.id).where(ApprovalWorkflowRun.test_case_id == ids.get("case"))
                 await db.execute(delete(ApprovalWorkflowDecision).where(ApprovalWorkflowDecision.workflow_run_id.in_(run_ids)))
                 await db.execute(delete(ApprovalWorkflowRun).where(ApprovalWorkflowRun.test_case_id == ids.get("case")))
+                await db.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id == ids.get("case")))
                 await db.execute(delete(OutboxEvent).where(OutboxEvent.aggregate_id.in_(
                     select(VersionModel.id).where(VersionModel.test_case_id == ids.get("case"))
                 )))

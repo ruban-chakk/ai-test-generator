@@ -261,7 +261,7 @@ class OutboxProcessor:
                 await self._alert_client.deliver(alert, idempotency_key=idempotency_key)
         except Exception as exc:
             logger.exception("Outbox event %s failed", event_id)
-            await self._record_failure(event_id, f"{type(exc).__name__}: {exc}")
+            await self._record_failure(event_id, type(exc).__name__)
             return
 
         async with self._session_factory() as db:
