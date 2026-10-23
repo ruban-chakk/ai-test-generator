@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import auth_router
+from app.api.admin import admin_router
 from app.api.routes import api_router
 from app.core.security import authenticate_request
 from app.core.config import settings
@@ -28,6 +29,11 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(
     api_router,
+    prefix="/api/v1",
+    dependencies=[Depends(authenticate_request), Depends(enforce_authenticated_rate_limit)],
+)
+app.include_router(
+    admin_router,
     prefix="/api/v1",
     dependencies=[Depends(authenticate_request), Depends(enforce_authenticated_rate_limit)],
 )

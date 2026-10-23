@@ -18,7 +18,8 @@ from app.db import get_db
 from app.models import User
 
 
-GLOBAL_ROLES = {"reviewer", "approver", "admin"}
+GLOBAL_ROLES = {"user", "reviewer", "tester", "test_lead", "product_manager", "approver", "admin", "app_admin"}
+APP_ADMIN_ROLES = {"admin", "app_admin"}
 password_hash = PasswordHash.recommended()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
 
@@ -131,6 +132,13 @@ def current_principal() -> Principal:
 
 def require_global_role(*allowed_roles: str) -> Principal:
     principal = current_principal()
-    if principal.role not in allowed_roles:
+    if principal.role not in allowed_roles and not (principal.role == "app_admin" and "admin" in allowed_roles):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role for this action")
+    return principal
+
+
+def require_app_admin() -> Principal:
+    principal = current_principal()
+    if principal.role not in APP_ADMIN_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="App administrator access required")
     return principal

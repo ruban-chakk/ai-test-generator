@@ -11,6 +11,7 @@ from app.models import (
     AuditLog,
     Feedback,
     IntegrationRun,
+    KnowledgeDocument,
     Requirement,
     RequirementVersion,
     TestCase,
@@ -91,6 +92,10 @@ async def _expected_vector_ids(db: AsyncSession, project_id: uuid.UUID | None) -
             Feedback.target_level == "requirement", Feedback.target_id.in_(requirement_ids)
         )
     expected.update(item for item in (await db.execute(feedback_stmt)).scalars() if item)
+    knowledge_stmt = select(KnowledgeDocument.vector_id)
+    if project_id is not None:
+        knowledge_stmt = knowledge_stmt.where(KnowledgeDocument.project_id == project_id)
+    expected.update(item for item in (await db.execute(knowledge_stmt)).scalars() if item)
     return expected
 
 

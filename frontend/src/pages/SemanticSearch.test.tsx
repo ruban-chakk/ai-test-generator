@@ -88,4 +88,30 @@ describe('Search page', () => {
     ));
     expect(await screen.findByText(/No keyword results found/)).toBeInTheDocument();
   });
+
+  it('selectively searches unapproved test cases', async () => {
+    const user = userEvent.setup();
+    vi.mocked(searchArtifacts).mockResolvedValue([]);
+    render(
+      <MemoryRouter>
+        <SemanticSearchPage selectedProject={project} />
+      </MemoryRouter>,
+    );
+
+    await user.type(screen.getByRole('searchbox'), 'checkout regression');
+    await user.selectOptions(screen.getByLabelText('Artifact type'), 'test_case');
+    await user.selectOptions(screen.getByLabelText('Test-case approval'), 'unapproved');
+    await user.click(screen.getByRole('button', { name: 'Search' }));
+
+    await waitFor(() => expect(searchArtifacts).toHaveBeenCalledWith(
+      'project-1',
+      'checkout regression',
+      'hybrid',
+      'test_case',
+      0,
+      '',
+      undefined,
+      'unapproved',
+    ));
+  });
 });

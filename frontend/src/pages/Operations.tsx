@@ -1,5 +1,7 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
+import SettingsHub, { SettingsDestination } from '../components/SettingsHub';
+import BackLink from '../components/BackLink';
 import {
   acknowledgeAlert,
   AlertSummary,
@@ -128,6 +130,24 @@ const EMPTY_CUSTOM_FIELD: CustomFieldDraft = {
 };
 
 export default function OperationsPage({ selectedProject }: OperationsPageProps) {
+  const section = useParams()['*'] ?? '';
+  const destinations: SettingsDestination[] = [
+    { key: 'mapping', title: 'Import mappings', description: 'Company-specific field mappings', to: '/operations/mapping', icon: 'mapping' },
+    { key: 'monitoring', title: 'Monitoring', description: 'Runtime and processing metrics', to: '/operations/monitoring', icon: 'monitor' },
+    { key: 'historical', title: 'Historical test import', description: 'Bulk test-case ingestion', to: '/operations/historical', icon: 'import' },
+    { key: 'dependencies', title: 'Dependency health', description: 'LLM, Pinecone, Jira, and runners', to: '/operations/dependencies', icon: 'health' },
+    { key: 'files', title: 'Requirement files', description: 'TXT, Markdown, CSV, and JSON import', to: '/operations/files', icon: 'import' },
+    { key: 'jira', title: 'Jira integration', description: 'Manual and scheduled Jira sync', to: '/operations/jira', icon: 'integration' },
+    { key: 'repository', title: 'Repository sync', description: 'Publish approved test cases', to: '/operations/repository', icon: 'repository' },
+    { key: 'cleanup', title: 'NLP cleanup', description: 'Normalize requirement text', to: '/operations/cleanup', icon: 'quality' },
+    { key: 'evaluation', title: 'Evaluation', description: 'Run the quality evaluation suite', to: '/operations/evaluation', icon: 'quality' },
+    { key: 'governance', title: 'Governance policies', description: 'Organization policy controls', to: '/operations/governance', icon: 'governance' },
+    { key: 'compliance', title: 'Project compliance', description: 'Evidence retention and exports', to: '/operations/compliance', icon: 'governance' },
+    { key: 'calibration', title: 'Semantic calibration', description: 'Operational calibration evidence', to: '/operations/calibration', icon: 'calibration' },
+    { key: 'alerts', title: 'Operational alerts', description: 'Failures that need attention', to: '/operations/alerts', icon: 'alert' },
+    { key: 'outbox', title: 'Outbox delivery', description: 'Indexing and delivery retries', to: '/operations/outbox', icon: 'delivery' },
+  ];
+  const activeDestination = destinations.find((item) => item.key === section);
   const [jiraJql, setJiraJql] = useState('ORDER BY updated DESC');
   const [jiraScheduleHours, setJiraScheduleHours] = useState(6);
   const [integrationSchedules, setIntegrationSchedules] = useState<IntegrationSchedule[]>([]);
@@ -550,16 +570,15 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
       <header className="page-header">
         <div>
           <p className="eyebrow">Enterprise operations</p>
-          <h1>Integrations and governance</h1>
+          <h1>{activeDestination?.title ?? 'Operations'}</h1>
+          <span className="header-subtitle">{activeDestination?.description ?? 'Choose an operational area to configure or inspect.'}</span>
         </div>
-        <Link className="secondary-button" to="/requirements">
-          Requirements
-        </Link>
+        <BackLink to={section ? '/operations' : '/requirements'} label={section ? 'All operations' : 'Back to workspace'} />
       </header>
 
       {error ? <div className="status-message status-error">{error}</div> : null}
 
-      <section className="ops-grid">
+      {!section ? <SettingsHub destinations={destinations} label="Operations settings" /> : !activeDestination ? <div className="status-message status-error">Unknown operations setting.</div> : <section className={`ops-grid operation-view focused operation-${section}`}>
         <article className="detail-card">
           <h2>Configurable import mappings</h2>
           <p className="case-meta">
@@ -1134,7 +1153,7 @@ export default function OperationsPage({ selectedProject }: OperationsPageProps)
             )) : <p>No outbox events found.</p>}
           </div>
         </article>
-      </section>
+      </section>}
     </main>
   );
 }

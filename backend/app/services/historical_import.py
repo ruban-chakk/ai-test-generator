@@ -19,7 +19,11 @@ from app.models import (
     TestScenario,
 )
 from app.services.historical_ingestion import ParsedHistoricalTestCase
-from app.services.outbox import TEST_CASE_VERSION_INDEX_REQUESTED, enqueue_index_event
+from app.services.outbox import (
+    TEST_CASE_INDEX_REQUESTED,
+    TEST_CASE_VERSION_INDEX_REQUESTED,
+    enqueue_index_event,
+)
 
 
 class HistoricalImportConflictError(ValueError):
@@ -301,8 +305,19 @@ async def import_historical_test_cases(
                 aggregate_id=version.id,
                 payload={"test_case_id": str(existing_case.id), "version": next_version},
             )
+            enqueue_index_event(
+                db,
+                event_key=(
+                    f"test_case.current_index:{existing_case.id}:v{next_version}:"
+                    f"{existing_case.status}"
+                ),
+                event_type=TEST_CASE_INDEX_REQUESTED,
+                aggregate_type="test_case",
+                aggregate_id=existing_case.id,
+                payload={"version": next_version, "status": existing_case.status, "artifact_scope": "current"},
+            )
             updated_test_case_count += 1
-            queued_vector_count += 1
+            queued_vector_count += 2
             continue
 
         test_case_id = uuid.uuid4()
@@ -387,9 +402,20 @@ async def import_historical_test_cases(
             aggregate_id=version.id,
             payload={"test_case_id": str(test_case.id), "version": item.version},
         )
+        enqueue_index_event(
+            db,
+            event_key=(
+                f"test_case.current_index:{test_case.id}:v{item.version}:"
+                f"{test_case.status}"
+            ),
+            event_type=TEST_CASE_INDEX_REQUESTED,
+            aggregate_type="test_case",
+            aggregate_id=test_case.id,
+            payload={"version": item.version, "status": test_case.status, "artifact_scope": "current"},
+        )
         case_by_identity[identity] = test_case
         created_test_case_count += 1
-        queued_vector_count += 1
+        queued_vector_count += 2
 
     run_id: uuid.UUID | None = None
     if record_run:

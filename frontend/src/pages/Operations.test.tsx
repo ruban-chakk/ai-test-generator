@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import OperationsPage from './Operations';
@@ -71,6 +71,16 @@ const project = {
   requirement_count: 2,
   test_case_count: 4,
 };
+
+function renderOperation(section: string) {
+  return render(
+    <MemoryRouter initialEntries={[`/operations/${section}`]}>
+      <Routes>
+        <Route path="/operations/*" element={<OperationsPage selectedProject={project} />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
 
 function mockRefresh() {
   vi.mocked(getImportMappingProfiles).mockResolvedValue([]);
@@ -152,10 +162,13 @@ describe('OperationsPage', () => {
       created_at: '2026-10-21T00:00:00Z',
     });
 
-    render(<MemoryRouter><OperationsPage selectedProject={project} /></MemoryRouter>);
+    const dependencyView = renderOperation('dependencies');
 
     expect(await screen.findByText('not configured')).toBeInTheDocument();
-    expect(screen.getByText('GenerationProviderError')).toBeInTheDocument();
+    dependencyView.unmount();
+
+    renderOperation('outbox');
+    expect(await screen.findByText('GenerationProviderError')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Retry event' }));
     await waitFor(() => expect(retryOutboxEvent).toHaveBeenCalledWith('event-1'));
   });
@@ -175,7 +188,7 @@ describe('OperationsPage', () => {
       acknowledged_at: '2026-10-21T00:01:00Z',
       created_at: '2026-10-21T00:00:00Z',
     });
-    render(<MemoryRouter><OperationsPage selectedProject={project} /></MemoryRouter>);
+    renderOperation('alerts');
 
     expect(await screen.findByText('Automated test execution failed')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Acknowledge' }));
@@ -194,8 +207,7 @@ describe('OperationsPage', () => {
       started_at: '2026-10-21T00:00:00Z',
       completed_at: '2026-10-21T00:00:01Z',
     });
-    render(<MemoryRouter><OperationsPage selectedProject={project} /></MemoryRouter>);
-    await screen.findByText('not configured');
+    renderOperation('files');
 
     const file = new File(['# Refunds\nUsers can request a refund.'], 'refunds.md', { type: 'text/markdown' });
     const fileInput = screen.getByLabelText('Requirement file');
@@ -222,8 +234,7 @@ describe('OperationsPage', () => {
       started_at: '2026-10-21T00:00:00Z',
       completed_at: '2026-10-21T00:00:01Z',
     });
-    render(<MemoryRouter><OperationsPage selectedProject={project} /></MemoryRouter>);
-    await screen.findByText('not configured');
+    renderOperation('historical');
 
     const file = new File(['{"test_cases":[]}'], 'historical.json', { type: 'application/json' });
     const fileInput = screen.getByLabelText('Historical test-case file');
@@ -258,7 +269,7 @@ describe('OperationsPage', () => {
       metrics: { accuracy: 1, macro_f1: 1, confusion: {} }, status: 'applied',
       requested_by: 'admin', created_at: '2026-10-21T00:00:00Z',
     });
-    render(<MemoryRouter><OperationsPage selectedProject={project} /></MemoryRouter>);
+    const complianceView = renderOperation('compliance');
     await screen.findByText('Active retention: 365 days');
 
     await user.click(screen.getByLabelText('Require approval notes'));
@@ -270,6 +281,8 @@ describe('OperationsPage', () => {
     await user.click(screen.getByRole('button', { name: 'Generate evidence export' }));
     expect(await screen.findByText(/Evidence SHA-256: a{64}/)).toBeInTheDocument();
 
+    complianceView.unmount();
+    renderOperation('calibration');
     await user.click(screen.getByRole('button', { name: 'Calibrate and apply' }));
     await waitFor(() => expect(createSemanticCalibration).toHaveBeenCalledWith(
       'project-1', expect.arrayContaining([expect.objectContaining({ expected_action: 'duplicate' })]), true,

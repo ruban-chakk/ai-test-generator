@@ -21,6 +21,36 @@ class UserSummary(APIModel):
     email: str
     role: str
     active: bool
+    settings_json: dict[str, Any] = Field(default_factory=dict)
+
+
+class UserProfileUpdate(APIModel):
+    username: str = Field(min_length=2, max_length=80)
+    email: str = Field(min_length=3, max_length=320)
+
+
+class UserSettingsUpdate(APIModel):
+    theme: Literal["light", "dark", "system"] = "light"
+    density: Literal["comfortable", "compact"] = "comfortable"
+    reduce_motion: bool = False
+
+
+class AdminUserCreate(APIModel):
+    username: str = Field(min_length=2, max_length=80)
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=12, max_length=256)
+    role: Literal["user", "reviewer", "tester", "test_lead", "product_manager", "approver", "app_admin"] = "user"
+
+
+class AdminUserRoleUpdate(APIModel):
+    role: Literal["user", "reviewer", "tester", "test_lead", "product_manager", "approver", "app_admin"]
+    active: bool = True
+
+
+class AdminContext(APIModel):
+    is_app_admin: bool
+    organization_admin_ids: List[uuid.UUID] = Field(default_factory=list)
+    project_admin_ids: List[uuid.UUID] = Field(default_factory=list)
 
 
 class AuthConfiguration(APIModel):
@@ -55,6 +85,16 @@ class TestCaseSummary(APIModel):
     steps: Optional[List[TestCaseStep]] = None
     custom_fields_json: dict = Field(default_factory=dict)
     custom_field_schema_json: dict = Field(default_factory=dict)
+
+
+class TestCaseInventoryItem(TestCaseSummary):
+    requirement_id: uuid.UUID
+    requirement_title: str
+    scenario_id: uuid.UUID
+    scenario_title: str
+    project_id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
 
 
 class ImportMappingProfileCreate(APIModel):
@@ -144,6 +184,69 @@ class ApprovalAction(APIModel):
     notes: Optional[str] = None
 
 
+class ApprovalStageDefinition(APIModel):
+    name: str = Field(min_length=1, max_length=255)
+    required_roles: List[str] = Field(min_length=1)
+    minimum_approvals: int = Field(default=1, ge=1, le=20)
+
+
+class ApprovalWorkflowUpdate(APIModel):
+    name: str = Field(default="Generated test approval", min_length=1, max_length=255)
+    stages: List[ApprovalStageDefinition] = Field(min_length=1, max_length=12)
+    evaluation_required: bool = True
+    minimum_evaluation_score: int = Field(default=80, ge=0, le=100)
+    allow_same_approver_multiple_stages: bool = False
+
+
+class ApprovalWorkflowSummary(ApprovalWorkflowUpdate):
+    project_id: uuid.UUID
+    version: int = 1
+    updated_at: Optional[datetime] = None
+
+
+class ApprovalWorkflowDecisionSummary(APIModel):
+    id: uuid.UUID
+    stage_index: int
+    stage_name: str
+    decision: str
+    decided_by: str
+    decided_role: str
+    notes: Optional[str] = None
+    created_at: datetime
+
+
+class ApprovalWorkflowRunSummary(APIModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    test_case_id: uuid.UUID
+    test_case_version: int
+    content_sha256: str
+    status: str
+    current_stage: int
+    policy: ApprovalWorkflowSummary
+    quality_evaluation_id: Optional[uuid.UUID] = None
+    decisions: List[ApprovalWorkflowDecisionSummary] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+
+
+class KnowledgeDocumentCreate(APIModel):
+    title: str = Field(min_length=1, max_length=500)
+    content: str = Field(min_length=1, max_length=500_000)
+    source: str = Field(default="manual", min_length=1, max_length=64)
+
+
+class KnowledgeDocumentSummary(KnowledgeDocumentCreate):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    status: str
+    vector_id: Optional[str] = None
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class FeedbackCreate(APIModel):
     target_level: str
     target_id: uuid.UUID
@@ -151,6 +254,7 @@ class FeedbackCreate(APIModel):
     feedback_type: str
     comment: str
     created_by: str
+    quality_evaluation_id: Optional[uuid.UUID] = None
 
 
 class FeedbackSummary(FeedbackCreate):
@@ -187,6 +291,7 @@ class RevisionRecordSummary(APIModel):
 
 class QualityEvaluationSummary(APIModel):
     id: uuid.UUID
+    source_event_id: Optional[uuid.UUID] = None
     target_level: str
     target_id: uuid.UUID
     score: int
@@ -202,6 +307,8 @@ class ImpactAnalyzeRequest(APIModel):
     text: str
     project_id: Optional[uuid.UUID] = None
     context_ids: Optional[List[uuid.UUID]] = None
+    target_level: Literal["requirement", "scenario", "test_case"] = "requirement"
+    target_id: Optional[uuid.UUID] = None
     created_by: str = "system"
 
 
@@ -281,6 +388,8 @@ class ImpactCandidate(APIModel):
 
 class ImpactAnalysisSummary(APIModel):
     id: uuid.UUID
+    target_level: str = "requirement"
+    target_id: Optional[uuid.UUID] = None
     requirement_id: Optional[uuid.UUID] = None
     source_text: str
     similarity_threshold: float
@@ -617,6 +726,18 @@ class TestCaseCreate(APIModel):
     status: Optional[str] = 'draft'
 
 
+class TestCaseUpdate(APIModel):
+    expected_version: int = Field(ge=1)
+    title: str = Field(min_length=5, max_length=1000)
+    description: str = Field(min_length=12, max_length=100_000)
+    prerequisite: Optional[str] = Field(default=None, max_length=100_000)
+    priority: Optional[str] = Field(default=None, max_length=100)
+    severity: Optional[str] = Field(default=None, max_length=100)
+    category: Optional[str] = Field(default=None, max_length=100)
+    type: Optional[str] = Field(default=None, max_length=100)
+    steps: List[TestCaseStep] = Field(min_length=1, max_length=500)
+
+
 class TestCaseStepCreate(APIModel):
     step_number: int
     action: str
@@ -627,6 +748,15 @@ class ProjectCreate(APIModel):
     name: str
     description: Optional[str] = None
     status: str = "active"
+    organization_id: Optional[uuid.UUID] = None
+    cost_center: str = "unassigned"
+
+
+class ProjectUpdate(APIModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: Optional[str] = None
+    status: Literal["active", "archived"] = "active"
+    cost_center: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 class ProjectSummary(ProjectCreate):
@@ -635,6 +765,145 @@ class ProjectSummary(ProjectCreate):
     test_case_count: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+class OrganizationCreate(APIModel):
+    name: str = Field(min_length=2, max_length=255)
+    slug: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,126}[a-z0-9]$")
+
+
+class OrganizationSummary(OrganizationCreate):
+    id: uuid.UUID
+    status: str
+    project_count: int = 0
+    member_count: int = 0
+    created_at: datetime
+
+
+class OrganizationMembershipUpsert(APIModel):
+    user_id: uuid.UUID
+    role: Literal["org_admin", "member"] = "member"
+
+
+class OrganizationMembershipSummary(OrganizationMembershipUpsert):
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    username: str
+    email: str
+    created_at: datetime
+
+
+class InvitationCreate(APIModel):
+    email: str = Field(min_length=3, max_length=320)
+    organization_id: uuid.UUID
+    project_id: Optional[uuid.UUID] = None
+    organization_role: Literal["org_admin", "member"] = "member"
+    project_role: Optional[str] = None
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
+class InvitationSummary(APIModel):
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    project_id: Optional[uuid.UUID] = None
+    email: str
+    organization_role: str
+    project_role: Optional[str] = None
+    status: str
+    expires_at: datetime
+    created_at: datetime
+    invitation_token: Optional[str] = None
+
+
+class InvitationAccept(APIModel):
+    username: str = Field(min_length=2, max_length=80)
+    password: str = Field(min_length=12, max_length=256)
+
+
+class AIModelConfigurationUpdate(APIModel):
+    generation_model: str = Field(min_length=1, max_length=255)
+    judge_model: str = Field(min_length=1, max_length=255)
+    embedding_model: str = Field(min_length=1, max_length=255)
+    vector_provider: Literal["pinecone"] = "pinecone"
+    vector_index: str = Field(min_length=1, max_length=255)
+    vector_namespace: str = Field(min_length=1, max_length=255)
+    vector_host: Optional[str] = Field(default=None, max_length=500)
+    credential_reference: Optional[str] = Field(default=None, max_length=255)
+    evaluation_weights: dict[str, float] = Field(default_factory=dict)
+    pricing: dict[str, float] = Field(default_factory=dict)
+
+
+class AIModelConfigurationSummary(AIModelConfigurationUpdate):
+    id: uuid.UUID
+    scope_type: str
+    scope_id: Optional[uuid.UUID] = None
+    updated_by: uuid.UUID
+    updated_at: datetime
+
+
+class PromptConfigurationUpdate(APIModel):
+    prompt_key: Literal["test_case_generation", "feedback_regeneration", "test_case_evaluation"]
+    system_template: str = Field(min_length=1, max_length=50000)
+    user_template: str = Field(min_length=1, max_length=50000)
+    variables: list[str] = Field(default_factory=list, max_length=100)
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
+    change_notes: Optional[str] = Field(default=None, max_length=2000)
+    status: Literal["draft", "published", "retired"] = "published"
+
+
+class PromptConfigurationSummary(PromptConfigurationUpdate):
+    id: uuid.UUID
+    scope_type: str
+    scope_id: Optional[uuid.UUID] = None
+    version: int
+    content_checksum: str
+    parent_configuration_id: Optional[uuid.UUID] = None
+    parent_version: Optional[int] = None
+    created_by: uuid.UUID
+    approved_by: Optional[uuid.UUID] = None
+    published_at: Optional[datetime] = None
+    updated_by: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class PromptConfigurationVersionSummary(APIModel):
+    id: uuid.UUID
+    prompt_configuration_id: uuid.UUID
+    prompt_key: Literal["test_case_generation", "feedback_regeneration", "test_case_evaluation"]
+    scope_type: str
+    scope_id: Optional[uuid.UUID] = None
+    version: int
+    system_template: str
+    user_template: str
+    variables: list[str]
+    temperature: Optional[float] = None
+    change_notes: Optional[str] = None
+    status: str
+    content_checksum: str
+    parent_configuration_id: Optional[uuid.UUID] = None
+    parent_version: Optional[int] = None
+    created_by: uuid.UUID
+    approved_by: Optional[uuid.UUID] = None
+    published_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class EffectivePromptConfigurationSummary(PromptConfigurationSummary):
+    effective_scope_type: str
+    effective_scope_id: Optional[uuid.UUID] = None
+    inherited: bool = False
+
+
+class AICostSummary(APIModel):
+    scope_type: str
+    scope_id: uuid.UUID
+    total_cost_micros: int
+    total_input_tokens: int
+    total_output_tokens: int
+    by_project: List[dict] = Field(default_factory=list)
+    by_model: List[dict] = Field(default_factory=list)
+    unpriced_models: List[str] = Field(default_factory=list)
 
 
 class ProjectMembershipUpsert(APIModel):

@@ -23,7 +23,9 @@ Create an enterprise-ready system that:
 - generates test scenarios and test cases with metadata tags
 - displays them in a reviewable web UI
 - supports approval, versioning, and persistence to a repository + vector DB
-- accepts multi-level feedback and revises generated cases
+- accepts requirement-suite, scenario, and test-case feedback and revises generated cases with cited RAG context
+- gates repository eligibility on version-bound evaluation and configurable staged human approval
+- indexes project supporting documents as chunked RAG evidence
 - performs impact analysis on new requirements
 - includes governance, auditability, and scalability for enterprise usage
 
@@ -50,3 +52,22 @@ The codebase includes sanitized dependency acceptance probes, a bounded load gat
 backup/restore drill. Run these against the target deployment and a disposable recovery database before release.
 Real OIDC, Xray/TestRail/Zephyr, Pinecone, Jira, LLM, and runner credentials are intentionally not stored here;
 tenant owners must supply them for live acceptance.
+
+## Local Docker deployment
+
+The complete local stack includes PostgreSQL, database migrations, the FastAPI backend, the React frontend, and
+the background workers. Provider credentials are loaded from `backend/.env` for Compose variable substitution.
+
+```bash
+docker compose --env-file backend/.env --profile workers up -d --build
+```
+
+Open the web app at `http://localhost:5173`. The backend health endpoints are available at
+`http://localhost:8000/health/live` and `http://localhost:8000/health/ready`.
+If either port is already in use, override it with `FRONTEND_PORT` or `BACKEND_PORT` when running Compose.
+
+To stop the containers without deleting PostgreSQL data:
+
+```bash
+docker compose --env-file backend/.env --profile workers down
+```

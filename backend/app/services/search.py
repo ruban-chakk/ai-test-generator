@@ -48,6 +48,7 @@ class SemanticSearchService:
         offset: int = 0,
         custom_field: str | None = None,
         custom_value: str | None = None,
+        test_case_approval: str = "all",
     ) -> list[SearchMatch]:
         embedding = await self._language_model.embed(query)
         contexts = await self._vector_store.query(
@@ -62,6 +63,17 @@ class SemanticSearchService:
             current_id = str(metadata.get("entity_id") or metadata.get("requirement_id") or "")
             if not current_type or not current_id or (entity_type and current_type != entity_type):
                 continue
+            if current_type == "test_case":
+                # Dedicated search represents the current test-case record. Immutable
+                # approved versions are retained for generation RAG, not shown as a
+                # second copy of the same case in search results.
+                if metadata.get("immutable_version") is True or metadata.get("artifact_scope") == "approved_version":
+                    continue
+                status = str(metadata.get("status") or "").lower()
+                if test_case_approval == "approved" and status != "approved":
+                    continue
+                if test_case_approval == "unapproved" and status == "approved":
+                    continue
             if custom_field and custom_value is not None:
                 safe_key = re.sub(r"[^a-z0-9]+", "_", custom_field.lower()).strip("_")[:80]
                 stored = metadata.get(f"custom__{safe_key}")
@@ -159,6 +171,7 @@ class KeywordSearchService:
         aliases: Iterable[str] = (),
         custom_field: str | None = None,
         custom_value: str | None = None,
+        test_case_approval: str = "all",
     ) -> list[SearchMatch]:
         candidate_limit = min(max((limit + offset) * 2, 20), 200)
         alias_list = tuple(aliases)
@@ -169,7 +182,8 @@ class KeywordSearchService:
             ))
         if entity_type in {None, "test_case"}:
             matches.extend(await self._test_cases(
-                query, project_id, candidate_limit, alias_list, custom_field, custom_value
+                query, project_id, candidate_limit, alias_list, custom_field, custom_value,
+                test_case_approval,
             ))
         if entity_type in {None, "feedback"} and not custom_field:
             matches.extend(await self._feedback(query, project_id, candidate_limit, alias_list))
@@ -253,7 +267,7 @@ class KeywordSearchService:
 
     async def _test_cases(
         self, query: str, project_id: str, limit: int, aliases: tuple[str, ...],
-        custom_field: str | None, custom_value: str | None,
+        custom_field: str | None, custom_value: str | None, test_case_approval: str,
     ) -> list[SearchMatch]:
         custom_fields = cast(TestCase.custom_fields_json, Text)
         vector = _search_vector(
@@ -292,7 +306,11 @@ class KeywordSearchService:
             + case((step_match, 0.75), else_=0.0)
             + (fuzzy * 0.4)
         ).label("keyword_rank")
-        filters = [Requirement.project_id == project_id, TestCase.status == "approved"]
+        filters = [Requirement.project_id == project_id]
+        if test_case_approval == "approved":
+            filters.append(TestCase.status == "approved")
+        elif test_case_approval == "unapproved":
+            filters.append(TestCase.status != "approved")
         if custom_field and custom_value is not None:
             filters.append(
                 func.lower(

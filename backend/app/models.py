@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Float,
     Integer,
     String,
     Text,
@@ -17,23 +18,174 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
+DEFAULT_ORGANIZATION_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
 class Project(Base):
     __tablename__ = "projects"
+    __table_args__ = (UniqueConstraint("organization_id", "name", name="uq_project_organization_name"),)
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = Column(String, nullable=False, unique=True)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False, index=True, default=lambda: DEFAULT_ORGANIZATION_ID)
+    name = Column(String, nullable=False)
     description = Column(Text, nullable=True)
+    cost_center = Column(String(128), nullable=False, default="unassigned")
     status = Column(String, nullable=False, default="active")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     requirements = relationship("Requirement", back_populates="project")
+    organization = relationship("Organization", back_populates="projects")
     memberships = relationship("ProjectMembership", back_populates="project", cascade="all, delete-orphan")
     import_mapping_profiles = relationship(
         "ImportMappingProfile", back_populates="project", cascade="all, delete-orphan"
     )
+    knowledge_documents = relationship(
+        "KnowledgeDocument", back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False, unique=True)
+    slug = Column(String(128), nullable=False, unique=True)
+    status = Column(String(32), nullable=False, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    projects = relationship("Project", back_populates="organization")
+    memberships = relationship("OrganizationMembership", back_populates="organization", cascade="all, delete-orphan")
+
+
+class OrganizationMembership(Base):
+    __tablename__ = "organization_memberships"
+    __table_args__ = (UniqueConstraint("organization_id", "user_id", name="uq_organization_membership"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(32), nullable=False, default="member")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    organization = relationship("Organization", back_populates="memberships")
+    user = relationship("User", back_populates="organization_memberships")
+
+
+class Invitation(Base):
+    __tablename__ = "invitations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    email = Column(String(320), nullable=False, index=True)
+    organization_role = Column(String(32), nullable=False, default="member")
+    project_role = Column(String(64), nullable=True)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    invited_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    accepted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AIModelConfiguration(Base):
+    __tablename__ = "ai_model_configurations"
+    __table_args__ = (UniqueConstraint("scope_type", "scope_id", name="uq_ai_model_configuration_scope"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope_type = Column(String(16), nullable=False, index=True)
+    scope_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    generation_model = Column(String(255), nullable=False)
+    judge_model = Column(String(255), nullable=False)
+    embedding_model = Column(String(255), nullable=False)
+    vector_provider = Column(String(64), nullable=False, default="pinecone")
+    vector_index = Column(String(255), nullable=False)
+    vector_namespace = Column(String(255), nullable=False)
+    vector_host = Column(String(500), nullable=True)
+    credential_reference = Column(String(255), nullable=True)
+    evaluation_weights = Column(JSON, nullable=False, default=dict)
+    pricing = Column(JSON, nullable=False, default=dict)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class PromptConfiguration(Base):
+    """Scoped, versioned business prompt templates."""
+
+    __tablename__ = "prompt_configurations"
+    __table_args__ = (UniqueConstraint("scope_type", "scope_id", "prompt_key", name="uq_prompt_configuration_scope_key"),)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    scope_type = Column(String(16), nullable=False, index=True)
+    scope_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    prompt_key = Column(String(64), nullable=False, index=True)
+    system_template = Column(Text, nullable=False)
+    user_template = Column(Text, nullable=False)
+    variables = Column(JSON, nullable=False, default=list)
+    temperature = Column(Float, nullable=True)
+    change_notes = Column(Text, nullable=True)
+    version = Column(Integer, nullable=False, default=1)
+    status = Column(String(16), nullable=False, default="published", index=True)
+    content_checksum = Column(String(64), nullable=False, default="")
+    parent_configuration_id = Column(UUID(as_uuid=True), ForeignKey("prompt_configurations.id", ondelete="SET NULL"), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class PromptConfigurationVersion(Base):
+    """Immutable prompt snapshot used for history, rollback, and reproducibility."""
+
+    __tablename__ = "prompt_configuration_versions"
+    __table_args__ = (
+        UniqueConstraint("prompt_configuration_id", "version", name="uq_prompt_configuration_version"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    prompt_configuration_id = Column(UUID(as_uuid=True), ForeignKey("prompt_configurations.id", ondelete="CASCADE"), nullable=False, index=True)
+    prompt_key = Column(String(64), nullable=False, index=True)
+    scope_type = Column(String(16), nullable=False, index=True)
+    scope_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    version = Column(Integer, nullable=False)
+    system_template = Column(Text, nullable=False)
+    user_template = Column(Text, nullable=False)
+    variables = Column(JSON, nullable=False, default=list)
+    temperature = Column(Float, nullable=True)
+    change_notes = Column(Text, nullable=True)
+    status = Column(String(16), nullable=False)
+    content_checksum = Column(String(64), nullable=False)
+    parent_configuration_id = Column(UUID(as_uuid=True), nullable=True)
+    parent_version = Column(Integer, nullable=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
+class AIUsageRecord(Base):
+    __tablename__ = "ai_usage_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False, index=True)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    operation = Column(String(64), nullable=False, index=True)
+    model = Column(String(255), nullable=False)
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    cost_micros = Column(BigInteger, nullable=False, default=0)
+    input_rate_per_million = Column(Float, nullable=False, default=0)
+    output_rate_per_million = Column(Float, nullable=False, default=0)
+    pricing_source = Column(String(64), nullable=False, default="unpriced")
+    metadata_json = Column("metadata", JSON, key="metadata_json", nullable=False, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
 class ImportMappingProfile(Base):
@@ -192,6 +344,23 @@ class RequirementVersion(Base):
     requirement = relationship("Requirement", back_populates="versions")
 
 
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String(500), nullable=False)
+    content = Column(Text, nullable=False)
+    source = Column(String(64), nullable=False, default="manual")
+    status = Column(String(32), nullable=False, default="pending_index", index=True)
+    vector_id = Column(String(512), nullable=True)
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    project = relationship("Project", back_populates="knowledge_documents")
+
+
 class TestScenario(Base):
     __tablename__ = "test_scenarios"
 
@@ -301,6 +470,9 @@ class Feedback(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     target_level = Column(String, nullable=False)
     target_id = Column(UUID(as_uuid=True), nullable=False)
+    quality_evaluation_id = Column(
+        UUID(as_uuid=True), ForeignKey("quality_evaluations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     source = Column(String, nullable=False)
     feedback_type = Column(String, nullable=False)
     comment = Column(Text, nullable=False)
@@ -332,6 +504,9 @@ class QualityEvaluation(Base):
     __tablename__ = "quality_evaluations"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_event_id = Column(
+        UUID(as_uuid=True), ForeignKey("outbox_events.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
     target_level = Column(String, nullable=False)
     target_id = Column(UUID(as_uuid=True), nullable=False)
     score = Column(Integer, nullable=False)
@@ -346,6 +521,8 @@ class ImpactAnalysis(Base):
     __tablename__ = "impact_analyses"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    target_level = Column(String(32), nullable=False, default="requirement", index=True)
+    target_id = Column(UUID(as_uuid=True), nullable=True, index=True)
     requirement_id = Column(UUID(as_uuid=True), ForeignKey("requirements.id", ondelete="SET NULL"), nullable=True)
     source_text = Column(Text, nullable=False)
     similarity_threshold = Column(Integer, nullable=False, default=80)
@@ -575,6 +752,60 @@ class ApprovalRecord(Base):
     notes = Column(Text, nullable=True)
 
 
+class ApprovalWorkflowRun(Base):
+    __tablename__ = "approval_workflow_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "test_case_id", "test_case_version", "content_sha256", name="uq_approval_workflow_artifact"
+        ),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    test_case_id = Column(
+        UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    test_case_version = Column(Integer, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
+    policy_snapshot = Column(JSON, nullable=False)
+    status = Column(String(32), nullable=False, default="awaiting_evaluation", index=True)
+    current_stage = Column(Integer, nullable=False, default=0)
+    quality_evaluation_id = Column(
+        UUID(as_uuid=True), ForeignKey("quality_evaluations.id", ondelete="SET NULL"), nullable=True
+    )
+    created_by = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    decisions = relationship(
+        "ApprovalWorkflowDecision", back_populates="workflow_run", cascade="all, delete-orphan"
+    )
+
+
+class ApprovalWorkflowDecision(Base):
+    __tablename__ = "approval_workflow_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_run_id", "stage_index", "decided_by", name="uq_approval_workflow_stage_actor"
+        ),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_run_id = Column(
+        UUID(as_uuid=True), ForeignKey("approval_workflow_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage_index = Column(Integer, nullable=False)
+    stage_name = Column(String(255), nullable=False)
+    decision = Column(String(32), nullable=False)
+    decided_by = Column(String(255), nullable=False)
+    decided_role = Column(String(64), nullable=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    workflow_run = relationship("ApprovalWorkflowRun", back_populates="decisions")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -585,10 +816,12 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     active = Column(Boolean, nullable=False, default=True)
     token_version = Column(Integer, nullable=False, default=1)
+    settings_json = Column("settings", JSON, key="settings_json", nullable=False, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     project_memberships = relationship("ProjectMembership", back_populates="user", cascade="all, delete-orphan")
+    organization_memberships = relationship("OrganizationMembership", back_populates="user", cascade="all, delete-orphan")
 
 
 class ProjectMembership(Base):

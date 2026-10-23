@@ -36,7 +36,7 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 
 ### Out of scope
 - Domain-specific test automation code generation.
-- Advanced multi-tenant SaaS billing or tenant isolation beyond enterprise role-based access.
+- Payment collection, invoicing, and external subscription billing. AI usage and calculated cost reporting are in scope.
 
 ## Functional requirements
 
@@ -51,6 +51,10 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - FR5: The system shall include metadata tags for each scenario and test case: prerequisite, priority, severity, category, type.
 - FR6: The system shall produce test case steps with numbered actions and expected results.
 - FR7: The system shall persist generated content as draft until reviewed.
+- FR7a: Every generated or manually edited test case shall enqueue an idempotent, version-bound quality evaluation
+  without rolling back the saved draft when the judge is temporarily unavailable.
+- FR7b: Authorized project users shall be able to manually edit test-case metadata and the complete ordered step list.
+  Editing an approved case shall preserve its immutable approved snapshot and create a new draft version.
 
 ### Review and approval
 - FR8: The system shall display requirements, scenarios, and test cases in a reviewable React UI.
@@ -63,6 +67,10 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - FR13: The system shall open a feedback modal to capture user comments and intent.
 - FR14: The system shall store feedback in PostgreSQL and as embeddings in Pinecone.
 - FR15: The system shall use feedback context to revise or generate test cases in subsequent iterations.
+- FR15a: A reviewer shall be able to submit a test-case evaluation and its metric evidence as feedback, regenerate
+  the linked test case, and optionally run a new version-bound evaluation on the result.
+- FR15b: DeepEval metric evidence shall be attached to LLM feedback only through an explicit reviewer checkbox.
+  When unchecked, the feedback and regeneration prompt shall not contain the evaluation record or metric evidence.
 
 ### Impact analysis
 - FR16: The system shall identify duplicate test cases based on similarity >= 80%.
@@ -71,11 +79,14 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - FR19: The system shall present impact analysis results in the UI.
 
 ### Search and retrieval
-- FR20: The system shall store embeddings for requirements, approved test cases, and feedback in Pinecone.
-- FR21: The system shall retrieve relevant historical requirements and approved test cases for generation context.
+- FR20: The system shall store searchable current-record embeddings for test cases in every workflow state and retain
+  immutable approved-version embeddings for governed RAG retrieval.
+- FR21: Test-case evidence supplied to test-case generation or regeneration shall be limited to approved test cases;
+  requirements, feedback, and approved supporting evidence remain eligible under their own retrieval policies.
 - FR22: The system shall support similarity search for duplicate detection and impact analysis.
 - FR23: The web application shall provide project-scoped keyword, semantic, and hybrid search over requirements,
-  approved test cases, and feedback. Hybrid ranking shall preserve evidence from both retrieval methods.
+  test cases in every workflow state, and feedback. Users shall be able to select all, approved-only, or
+  unapproved-only test cases. Hybrid ranking shall preserve evidence from both retrieval methods.
 - FR24: The system shall bulk-import historical test cases, scenarios, and steps with stable external identities,
   atomic audit evidence, conflict detection, and asynchronous vector indexing.
 - FR25: The system shall reconcile missing vector-index events from canonical PostgreSQL records and index each
@@ -83,6 +94,19 @@ Build an enterprise-grade application that generates, reviews, approves, and man
 - FR26: The system shall support reusable project-scoped import mapping profiles for company-specific JSON and CSV
   requirement and historical test-case formats, with preview, allow-listed transforms, custom fields, audit evidence,
   and transactional vector-index intents.
+- FR27: The system shall isolate administration into app, organization, and project scopes. App administrators have
+  complete application control; organization and project administrators cannot grant themselves or others a higher scope.
+- FR28: Organizations shall contain users and multiple projects. Every project shall belong to one organization and
+  carry a cost-center identifier.
+- FR29: Authorized administrators shall create users, issue expiring single-use invitations, and assign global,
+  organization, and project roles through server-enforced policies.
+- FR30: Authorized administrators shall configure generation, judge, embedding, and vector-store settings at app,
+  organization, or project scope without exposing raw credentials to the browser.
+- FR31: The system shall record provider token usage, immutable rate snapshot, pricing source, and calculated cost per
+  organization, project, operation, user, and model, and expose scoped cost summaries and unpriced-model warnings.
+- FR32: Every generated test-case evaluation shall expose weighted requirement coverage, grounding, correctness,
+  completeness, relevance, hallucination rate, executability, boundary/negative coverage, and traceability metrics
+  with red/amber/green status and evidence-based justification.
 
 ## Non-functional requirements
 

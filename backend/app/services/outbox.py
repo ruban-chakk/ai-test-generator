@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import json
+import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -13,7 +14,9 @@ from app.core.config import Settings, settings
 from app.models import (
     Alert,
     Feedback,
+    KnowledgeDocument,
     OutboxEvent,
+    QualityEvaluation,
     RepositorySyncRun,
     Requirement,
     RequirementVersion,
@@ -32,10 +35,12 @@ from app.services.indexing import IndexableArtifact, IndexingResult, IndexingSer
 TEST_CASE_INDEX_REQUESTED = "test_case.index_requested"
 TEST_CASE_VERSION_INDEX_REQUESTED = "test_case_version.index_requested"
 FEEDBACK_INDEX_REQUESTED = "feedback.index_requested"
+KNOWLEDGE_DOCUMENT_INDEX_REQUESTED = "knowledge_document.index_requested"
 REQUIREMENT_INDEX_REQUESTED = "requirement.index_requested"
 REQUIREMENT_VERSION_INDEX_REQUESTED = "requirement_version.index_requested"
 TEST_CASE_REPOSITORY_SYNC_REQUESTED = "test_case.repository_sync_requested"
 TEST_CASE_EXECUTION_REQUESTED = "test_case.execution_requested"
+TEST_CASE_QUALITY_EVALUATION_REQUESTED = "test_case.quality_evaluation_requested"
 
 
 def _utcnow() -> datetime:
@@ -197,12 +202,24 @@ class OutboxProcessor:
                     TEST_CASE_INDEX_REQUESTED,
                     TEST_CASE_VERSION_INDEX_REQUESTED,
                     FEEDBACK_INDEX_REQUESTED,
+                    KNOWLEDGE_DOCUMENT_INDEX_REQUESTED,
                 }:
                     operation = ("index", await self._load_artifact(db, event))
                 elif event.event_type == TEST_CASE_REPOSITORY_SYNC_REQUESTED:
                     operation = ("repository", await self._load_repository_delivery(db, event))
                 elif event.event_type == TEST_CASE_EXECUTION_REQUESTED:
                     operation = ("execution", await self._load_execution(db, event))
+                elif event.event_type == TEST_CASE_QUALITY_EVALUATION_REQUESTED:
+                    existing = await db.scalar(
+                        select(QualityEvaluation).where(QualityEvaluation.source_event_id == event.id)
+                    )
+                    operation = (
+                        "noop",
+                        None,
+                    ) if existing else (
+                        "quality",
+                        (event.id, event.aggregate_id, dict(event.payload or {})),
+                    )
                 elif event.event_type == ALERT_DELIVERY_REQUESTED:
                     operation = ("alert", await self._load_alert(db, event))
                 else:
@@ -231,7 +248,10 @@ class OutboxProcessor:
                     environment=environment,
                     idempotency_key=idempotency_key,
                 )
-            else:
+            elif operation[0] == "quality":
+                source_event_id, test_case_id, payload = operation[1]
+                await self._evaluate_test_case(source_event_id, test_case_id, payload)
+            elif operation[0] == "alert":
                 if self._alert_client is None:
                     self._alert_client = AlertWebhookClient(self._config)
                 alert, idempotency_key = operation[1]
@@ -263,10 +283,10 @@ class OutboxProcessor:
                     if requirement and requirement.version == version.version:
                         requirement.vector_id = version.vector_id
             elif event.event_type == TEST_CASE_INDEX_REQUESTED:
-                test_case = await db.get(TestCase, event.aggregate_id)
-                if test_case:
-                    test_case.repository_status = "indexed"
-                    test_case.repository_synced_at = event.processed_at
+                # Current-record vectors power Search for every workflow state.
+                # Repository delivery status is governed by approved-version indexing
+                # and repository sync, not by this search projection.
+                pass
             elif event.event_type == TEST_CASE_VERSION_INDEX_REQUESTED:
                 version = await db.get(TestCaseVersion, event.aggregate_id)
                 if version:
@@ -276,6 +296,11 @@ class OutboxProcessor:
                         test_case.vector_id = version.vector_id
                         test_case.repository_status = "indexed"
                         test_case.repository_synced_at = event.processed_at
+            elif event.event_type == KNOWLEDGE_DOCUMENT_INDEX_REQUESTED:
+                document = await db.get(KnowledgeDocument, event.aggregate_id)
+                if document:
+                    document.vector_id = document.vector_id or f"knowledge_document:{document.id}"
+                    document.status = "indexed"
             elif event.event_type == TEST_CASE_REPOSITORY_SYNC_REQUESTED:
                 await self._complete_repository_delivery(db, event)
             elif event.event_type == TEST_CASE_EXECUTION_REQUESTED and execution_result is not None:
@@ -283,6 +308,42 @@ class OutboxProcessor:
             elif event.event_type == ALERT_DELIVERY_REQUESTED:
                 await self._complete_alert_delivery(db, event)
             await db.commit()
+
+    async def _evaluate_test_case(
+        self,
+        source_event_id: uuid.UUID,
+        test_case_id: uuid.UUID,
+        payload: dict,
+    ) -> None:
+        # Imported lazily to keep HTTP adapters out of the outbox module's import
+        # graph while reusing the same authoritative evaluation transaction.
+        from app.api.routes import _evaluate_quality_impl
+        from app.core.security import Principal, _principal_context
+
+        try:
+            actor_id = uuid.UUID(str(payload["requested_by_id"]))
+            actor = str(payload["requested_by"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("quality evaluation event has no valid actor") from exc
+
+        principal_token = _principal_context.set(
+            Principal(
+                user_id=actor_id,
+                username=actor,
+                role="app_admin",
+                token_version=0,
+            )
+        )
+        try:
+            async with self._session_factory() as db:
+                await _evaluate_quality_impl(
+                    "test_case",
+                    str(test_case_id),
+                    db,
+                    source_event_id=source_event_id,
+                )
+        finally:
+            _principal_context.reset(principal_token)
 
     async def _replace_vector_chunk_inventory(
         self,
@@ -470,7 +531,7 @@ class OutboxProcessor:
             )
             identity = f"Test case: {test_case.external_id or test_case.id} — {test_case.title}"
             return await self._tracked_artifact(db, event, IndexableArtifact(
-                vector_id=test_case.vector_id or f"test_case:{test_case.id}:v{test_case.version}",
+                vector_id=f"test_case:{test_case.id}:current",
                 entity_type="test_case",
                 entity_id=str(test_case.id),
                 project_id=str(requirement.project_id),
@@ -492,8 +553,9 @@ class OutboxProcessor:
                     "scenario_id": str(test_case.scenario_id),
                     "title": test_case.title,
                     "status": test_case.status,
-                    "repository_status": "indexed",
+                    "repository_status": test_case.repository_status,
                     "version": test_case.version,
+                    "artifact_scope": "current",
                     "priority": test_case.priority or "",
                     "severity": test_case.severity or "",
                     "category": test_case.category or "",
@@ -573,6 +635,8 @@ class OutboxProcessor:
                     "type": version.type or "",
                     "approved_at": version.approved_at.isoformat(),
                     "immutable_version": True,
+                    "artifact_scope": "approved_version",
+                    "rag_eligible": True,
                     **_custom_field_metadata(
                         version.custom_fields_json or {}, version.custom_field_schema_json or {}
                     ),
@@ -601,6 +665,27 @@ class OutboxProcessor:
                     "target_id": str(feedback.target_id),
                     "feedback_type": feedback.feedback_type,
                     "status": feedback.status,
+                },
+            ))
+
+        if event.event_type == KNOWLEDGE_DOCUMENT_INDEX_REQUESTED:
+            document = await db.get(KnowledgeDocument, event.aggregate_id)
+            if not document:
+                raise LookupError("knowledge document no longer exists")
+            return await self._tracked_artifact(db, event, IndexableArtifact(
+                vector_id=document.vector_id or f"knowledge_document:{document.id}",
+                entity_type="knowledge_document",
+                entity_id=str(document.id),
+                project_id=str(document.project_id),
+                text=f"Title: {document.title}\nContent: {document.content}",
+                logical_segments=(
+                    f"Supporting document: {document.title}",
+                    document.content,
+                ),
+                metadata={
+                    "title": document.title,
+                    "source": document.source,
+                    "status": document.status,
                 },
             ))
 
@@ -785,9 +870,16 @@ class OutboxProcessor:
             feedback = await db.get(Feedback, event.aggregate_id)
             requirement = await self._feedback_requirement(db, feedback) if feedback else None
             return requirement.project_id if requirement else None
+        if event.event_type == KNOWLEDGE_DOCUMENT_INDEX_REQUESTED:
+            document = await db.get(KnowledgeDocument, event.aggregate_id)
+            return document.project_id if document else None
         if event.event_type == TEST_CASE_EXECUTION_REQUESTED:
             execution_run = await db.get(TestExecutionRun, event.aggregate_id)
             return execution_run.project_id if execution_run else None
+        if event.event_type == TEST_CASE_QUALITY_EVALUATION_REQUESTED:
+            test_case = await db.get(TestCase, event.aggregate_id)
+            requirement = await db.get(Requirement, test_case.requirement_id) if test_case else None
+            return requirement.project_id if requirement else None
         if event.event_type == TEST_CASE_REPOSITORY_SYNC_REQUESTED:
             sync_run_id = event.payload.get("sync_run_id")
             if sync_run_id:
@@ -803,7 +895,7 @@ class OutboxProcessor:
         return None
 
     async def _feedback_requirement(self, db: AsyncSession, feedback: Feedback) -> Requirement:
-        if feedback.target_level == "requirement":
+        if feedback.target_level in {"requirement", "suite"}:
             requirement = await db.get(Requirement, feedback.target_id)
         elif feedback.target_level == "scenario":
             scenario = await db.get(TestScenario, feedback.target_id)

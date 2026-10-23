@@ -4,13 +4,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     AuditLog,
     Feedback,
     IntegrationRun,
+    KnowledgeDocument,
     OutboxEvent,
     Requirement,
     RequirementVersion,
@@ -20,6 +21,7 @@ from app.models import (
 )
 from app.services.outbox import (
     FEEDBACK_INDEX_REQUESTED,
+    KNOWLEDGE_DOCUMENT_INDEX_REQUESTED,
     REQUIREMENT_INDEX_REQUESTED,
     REQUIREMENT_VERSION_INDEX_REQUESTED,
     TEST_CASE_INDEX_REQUESTED,
@@ -40,6 +42,7 @@ class VectorBackfillResult:
     test_case_count: int
     test_case_version_count: int
     feedback_count: int
+    knowledge_document_count: int
 
 
 @dataclass(frozen=True)
@@ -151,34 +154,29 @@ async def enqueue_vector_backfill(
     )
     version_case_by_id = {test_case.id: test_case for test_case in version_cases}
 
-    current_version_exists = exists(
-        select(TestCaseVersion.id).where(
-            TestCaseVersion.test_case_id == TestCase.id,
-            TestCaseVersion.version == TestCase.version,
-        )
-    )
     test_cases_stmt = (
         select(TestCase)
         .join(Requirement, Requirement.id == TestCase.requirement_id)
-        .where(TestCase.status == "approved", ~current_version_exists)
     )
     if project_id is not None:
         test_cases_stmt = test_cases_stmt.where(Requirement.project_id == project_id)
     if not include_all:
-        test_case_completed = exists(
+        current_search_projection_completed = exists(
             select(OutboxEvent.id).where(
                 OutboxEvent.event_type == TEST_CASE_INDEX_REQUESTED,
                 OutboxEvent.aggregate_id == TestCase.id,
+                OutboxEvent.event_key == func.concat(
+                    "test_case.current_index:",
+                    TestCase.id,
+                    ":v",
+                    TestCase.version,
+                    ":",
+                    TestCase.status,
+                ),
                 OutboxEvent.status == "completed",
             )
         )
-        test_cases_stmt = test_cases_stmt.where(
-            or_(
-                TestCase.vector_id.is_(None),
-                TestCase.repository_status != "indexed",
-                ~test_case_completed,
-            )
-        )
+        test_cases_stmt = test_cases_stmt.where(~current_search_projection_completed)
     test_cases = list((await db.execute(test_cases_stmt)).scalars().all())
 
     feedback_completed = exists(
@@ -205,12 +203,28 @@ async def enqueue_vector_backfill(
         )
         feedback_stmt = feedback_stmt.where(
             or_(
-                and_(Feedback.target_level == "requirement", Feedback.target_id.in_(requirement_ids)),
+                and_(Feedback.target_level.in_({"requirement", "suite"}), Feedback.target_id.in_(requirement_ids)),
                 and_(Feedback.target_level == "scenario", Feedback.target_id.in_(scenario_ids)),
                 and_(Feedback.target_level == "test_case", Feedback.target_id.in_(test_case_ids)),
             )
         )
     feedback_items = list((await db.execute(feedback_stmt)).scalars().all())
+
+    knowledge_completed = exists(
+        select(OutboxEvent.id).where(
+            OutboxEvent.event_type == KNOWLEDGE_DOCUMENT_INDEX_REQUESTED,
+            OutboxEvent.aggregate_id == KnowledgeDocument.id,
+            OutboxEvent.status == "completed",
+        )
+    )
+    knowledge_stmt = select(KnowledgeDocument)
+    if project_id is not None:
+        knowledge_stmt = knowledge_stmt.where(KnowledgeDocument.project_id == project_id)
+    if not include_all:
+        knowledge_stmt = knowledge_stmt.where(
+            or_(KnowledgeDocument.vector_id.is_(None), ~knowledge_completed)
+        )
+    knowledge_documents = list((await db.execute(knowledge_stmt)).scalars().all())
 
     candidates: list[_Candidate] = []
     for requirement in requirements:
@@ -237,16 +251,15 @@ async def enqueue_vector_backfill(
             )
         )
     for test_case in test_cases:
-        test_case.vector_id = f"test_case:{test_case.id}:v{test_case.version}"
-        if test_case.repository_status != "indexed":
-            test_case.repository_status = "pending_index"
-            test_case.repository_synced_at = None
         candidates.append(
             _Candidate(
                 event_type=TEST_CASE_INDEX_REQUESTED,
                 aggregate_type="test_case",
                 aggregate_id=test_case.id,
-                event_key=f"vector.reconcile:test_case:{test_case.id}:v{test_case.version}",
+                event_key=(
+                    f"test_case.current_index:{test_case.id}:v{test_case.version}:"
+                    f"{test_case.status}"
+                ),
             )
         )
     for version in test_case_versions:
@@ -273,6 +286,17 @@ async def enqueue_vector_backfill(
                 aggregate_type="feedback",
                 aggregate_id=feedback.id,
                 event_key=f"vector.reconcile:feedback:{feedback.id}",
+            )
+        )
+    for document in knowledge_documents:
+        document.vector_id = document.vector_id or f"knowledge_document:{document.id}"
+        document.status = "pending_index"
+        candidates.append(
+            _Candidate(
+                event_type=KNOWLEDGE_DOCUMENT_INDEX_REQUESTED,
+                aggregate_type="knowledge_document",
+                aggregate_id=document.id,
+                event_key=f"vector.reconcile:knowledge_document:{document.id}",
             )
         )
 
@@ -347,6 +371,7 @@ async def enqueue_vector_backfill(
             "test_case_count": len(test_cases),
             "test_case_version_count": len(test_case_versions),
             "feedback_count": len(feedback_items),
+            "knowledge_document_count": len(knowledge_documents),
         },
         completed_at=now,
     )
@@ -380,4 +405,5 @@ async def enqueue_vector_backfill(
         test_case_count=len(test_cases),
         test_case_version_count=len(test_case_versions),
         feedback_count=len(feedback_items),
+        knowledge_document_count=len(knowledge_documents),
     )

@@ -38,6 +38,16 @@ export type TestCaseSummary = {
   custom_field_schema_json?: Record<string, unknown>;
 };
 
+export type TestCaseInventoryItem = TestCaseSummary & {
+  requirement_id: string;
+  requirement_title: string;
+  scenario_id: string;
+  scenario_title: string;
+  project_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type TestScenarioSummary = {
   id: string;
   external_id?: string;
@@ -54,8 +64,10 @@ export type TestScenarioSummary = {
 
 export type ProjectSummary = {
   id: string;
+  organization_id?: string;
   name: string;
   description?: string;
+  cost_center?: string;
   status: string;
   requirement_count: number;
   test_case_count: number;
@@ -67,6 +79,117 @@ export type ProjectCreatePayload = {
   name: string;
   description?: string;
   status?: string;
+  organization_id?: string;
+  cost_center?: string;
+};
+
+export type AdminContext = {
+  is_app_admin: boolean;
+  organization_admin_ids: string[];
+  project_admin_ids: string[];
+};
+
+export type OrganizationSummary = {
+  id: string;
+  name: string;
+  slug: string;
+  status: string;
+  project_count: number;
+  member_count: number;
+  created_at: string;
+};
+
+export type InvitationSummary = {
+  id: string;
+  organization_id: string;
+  project_id?: string;
+  email: string;
+  organization_role: string;
+  project_role?: string;
+  status: string;
+  expires_at: string;
+  created_at: string;
+  invitation_token?: string;
+};
+
+export type ScopedMembership = {
+  id: string;
+  organization_id?: string;
+  project_id?: string;
+  user_id: string;
+  username: string;
+  email: string;
+  role: string;
+  created_at: string;
+};
+
+export type AIModelConfiguration = {
+  id?: string;
+  scope_type?: string;
+  scope_id?: string;
+  generation_model: string;
+  judge_model: string;
+  embedding_model: string;
+  vector_provider: 'pinecone';
+  vector_index: string;
+  vector_namespace: string;
+  vector_host?: string;
+  credential_reference?: string;
+  evaluation_weights: Record<string, number>;
+  pricing: Record<string, number>;
+  updated_by?: string;
+  updated_at?: string;
+};
+
+export type PromptConfiguration = {
+  id?: string;
+  scope_type?: string;
+  scope_id?: string;
+  prompt_key: 'test_case_generation' | 'feedback_regeneration' | 'test_case_evaluation';
+  system_template: string;
+  user_template: string;
+  variables: string[];
+  temperature?: number;
+  change_notes?: string;
+  version?: number;
+  status?: 'draft' | 'published' | 'retired';
+  content_checksum?: string;
+  parent_configuration_id?: string;
+  parent_version?: number;
+  created_by?: string;
+  approved_by?: string;
+  published_at?: string;
+  updated_by?: string;
+  created_at?: string;
+  updated_at?: string;
+  effective_scope_type?: string;
+  effective_scope_id?: string;
+  inherited?: boolean;
+};
+
+export type PromptConfigurationVersion = Omit<PromptConfiguration, 'id' | 'updated_at'> & {
+  id: string;
+  prompt_configuration_id: string;
+  created_at: string;
+  content_checksum: string;
+  change_notes?: string;
+};
+
+export type AICostSummary = {
+  scope_type: string;
+  scope_id: string;
+  total_cost_micros: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  by_project: { project_id: string; cost_micros: number; tokens: number }[];
+  by_model: { model: string; cost_micros: number; input_tokens: number; output_tokens: number; tokens: number; pricing_sources: string[] }[];
+  unpriced_models: string[];
+};
+
+export type UserPreferences = {
+  theme: 'light' | 'dark' | 'system';
+  density: 'comfortable' | 'compact';
+  reduce_motion: boolean;
 };
 
 export type RequirementSummary = {
@@ -131,6 +254,11 @@ export type TestCaseCreatePayload = {
   status?: string;
 };
 
+export type TestCaseUpdatePayload = Omit<TestCaseCreatePayload, 'status'> & {
+  expected_version: number;
+  steps: TestCaseStep[];
+};
+
 export type TestCaseStepCreatePayload = {
   step_number: number;
   action: string;
@@ -142,6 +270,63 @@ export type ApprovalActionPayload = {
   notes?: string;
 };
 
+export type ApprovalStageDefinition = {
+  name: string;
+  required_roles: string[];
+  minimum_approvals: number;
+};
+
+export type ApprovalWorkflow = {
+  project_id: string;
+  name: string;
+  version: number;
+  stages: ApprovalStageDefinition[];
+  evaluation_required: boolean;
+  minimum_evaluation_score: number;
+  allow_same_approver_multiple_stages: boolean;
+  updated_at?: string;
+};
+
+export type ApprovalWorkflowDecision = {
+  id: string;
+  stage_index: number;
+  stage_name: string;
+  decision: string;
+  decided_by: string;
+  decided_role: string;
+  notes?: string;
+  created_at: string;
+};
+
+export type ApprovalWorkflowRun = {
+  id: string;
+  project_id: string;
+  test_case_id: string;
+  test_case_version: number;
+  content_sha256: string;
+  status: string;
+  current_stage: number;
+  policy: ApprovalWorkflow;
+  quality_evaluation_id?: string;
+  decisions: ApprovalWorkflowDecision[];
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
+};
+
+export type KnowledgeDocument = {
+  id: string;
+  project_id: string;
+  title: string;
+  content: string;
+  source: string;
+  status: string;
+  vector_id?: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type FeedbackCreatePayload = {
   target_level: string;
   target_id: string;
@@ -149,6 +334,7 @@ export type FeedbackCreatePayload = {
   feedback_type: string;
   comment: string;
   created_by: string;
+  quality_evaluation_id?: string;
 };
 
 export type FeedbackSummary = FeedbackCreatePayload & {
@@ -183,6 +369,7 @@ export type RevisionRecordSummary = {
 
 export type QualityEvaluationSummary = {
   id: string;
+  source_event_id?: string;
   target_level: string;
   target_id: string;
   score: number;
@@ -211,6 +398,8 @@ export type ImpactCandidate = {
 
 export type ImpactAnalysisSummary = {
   id: string;
+  target_level: 'requirement' | 'scenario' | 'test_case';
+  target_id?: string;
   requirement_id?: string;
   source_text: string;
   similarity_threshold: number;
@@ -289,6 +478,7 @@ export type SemanticSearchResult = {
 };
 
 export type SearchMode = 'hybrid' | 'semantic' | 'keyword';
+export type TestCaseApprovalFilter = 'all' | 'approved' | 'unapproved';
 
 export async function searchArtifacts(
   projectId: string,
@@ -298,6 +488,7 @@ export async function searchArtifacts(
   offset = 0,
   customField?: string,
   customValue?: string,
+  testCaseApproval: TestCaseApprovalFilter = 'all',
 ): Promise<SemanticSearchResult[]> {
   const params = new URLSearchParams({ project_id: projectId, query, mode });
   if (entityType) params.set('entity_type', entityType);
@@ -306,6 +497,7 @@ export async function searchArtifacts(
     params.set('custom_field', customField);
     params.set('custom_value', customValue);
   }
+  if (testCaseApproval !== 'all') params.set('test_case_approval', testCaseApproval);
   return request<SemanticSearchResult[]>(`${API_BASE_URL}/search?${params.toString()}`, {
     headers: { 'Content-Type': 'application/json' },
   });
@@ -630,8 +822,9 @@ export type AuthenticatedUser = {
   id: string;
   username: string;
   email: string;
-  role: 'reviewer' | 'approver' | 'admin';
+  role: 'user' | 'reviewer' | 'tester' | 'test_lead' | 'product_manager' | 'approver' | 'admin' | 'app_admin';
   active: boolean;
+  settings_json?: Partial<UserPreferences>;
 };
 
 export type AuthConfiguration = {
@@ -654,8 +847,129 @@ export async function login(username: string, password: string): Promise<Authent
   return getCurrentUser();
 }
 
+export async function acceptInvitation(token: string, payload: { username: string; password: string }): Promise<AuthenticatedUser> {
+  return request<AuthenticatedUser>(`${API_BASE_URL}/auth/invitations/${encodeURIComponent(token)}/accept`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
 export async function getCurrentUser(): Promise<AuthenticatedUser> {
   return request<AuthenticatedUser>(`${API_BASE_URL}/auth/me`);
+}
+
+export async function updateCurrentUser(payload: { username: string; email: string }): Promise<AuthenticatedUser> {
+  return request<AuthenticatedUser>(`${API_BASE_URL}/auth/me`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateUserSettings(payload: UserPreferences): Promise<AuthenticatedUser> {
+  return request<AuthenticatedUser>(`${API_BASE_URL}/auth/me/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getAdminContext(): Promise<AdminContext> {
+  return request<AdminContext>(`${API_BASE_URL}/admin/context`);
+}
+
+export async function getOrganizations(): Promise<OrganizationSummary[]> {
+  return request<OrganizationSummary[]>(`${API_BASE_URL}/admin/organizations`);
+}
+
+export async function createOrganization(payload: { name: string; slug: string }): Promise<OrganizationSummary> {
+  return request<OrganizationSummary>(`${API_BASE_URL}/admin/organizations`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+export async function getAdminUsers(organizationId?: string, projectId?: string): Promise<AuthenticatedUser[]> {
+  const params = new URLSearchParams();
+  if (organizationId) params.set('organization_id', organizationId);
+  if (projectId) params.set('project_id', projectId);
+  return request<AuthenticatedUser[]>(`${API_BASE_URL}/admin/users${params.size ? `?${params}` : ''}`);
+}
+
+export async function createAdminUser(payload: { username: string; email: string; password: string; role: AuthenticatedUser['role'] }): Promise<AuthenticatedUser> {
+  return request<AuthenticatedUser>(`${API_BASE_URL}/admin/users`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+export async function updateAdminUserRole(userId: string, payload: { role: AuthenticatedUser['role']; active: boolean }): Promise<AuthenticatedUser> {
+  return request<AuthenticatedUser>(`${API_BASE_URL}/admin/users/${userId}/role`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+export async function createInvitation(payload: { email: string; organization_id: string; project_id?: string; organization_role: string; project_role?: string; expires_in_days: number }): Promise<InvitationSummary> {
+  return request<InvitationSummary>(`${API_BASE_URL}/admin/invitations`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+export async function getOrganizationMembers(organizationId: string): Promise<ScopedMembership[]> {
+  return request<ScopedMembership[]>(`${API_BASE_URL}/admin/organizations/${organizationId}/members`);
+}
+
+export async function putOrganizationMember(organizationId: string, userId: string, role: string): Promise<ScopedMembership> {
+  return request<ScopedMembership>(`${API_BASE_URL}/admin/organizations/${organizationId}/members`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: userId, role }),
+  });
+}
+
+export async function getProjectMembers(projectId: string): Promise<ScopedMembership[]> {
+  return request<ScopedMembership[]>(`${API_BASE_URL}/projects/${projectId}/members`);
+}
+
+export async function putProjectMember(projectId: string, userId: string, role: string): Promise<ScopedMembership> {
+  return request<ScopedMembership>(`${API_BASE_URL}/projects/${projectId}/members`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: userId, role }),
+  });
+}
+
+export async function getModelConfiguration(scopeType: string, scopeId?: string): Promise<AIModelConfiguration | null> {
+  const params = scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : '';
+  return request<AIModelConfiguration | null>(`${API_BASE_URL}/admin/model-config/${scopeType}${params}`);
+}
+
+export async function putModelConfiguration(scopeType: string, scopeId: string | undefined, payload: AIModelConfiguration): Promise<AIModelConfiguration> {
+  const params = scopeId ? `?scope_id=${encodeURIComponent(scopeId)}` : '';
+  return request<AIModelConfiguration>(`${API_BASE_URL}/admin/model-config/${scopeType}${params}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+export async function getPromptConfiguration(promptKey: PromptConfiguration['prompt_key'], scopeType: string, scopeId?: string): Promise<PromptConfiguration | null> {
+  const params = new URLSearchParams({ scope_type: scopeType });
+  if (scopeId) params.set('scope_id', scopeId);
+  return request<PromptConfiguration | null>(`${API_BASE_URL}/admin/prompt-config/${promptKey}?${params.toString()}`);
+}
+
+export async function getEffectivePromptConfiguration(promptKey: PromptConfiguration['prompt_key'], projectId: string, targetScope: 'app' | 'organization' | 'project' = 'project'): Promise<PromptConfiguration> {
+  return request<PromptConfiguration>(`${API_BASE_URL}/admin/prompt-config/${promptKey}/effective?project_id=${encodeURIComponent(projectId)}&target_scope=${targetScope}`);
+}
+
+export async function getPromptConfigurationHistory(promptKey: PromptConfiguration['prompt_key'], scopeType: string, scopeId?: string): Promise<PromptConfigurationVersion[]> {
+  const params = new URLSearchParams({ scope_type: scopeType });
+  if (scopeId) params.set('scope_id', scopeId);
+  return request<PromptConfigurationVersion[]>(`${API_BASE_URL}/admin/prompt-config/${promptKey}/history?${params.toString()}`);
+}
+
+export async function putPromptConfiguration(promptKey: PromptConfiguration['prompt_key'], scopeType: string, scopeId: string | undefined, payload: PromptConfiguration): Promise<PromptConfiguration> {
+  const params = new URLSearchParams({ scope_type: scopeType });
+  if (scopeId) params.set('scope_id', scopeId);
+  return request<PromptConfiguration>(`${API_BASE_URL}/admin/prompt-config/${promptKey}?${params.toString()}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+export async function getAICostSummary(scopeType: 'organization' | 'project', scopeId: string): Promise<AICostSummary> {
+  return request<AICostSummary>(`${API_BASE_URL}/admin/costs/${scopeType}/${scopeId}`);
 }
 
 export async function logout(): Promise<void> {
@@ -717,6 +1031,25 @@ export async function createProject(payload: ProjectCreatePayload): Promise<Proj
     body: JSON.stringify(payload),
   });
   return handleResponse<ProjectSummary>(response);
+}
+
+export async function updateProject(projectId: string, payload: ProjectCreatePayload): Promise<ProjectSummary> {
+  return request<ProjectSummary>(`${API_BASE_URL}/projects/${projectId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getTestCases(
+  projectId: string,
+  filters: { search?: string; status?: string; source?: string } = {},
+): Promise<TestCaseInventoryItem[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  if (filters.search) params.set('search', filters.search);
+  if (filters.status) params.set('status', filters.status);
+  if (filters.source) params.set('source', filters.source);
+  return request<TestCaseInventoryItem[]>(`${API_BASE_URL}/test_cases?${params.toString()}`);
 }
 
 export async function getRequirements(
@@ -802,6 +1135,17 @@ export async function createTestCaseForScenario(
     body: JSON.stringify(payload),
   });
   return handleResponse<TestCaseSummary>(response);
+}
+
+export async function updateTestCase(
+  testCaseId: string,
+  payload: TestCaseUpdatePayload,
+): Promise<TestCaseSummary> {
+  return request<TestCaseSummary>(`${API_BASE_URL}/test_cases/${testCaseId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function appendTestCaseStep(
@@ -902,6 +1246,40 @@ export async function rejectTestCase(
   return handleResponse<TestCaseSummary>(response);
 }
 
+export async function getProjectApprovalWorkflow(projectId: string): Promise<ApprovalWorkflow> {
+  return request<ApprovalWorkflow>(`${API_BASE_URL}/projects/${projectId}/approval-workflow`);
+}
+
+export async function updateProjectApprovalWorkflow(
+  projectId: string,
+  payload: Omit<ApprovalWorkflow, 'project_id' | 'version' | 'updated_at'>,
+): Promise<ApprovalWorkflow> {
+  return request<ApprovalWorkflow>(`${API_BASE_URL}/projects/${projectId}/approval-workflow`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getTestCaseApprovalWorkflow(testCaseId: string): Promise<ApprovalWorkflowRun | null> {
+  return request<ApprovalWorkflowRun | null>(`${API_BASE_URL}/test_cases/${testCaseId}/approval-workflow`);
+}
+
+export async function createKnowledgeDocument(
+  projectId: string,
+  payload: { title: string; content: string; source?: string },
+): Promise<KnowledgeDocument> {
+  return request<KnowledgeDocument>(`${API_BASE_URL}/projects/${projectId}/knowledge-documents`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getKnowledgeDocuments(projectId: string): Promise<KnowledgeDocument[]> {
+  return request<KnowledgeDocument[]>(`${API_BASE_URL}/projects/${projectId}/knowledge-documents`);
+}
+
 export async function createFeedback(
   payload: FeedbackCreatePayload,
 ): Promise<FeedbackSummary> {
@@ -981,10 +1359,14 @@ export async function getApprovals(
 export async function getAudit(
   entityType?: string,
   entityId?: string,
+  scopeType?: 'app' | 'organization' | 'project',
+  scopeId?: string,
 ): Promise<AuditLogSummary[]> {
   const params = new URLSearchParams();
   if (entityType) params.set('entity_type', entityType);
   if (entityId) params.set('entity_id', entityId);
+  if (scopeType) params.set('scope_type', scopeType);
+  if (scopeId) params.set('scope_id', scopeId);
   const url = `${API_BASE_URL}/audit${params.toString() ? `?${params.toString()}` : ''}`;
   const response = await fetch(url, {
     headers: {
@@ -1048,6 +1430,21 @@ export async function getRequirementImpact(requirementId: string): Promise<Impac
     },
   });
   return handleResponse<ImpactAnalysisSummary>(response);
+}
+
+export async function getScenarioImpact(scenarioId: string): Promise<ImpactAnalysisSummary> {
+  const response = await fetch(`${API_BASE_URL}/scenarios/${scenarioId}/impact`, { headers: { 'Content-Type': 'application/json' } });
+  return handleResponse<ImpactAnalysisSummary>(response);
+}
+
+export async function getTestCaseImpact(testCaseId: string): Promise<ImpactAnalysisSummary> {
+  const response = await fetch(`${API_BASE_URL}/test_cases/${testCaseId}/impact`, { headers: { 'Content-Type': 'application/json' } });
+  return handleResponse<ImpactAnalysisSummary>(response);
+}
+
+export async function getImpactAnalyses(targetId: string, targetLevel: 'requirement' | 'scenario' | 'test_case'): Promise<ImpactAnalysisSummary[]> {
+  const params = new URLSearchParams({ target_level: targetLevel, target_id: targetId });
+  return request<ImpactAnalysisSummary[]>(`${API_BASE_URL}/impact?${params.toString()}`);
 }
 
 export async function analyzeImpact(payload: ImpactAnalyzePayload): Promise<ImpactAnalysisSummary> {

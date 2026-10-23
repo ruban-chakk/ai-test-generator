@@ -108,7 +108,7 @@ def test_historical_import_is_atomic_idempotent_and_indexes_immutable_version() 
                 assert first.created_test_case_count == 1
                 assert first.updated_test_case_count == 0
                 assert first.existing_test_case_count == 0
-                assert first.queued_vector_count == 1
+                assert first.queued_vector_count == 2
 
             async with session_factory() as db:
                 second = await import_historical_test_cases(
@@ -193,7 +193,7 @@ def test_historical_import_is_atomic_idempotent_and_indexes_immutable_version() 
                 )
                 assert updated.created_test_case_count == 0
                 assert updated.updated_test_case_count == 1
-                assert updated.queued_vector_count == 1
+                assert updated.queued_vector_count == 2
                 test_case = await db.scalar(
                     select(CaseModel)
                     .join(Requirement, Requirement.id == CaseModel.requirement_id)

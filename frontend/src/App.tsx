@@ -7,9 +7,15 @@ import RequirementCreate from './pages/RequirementCreate';
 import Operations from './pages/Operations';
 import SemanticSearch from './pages/SemanticSearch';
 import Executions from './pages/Executions';
+import TestCaseDashboard from './pages/TestCaseDashboard';
+import ProjectSettings from './pages/ProjectSettings';
+import UserProfile from './pages/UserProfile';
+import AdminSettings from './pages/AdminSettings';
+import AcceptInvitation from './pages/AcceptInvitation';
 import {
   AuthenticatedUser,
-  createProject,
+  AdminContext,
+  getAdminContext,
   getAuthConfiguration,
   getCurrentUser,
   getProjects,
@@ -30,16 +36,22 @@ function App() {
   const [password, setPassword] = useState('');
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
-  const [projectName, setProjectName] = useState('');
-  const [projectDescription, setProjectDescription] = useState('');
+  const [projectSwitcherOpen, setProjectSwitcherOpen] = useState(false);
   const [projectLoading, setProjectLoading] = useState(true);
-  const [projectSaving, setProjectSaving] = useState(false);
   const [projectError, setProjectError] = useState<string | null>(null);
+  const [adminContext, setAdminContext] = useState<AdminContext | null>(null);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
     [projects, selectedProjectId],
   );
+
+  useEffect(() => {
+    const preferences = user?.settings_json;
+    document.documentElement.dataset.theme = preferences?.theme ?? 'light';
+    document.documentElement.dataset.density = preferences?.density ?? 'comfortable';
+    document.documentElement.dataset.reduceMotion = String(preferences?.reduce_motion ?? false);
+  }, [user]);
 
   async function refreshProjects(preferredProjectId?: string) {
     const data = await getProjects();
@@ -91,7 +103,17 @@ function App() {
       }
     }
     loadProjects();
+    getAdminContext().then(setAdminContext).catch(() => setAdminContext(null));
   }, [user]);
+
+  useEffect(() => {
+    if (!projectSwitcherOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setProjectSwitcherOpen(false);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [projectSwitcherOpen]);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -114,34 +136,14 @@ function App() {
       setUser(null);
       setProjects([]);
       setSelectedProjectId('');
+      setAdminContext(null);
     }
   }
 
   function handleProjectChange(projectId: string) {
     setSelectedProjectId(projectId);
     localStorage.setItem(selectedProjectStorageKey, projectId);
-  }
-
-  async function handleProjectCreate(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!projectName.trim()) return;
-
-    try {
-      setProjectSaving(true);
-      setProjectError(null);
-      const project = await createProject({
-        name: projectName.trim(),
-        description: projectDescription.trim() || undefined,
-        status: 'active',
-      });
-      setProjectName('');
-      setProjectDescription('');
-      await refreshProjects(project.id);
-    } catch (err) {
-      setProjectError(err instanceof Error ? err.message : 'Unable to create project');
-    } finally {
-      setProjectSaving(false);
-    }
+    setProjectSwitcherOpen(false);
   }
 
   if (authLoading) {
@@ -149,6 +151,8 @@ function App() {
   }
 
   if (!user) {
+    const invitationMatch = window.location.pathname.match(/^\/accept-invitation\/([^/]+)$/);
+    if (invitationMatch) return <AcceptInvitation token={decodeURIComponent(invitationMatch[1])} />;
     return (
       <main className="auth-shell">
         <form className="auth-card" onSubmit={handleLogin}>
@@ -198,23 +202,8 @@ function App() {
         </div>
 
         <section className="project-panel" aria-label="Project selection">
-          <label htmlFor="projectSelect">Project</label>
-          <select
-            id="projectSelect"
-            value={selectedProjectId}
-            onChange={(event) => handleProjectChange(event.target.value)}
-            disabled={projectLoading || projects.length === 0}
-          >
-            {projects.length === 0 ? (
-              <option value="">No projects</option>
-            ) : (
-              projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))
-            )}
-          </select>
+          <span className="project-panel-label">Current project</span>
+          <strong className="current-project-name">{selectedProject?.name ?? 'No project selected'}</strong>
           {selectedProject ? (
             <p>
               {selectedProject.requirement_count} requirements · {selectedProject.test_case_count} test cases
@@ -222,44 +211,40 @@ function App() {
           ) : (
             <p>Create a project to begin.</p>
           )}
-
-          {user.role === 'admin' ? <form className="project-create" onSubmit={handleProjectCreate}>
-            <input
-              type="text"
-              value={projectName}
-              onChange={(event) => setProjectName(event.target.value)}
-              placeholder="New project name"
-              aria-label="New project name"
-            />
-            <textarea
-              value={projectDescription}
-              onChange={(event) => setProjectDescription(event.target.value)}
-              placeholder="Description"
-              aria-label="New project description"
-              rows={3}
-            />
-            <button type="submit" className="secondary-button" disabled={projectSaving || !projectName.trim()}>
-              {projectSaving ? 'Creating...' : 'Create Project'}
-            </button>
-          </form> : null}
+          <button
+            type="button"
+            className="project-switch-button"
+            onClick={() => setProjectSwitcherOpen(true)}
+            disabled={projectLoading || projects.length === 0}
+          >
+            Switch project
+          </button>
           {projectError ? <div className="sidebar-error">{projectError}</div> : null}
         </section>
 
         <nav className="sidebar-nav" aria-label="Primary navigation">
+          <span className="nav-section-label">Workspace</span>
           <NavLink to="/requirements" end>
             Requirements
           </NavLink>
+          <NavLink to="/test-cases">Test Cases</NavLink>
           <NavLink to="/requirements/new">
             New Requirement
           </NavLink>
           <NavLink to="/search">Search</NavLink>
           <NavLink to="/executions">Executions</NavLink>
-          {user.role === 'admin' ? <NavLink to="/operations">Operations</NavLink> : null}
+          <span className="nav-section-label">Administration</span>
+          {selectedProject ? <NavLink to="/project-settings">Project Settings</NavLink> : null}
+          {adminContext?.is_app_admin ? (
+            <>
+              <NavLink to="/operations">Operations</NavLink>
+            </>
+          ) : null}
+          {adminContext && (adminContext.is_app_admin || adminContext.organization_admin_ids.length > 0 || adminContext.project_admin_ids.length > 0) ? <NavLink to="/admin-settings">Admin Settings</NavLink> : null}
         </nav>
 
         <div className="sidebar-user">
-          <span>{user.username}</span>
-          <small>{user.role}</small>
+          <NavLink to="/profile" className="user-profile-link"><span className="user-avatar" aria-hidden="true">{user.username.slice(0, 2).toUpperCase()}</span><span><strong>{user.username}</strong><small>{user.role.replace('_', ' ')}</small></span></NavLink>
           <button type="button" className="secondary-button" onClick={handleLogout}>Sign out</button>
         </div>
       </aside>
@@ -275,19 +260,58 @@ function App() {
             path="/requirements/new"
             element={<RequirementCreate selectedProject={selectedProject} />}
           />
+          <Route path="/test-cases" element={<TestCaseDashboard selectedProject={selectedProject} />} />
           <Route path="/requirements/:id" element={<RequirementDetail />} />
-          <Route path="/requirements/:id/test-cases" element={<RequirementTestCases />} />
+          <Route path="/requirements/:id/test-cases" element={<RequirementTestCases user={user} />} />
           <Route path="/search" element={<SemanticSearch selectedProject={selectedProject} />} />
           <Route
             path="/executions"
             element={<Executions selectedProject={selectedProject} canExecute={user.role !== 'reviewer'} />}
           />
           <Route
-            path="/operations"
-            element={user.role === 'admin' ? <Operations selectedProject={selectedProject} /> : <Navigate to="/requirements" replace />}
+            path="/operations/*"
+            element={adminContext?.is_app_admin ? <Operations selectedProject={selectedProject} /> : <Navigate to="/requirements" replace />}
           />
+          <Route path="/project-settings/*" element={<ProjectSettings selectedProject={selectedProject} user={user} canAdmin={Boolean(adminContext?.is_app_admin || (selectedProject && adminContext?.project_admin_ids.includes(selectedProject.id)) || (selectedProject?.organization_id && adminContext?.organization_admin_ids.includes(selectedProject.organization_id)))} onProjectChange={(updated) => setProjects((current) => current.map((project) => project.id === updated.id ? updated : project))} />} />
+          <Route path="/admin-settings/*" element={adminContext ? <AdminSettings context={adminContext} projects={projects} selectedProject={selectedProject} onProjectCreated={async (project) => refreshProjects(project.id)} /> : <Navigate to="/requirements" replace />} />
+          <Route path="/profile/*" element={<UserProfile user={user} onUserChange={setUser} />} />
         </Routes>
       </section>
+      {projectSwitcherOpen ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setProjectSwitcherOpen(false);
+          }}
+        >
+          <div className="modal-panel project-switcher" role="dialog" aria-modal="true" aria-labelledby="switch-project-title">
+            <div className="modal-header">
+              <div>
+                <p className="eyebrow">Workspace</p>
+                <h2 id="switch-project-title">Switch project</h2>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => setProjectSwitcherOpen(false)}>Close</button>
+            </div>
+            <div className="project-option-list">
+              {projects.map((project) => (
+                <button
+                  type="button"
+                  key={project.id}
+                  className={project.id === selectedProjectId ? 'project-option active' : 'project-option'}
+                  onClick={() => handleProjectChange(project.id)}
+                >
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.description || 'No description'}</small>
+                  </span>
+                  <span>{project.requirement_count} requirements · {project.test_case_count} tests</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", repr=False)
     llm_base_url: str = "https://api.openai.com/v1"
     llm_model: str = "gpt-4.1-mini"
+    eval_llm_enabled: bool = False
+    eval_llm_model: str = ""
+    eval_pass_score: int = 80
+    eval_require_citations: bool = True
+    eval_rubric_version: str = "test-case-v2"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimension: int = 1536
     provider_timeout_seconds: float = 30.0
@@ -107,6 +112,13 @@ class Settings(BaseSettings):
     @classmethod
     def empty_optional_integer(cls, value):
         return None if value == "" else value
+
+    @field_validator("eval_pass_score")
+    @classmethod
+    def valid_evaluation_score(cls, value: int) -> int:
+        if not 0 <= value <= 100:
+            raise ValueError("EVAL_PASS_SCORE must be between 0 and 100")
+        return value
 
 
 settings = Settings()

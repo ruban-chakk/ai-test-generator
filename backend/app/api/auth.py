@@ -12,15 +12,49 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import Principal, authenticate_request, create_access_token, verify_password
+from app.core.security import Principal, authenticate_request, create_access_token, hash_password, verify_password
 from app.db import get_db
-from app.models import AuditLog, User
-from app.schemas import AuthConfiguration, TokenResponse, UserSummary
+from app.models import AuditLog, Invitation, OrganizationMembership, ProjectMembership, User
+from app.schemas import AuthConfiguration, InvitationAccept, TokenResponse, UserProfileUpdate, UserSettingsUpdate, UserSummary
 from app.services.oidc import OIDCClient, OIDCConfigurationError, OIDCProviderError, allowed_email_domain
 from app.services.rate_limit import enforce_auth_rate_limit
 
 
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+
+@auth_router.post("/invitations/{token}/accept", response_model=UserSummary)
+async def accept_invitation(
+    token: str,
+    payload: InvitationAccept,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> UserSummary:
+    await enforce_auth_rate_limit(request, db, scope="auth-invitation")
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    invitation = await db.scalar(select(Invitation).where(Invitation.token_hash == token_hash).with_for_update())
+    if not invitation or invitation.status != "pending" or invitation.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
+    if await db.scalar(select(User.id).where(or_(func.lower(User.username) == payload.username.lower(), func.lower(User.email) == invitation.email.lower()))):
+        raise HTTPException(status_code=409, detail="Username or invited email already has an account")
+    user = User(
+        username=payload.username.strip(),
+        email=invitation.email,
+        role="user",
+        password_hash=hash_password(payload.password),
+        active=True,
+    )
+    db.add(user)
+    await db.flush()
+    db.add(OrganizationMembership(organization_id=invitation.organization_id, user_id=user.id, role=invitation.organization_role))
+    if invitation.project_id:
+        db.add(ProjectMembership(project_id=invitation.project_id, user_id=user.id, role=invitation.project_role or "reviewer"))
+    invitation.status = "accepted"
+    invitation.accepted_at = datetime.now(timezone.utc)
+    db.add(AuditLog(entity_type="invitation", entity_id=invitation.id, action="invitation_accepted", actor=user.username, details={"user_id": str(user.id)}))
+    await db.commit()
+    await db.refresh(user)
+    return UserSummary.model_validate(user)
 
 
 @auth_router.get("/config", response_model=AuthConfiguration)
@@ -187,6 +221,51 @@ async def get_me(
 ) -> UserSummary:
     result = await db.execute(select(User).where(User.id == principal.user_id))
     user = result.scalar_one()
+    return UserSummary.model_validate(user)
+
+
+@auth_router.patch("/me", response_model=UserSummary)
+async def update_me(
+    payload: UserProfileUpdate,
+    principal: Principal = Depends(authenticate_request),
+    db: AsyncSession = Depends(get_db),
+) -> UserSummary:
+    username = payload.username.strip()
+    email = payload.email.strip().lower()
+    conflict = await db.scalar(
+        select(User.id).where(
+            User.id != principal.user_id,
+            or_(func.lower(User.username) == username.lower(), func.lower(User.email) == email),
+        )
+    )
+    if conflict:
+        raise HTTPException(status_code=409, detail="Username or email is already in use")
+    user = await db.get(User, principal.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    previous = {"username": user.username, "email": user.email}
+    user.username = username
+    user.email = email
+    db.add(AuditLog(entity_type="user", entity_id=user.id, action="profile_updated", actor=username, details={"old_value": previous, "new_value": {"username": username, "email": email}}))
+    await db.commit()
+    await db.refresh(user)
+    return UserSummary.model_validate(user)
+
+
+@auth_router.put("/me/settings", response_model=UserSummary)
+async def update_my_settings(
+    payload: UserSettingsUpdate,
+    principal: Principal = Depends(authenticate_request),
+    db: AsyncSession = Depends(get_db),
+) -> UserSummary:
+    user = await db.get(User, principal.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    old_value = user.settings_json or {}
+    user.settings_json = payload.model_dump(mode="json")
+    db.add(AuditLog(entity_type="user", entity_id=user.id, action="user_settings_updated", actor=user.username, details={"old_value": old_value, "new_value": user.settings_json}))
+    await db.commit()
+    await db.refresh(user)
     return UserSummary.model_validate(user)
 
 

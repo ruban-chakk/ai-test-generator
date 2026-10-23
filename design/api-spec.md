@@ -11,7 +11,8 @@ Base URL: `/api/v1`. JSON responses are returned directly rather than inside a r
 - `GET /auth/me` returns the authenticated database user.
 - `POST /auth/logout` revokes the current token version and clears the cookie.
 - Automation may use the returned JWT as a Bearer token.
-- Every endpoint below requires authentication. Global roles are `reviewer`, `approver`, and `admin`; project
+- Every endpoint below requires authentication. Global roles are `reviewer`, `tester`, `test_lead`,
+  `product_manager`, `approver`, and `admin`; project
   memberships further restrict project resources. Browser state-changing cookie requests are Origin checked.
 - Client fields such as `created_by`, `requested_by`, and `approved_by` are compatibility inputs only. The server
   always attributes state changes to the authenticated principal.
@@ -35,7 +36,8 @@ Base URL: `/api/v1`. JSON responses are returned directly rather than inside a r
   versioned vector identifiers.
 - `POST /requirements/{requirement_id}/generate` — run configured OpenAI-compatible generation with
   project-filtered Pinecone retrieval and persist a schema-validated draft. Returns `503` if unconfigured and `502`
-  on provider failure; it never substitutes canned output.
+  on provider failure; it never substitutes canned output. Every generated test case atomically queues a durable,
+  version-bound quality evaluation.
 - `POST /requirements/{requirement_id}/scenarios`, `POST /scenarios/{scenario_id}/test_cases`, and
   `POST /test_cases/{test_case_id}/steps` — manually add draft artifacts.
 
@@ -46,20 +48,39 @@ Base URL: `/api/v1`. JSON responses are returned directly rather than inside a r
 - `POST /test_cases/{id}/approve|reject`
 - `GET /test_cases/{id}/versions`
 - `POST /feedback`, `GET /feedback?target_level=&target_id=`
+- `POST /feedback` accepts an optional `quality_evaluation_id`; the evaluation must belong to the same target.
+- The web UI sends `quality_evaluation_id` only when the reviewer explicitly checks `Include DeepEval evaluation
+  data with this feedback`. When unchecked, no evaluation record, metrics, justifications, or issues enter the
+  revision prompt.
 - `POST /feedback/revise` — resolve feedback. `revise` and `generate_new` call the configured structured generator
-  with the requirement, current target, feedback, and project-scoped retrieved context. Deprecation requires an
+  with the requirement, current target, linked DeepEval evidence, feedback, and project-scoped retrieved context. Deprecation requires an
   approver. Processing the same feedback again returns its existing resolution.
 - `GET /revisions`, `GET /approvals`, `GET /audit`
+- `GET|PUT /projects/{project_id}/approval-workflow` — read or configure ordered, role-bound approval stages and
+  the version-bound evaluation gate. Policy updates affect new workflow runs; active runs retain their snapshot.
+- `GET /test_cases/{test_case_id}/approval-workflow` — inspect the evaluation, current stage, decisions, and exact
+  content digest for the current test-case version.
+- Test-case `approve` and `reject` actions now record a decision at the current stage. Repository/index delivery is
+  queued only after a passing evaluation and completion of every required approval stage.
+- `POST|GET /projects/{project_id}/knowledge-documents` — add/list project-scoped supporting text that is chunked,
+  embedded, and retrieved as untrusted evidence by feedback revision and LLM evaluation.
 - `GET /validate/{target_level}/{target_id}`, `POST /quality/{target_level}/{target_id}`, `GET /quality`
+- `PUT /test_cases/{test_case_id}` — replace editable metadata and the complete ordered step list using an
+  `expected_version` optimistic-concurrency check. A successful edit creates a new draft version, preserves prior
+  immutable approved snapshots, writes audit evidence, and queues automatic evaluation.
 
 Approved cases are locked and versioned. Vector indexing is queued in the same PostgreSQL transaction through the
 outbox; it is not a synchronous database-plus-provider dual write. The worker indexes the immutable approved
 version snapshot under `test_case:<case-id>:v<version>`, so later edits cannot alter historical vector content.
+Automatic evaluation uses the same outbox with `test_case.quality_evaluation_requested`; the resulting evaluation
+stores a unique `source_event_id`, so worker retries cannot create duplicate judge records.
 
 ## Search and semantic impact
 
-- `GET /search?project_id=&query=&mode=&entity_type=&limit=` — project-filtered search over requirements, approved
-  test cases, and feedback. `mode` is `semantic` (the backward-compatible API default), `keyword`, or `hybrid`.
+- `GET /search?project_id=&query=&mode=&entity_type=&test_case_approval=&limit=` — project-filtered search over
+  requirements, current test cases in every workflow state, and feedback. `test_case_approval` is `all` (default),
+  `approved`, or `unapproved`, and applies only to test-case results. `mode` is `semantic` (the backward-compatible
+  API default), `keyword`, or `hybrid`.
   Keyword mode uses PostgreSQL full-text search against canonical records. Hybrid mode uses reciprocal-rank fusion
   to combine PostgreSQL keyword ranks with Pinecone semantic ranks without treating their raw scores as comparable.
 
@@ -154,3 +175,14 @@ tenant-specific acceptance results are deliberately not committed.
 
 Mapping transforms are selected from an allow-list (`string`, case normalization, integer/version conversion,
 ISO/Excel dates, Jira-style references, and numbered test steps). Profiles never contain executable expressions.
+### Scoped prompt configuration
+
+Administrators can manage the three prompt purposes (`test_case_generation`,
+`feedback_regeneration`, and `test_case_evaluation`) through:
+
+- `GET/PUT /api/v1/admin/prompt-config/{prompt_key}?scope_type=app|organization|project&scope_id=...`
+
+Published values resolve project > organization > application defaults. Every
+write increments the prompt version and records `old_value`, `new_value`, the
+actor, and timestamp in the audit log. Prompt placeholders must be declared in
+the `variables` list; platform safety instructions are always prepended.

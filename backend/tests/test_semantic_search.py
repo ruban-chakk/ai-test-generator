@@ -36,6 +36,32 @@ class FakeVectorStore:
                 },
             ),
             RetrievedContext(
+                id="test_case:2:current",
+                score=0.92,
+                text="Draft reset-link coverage.",
+                metadata={
+                    "entity_type": "test_case",
+                    "entity_id": "case-2",
+                    "project_id": "project-1",
+                    "title": "Draft reset link",
+                    "status": "draft",
+                    "artifact_scope": "current",
+                },
+            ),
+            RetrievedContext(
+                id="test_case:2:v1",
+                score=0.99,
+                text="Older immutable approved reset-link coverage.",
+                metadata={
+                    "entity_type": "test_case",
+                    "entity_id": "case-2",
+                    "project_id": "project-1",
+                    "title": "Older approved version",
+                    "status": "approved",
+                    "immutable_version": True,
+                },
+            ),
+            RetrievedContext(
                 id="feedback:1",
                 score=0.85,
                 text="Add a boundary case.",
@@ -49,11 +75,33 @@ def test_semantic_search_filters_types_and_removes_project_metadata() -> None:
     results = asyncio.run(
         service.search("expired reset link", project_id="project-1", entity_type="test_case", limit=5)
     )
-    assert len(results) == 1
+    assert len(results) == 2
     assert results[0].entity_id == "case-1"
     assert results[0].score == 0.94
     assert results[0].semantic_score == 0.94
     assert "project_id" not in results[0].metadata
+
+    approved = asyncio.run(
+        service.search(
+            "expired reset link",
+            project_id="project-1",
+            entity_type="test_case",
+            limit=5,
+            test_case_approval="approved",
+        )
+    )
+    assert [result.entity_id for result in approved] == ["case-1"]
+
+    unapproved = asyncio.run(
+        service.search(
+            "expired reset link",
+            project_id="project-1",
+            entity_type="test_case",
+            limit=5,
+            test_case_approval="unapproved",
+        )
+    )
+    assert [result.entity_id for result in unapproved] == ["case-2"]
 
 
 def test_hybrid_search_fuses_rankings_and_preserves_component_evidence() -> None:

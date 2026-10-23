@@ -86,6 +86,16 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                 )
                 db.add(test_case)
                 await db.flush()
+                draft_test_case = CaseModel(
+                    scenario_id=test_scenario.id,
+                    requirement_id=requirement.id,
+                    title="Draft expired reset token coverage",
+                    description="Unapproved coverage for an expired token.",
+                    status="draft",
+                    locked=False,
+                )
+                db.add(draft_test_case)
+                await db.flush()
                 db.add(
                     StepModel(
                         test_case_id=test_case.id,
@@ -131,8 +141,28 @@ def test_keyword_search_is_project_scoped_and_searches_canonical_artifacts() -> 
                     entity_type="test_case",
                     limit=10,
                 )
-                assert [match.entity_id for match in scenario_matches] == [str(test_case.id)]
+                assert {match.entity_id for match in scenario_matches} == {
+                    str(test_case.id), str(draft_test_case.id)
+                }
                 assert "scenario" in scenario_matches[0].matched_fields
+
+                approved_matches = await service.search(
+                    "expired token",
+                    project_id=str(project.id),
+                    entity_type="test_case",
+                    test_case_approval="approved",
+                    limit=10,
+                )
+                assert [match.entity_id for match in approved_matches] == [str(test_case.id)]
+
+                unapproved_matches = await service.search(
+                    "expired token",
+                    project_id=str(project.id),
+                    entity_type="test_case",
+                    test_case_approval="unapproved",
+                    limit=10,
+                )
+                assert [match.entity_id for match in unapproved_matches] == [str(draft_test_case.id)]
 
                 custom_matches = await service.search(
                     "expired token",

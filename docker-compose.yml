@@ -15,6 +15,18 @@ services:
       interval: 10s
       retries: 5
 
+  migrate:
+    build:
+      context: ./backend
+    container_name: ai-testgen-migrate
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   backend:
     build:
       context: ./backend
@@ -27,9 +39,15 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
       - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
+      - EVAL_LLM_ENABLED=${EVAL_LLM_ENABLED:-false}
+      - EVAL_LLM_MODEL=${EVAL_LLM_MODEL:-}
+      - EVAL_PASS_SCORE=${EVAL_PASS_SCORE:-80}
+      - EVAL_REQUIRE_CITATIONS=${EVAL_REQUIRE_CITATIONS:-true}
+      - EVAL_RUBRIC_VERSION=${EVAL_RUBRIC_VERSION:-test-case-v2}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
       - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-1536}
       - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-ai-testgen-embeddings}
       - PINECONE_HOST=${PINECONE_HOST:-}
       - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
       - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
@@ -93,11 +111,28 @@ services:
       - OIDC_ALLOWED_EMAIL_DOMAINS=${OIDC_ALLOWED_EMAIL_DOMAINS:-}
       - OIDC_AUTO_PROVISION=${OIDC_AUTO_PROVISION:-false}
     ports:
-      - '8000:8000'
+      - '${BACKEND_PORT:-8000}:8000'
     depends_on:
-      - postgres
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - import_spool:/var/lib/ai-test-generator/imports
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ai-testgen-frontend
+    ports:
+      - '${FRONTEND_PORT:-5173}:80'
+    depends_on:
+      backend:
+        condition: service_healthy
     restart: on-failure
 
   indexer:
@@ -111,9 +146,16 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
+      - EVAL_LLM_ENABLED=${EVAL_LLM_ENABLED:-false}
+      - EVAL_LLM_MODEL=${EVAL_LLM_MODEL:-}
+      - EVAL_PASS_SCORE=${EVAL_PASS_SCORE:-80}
+      - EVAL_REQUIRE_CITATIONS=${EVAL_REQUIRE_CITATIONS:-true}
+      - EVAL_RUBRIC_VERSION=${EVAL_RUBRIC_VERSION:-test-case-v2}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
       - EMBEDDING_DIMENSION=${EMBEDDING_DIMENSION:-1536}
       - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-ai-testgen-embeddings}
       - PINECONE_HOST=${PINECONE_HOST:-}
       - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
       - PINECONE_CONTROL_PLANE_URL=${PINECONE_CONTROL_PLANE_URL:-https://api.pinecone.io}
@@ -155,8 +197,8 @@ services:
       - OUTBOX_MAX_ATTEMPTS=${OUTBOX_MAX_ATTEMPTS:-8}
       - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
     volumes:
       - import_spool:/var/lib/ai-test-generator/imports
@@ -174,8 +216,8 @@ services:
       - MAPPED_IMPORT_SPOOL_DIR=${MAPPED_IMPORT_SPOOL_DIR:-/var/lib/ai-test-generator/imports}
       - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
     volumes:
       - import_spool:/var/lib/ai-test-generator/imports
@@ -189,14 +231,15 @@ services:
     environment:
       - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
       - PINECONE_API_KEY=${PINECONE_API_KEY:-}
+      - PINECONE_INDEX_NAME=${PINECONE_INDEX_NAME:-ai-testgen-embeddings}
       - PINECONE_HOST=${PINECONE_HOST:-}
       - PINECONE_NAMESPACE=${PINECONE_NAMESPACE:-ai-test-generator}
       - VECTOR_MAINTENANCE_INTERVAL_SECONDS=${VECTOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
       - VECTOR_MAINTENANCE_REPAIR_MISSING=${VECTOR_MAINTENANCE_REPAIR_MISSING:-true}
       - VECTOR_MAINTENANCE_DELETE_ORPHANS=${VECTOR_MAINTENANCE_DELETE_ORPHANS:-false}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
 
   integration-scheduler:
@@ -213,8 +256,8 @@ services:
       - JIRA_TIMEOUT_SECONDS=${JIRA_TIMEOUT_SECONDS:-30}
       - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: on-failure
 
 volumes:

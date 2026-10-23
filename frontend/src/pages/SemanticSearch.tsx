@@ -10,6 +10,7 @@ import {
   searchArtifacts,
   SearchMode,
   SemanticSearchResult,
+  TestCaseApprovalFilter,
 } from '../api';
 
 
@@ -43,6 +44,10 @@ function validEntityType(value: string | null): SemanticSearchResult['entity_typ
   return value === 'requirement' || value === 'test_case' || value === 'feedback' ? value : '';
 }
 
+function validApproval(value: string | null): TestCaseApprovalFilter {
+  return value === 'approved' || value === 'unapproved' ? value : 'all';
+}
+
 function percentage(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
@@ -54,11 +59,13 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
   const activeEntityType = validEntityType(searchParams.get('type'));
   const activeCustomField = searchParams.get('field')?.trim() ?? '';
   const activeCustomValue = searchParams.get('value') ?? '';
+  const activeApproval = validApproval(searchParams.get('approval'));
   const [query, setQuery] = useState(activeQuery);
   const [mode, setMode] = useState<SearchMode>(activeMode);
   const [entityType, setEntityType] = useState<SemanticSearchResult['entity_type'] | ''>(activeEntityType);
   const [customField, setCustomField] = useState(activeCustomField);
   const [customValue, setCustomValue] = useState(activeCustomValue);
+  const [testCaseApproval, setTestCaseApproval] = useState<TestCaseApprovalFilter>(activeApproval);
   const [results, setResults] = useState<SemanticSearchResult[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -73,7 +80,8 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
     setEntityType(activeEntityType);
     setCustomField(activeCustomField);
     setCustomValue(activeCustomValue);
-  }, [activeCustomField, activeCustomValue, activeEntityType, activeMode, activeQuery]);
+    setTestCaseApproval(activeApproval);
+  }, [activeApproval, activeCustomField, activeCustomValue, activeEntityType, activeMode, activeQuery]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -92,7 +100,7 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
     }
     setBusy(true);
     setError(null);
-    const searchRequest = activeCustomField
+    const searchRequest = activeCustomField || activeApproval !== 'all'
       ? searchArtifacts(
         selectedProject.id,
         activeQuery,
@@ -100,7 +108,8 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
         activeEntityType || undefined,
         0,
         activeCustomField,
-        activeCustomValue,
+        activeCustomField ? activeCustomValue : undefined,
+        activeApproval,
       )
       : searchArtifacts(selectedProject.id, activeQuery, activeMode, activeEntityType || undefined);
     searchRequest
@@ -120,7 +129,7 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
         if (active) setBusy(false);
       });
     return () => { active = false; };
-  }, [activeCustomField, activeCustomValue, activeEntityType, activeMode, activeQuery, refreshToken, selectedProject]);
+  }, [activeApproval, activeCustomField, activeCustomValue, activeEntityType, activeMode, activeQuery, refreshToken, selectedProject]);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -132,6 +141,7 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
     if (normalizedQuery.length < 2) return;
     const next = new URLSearchParams({ q: normalizedQuery, mode });
     if (entityType) next.set('type', entityType);
+    if (testCaseApproval !== 'all') next.set('approval', testCaseApproval);
     if (customField.trim()) {
       next.set('field', customField.trim());
       next.set('value', customValue);
@@ -154,6 +164,7 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
         results.length,
         activeCustomField || undefined,
         activeCustomField ? activeCustomValue : undefined,
+        activeApproval,
       );
       setResults((current) => [...current, ...next]);
       setHasMore(next.length === 20);
@@ -207,7 +218,7 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
         <div>
           <p className="eyebrow">Project-scoped retrieval</p>
           <h1>Search</h1>
-          <p>Find requirements, approved test cases, and feedback by exact language, meaning, or both.</p>
+          <p>Find requirements, test cases in any workflow state, and feedback by exact language, meaning, or both.</p>
         </div>
       </header>
 
@@ -255,8 +266,19 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
               <select value={entityType} onChange={(event) => setEntityType(event.target.value as typeof entityType)}>
                 <option value="">All indexed artifacts</option>
                 <option value="requirement">Requirements</option>
-                <option value="test_case">Approved test cases</option>
+                <option value="test_case">Test cases</option>
                 <option value="feedback">Feedback</option>
+              </select>
+            </label>
+            <label>
+              Test-case approval
+              <select
+                value={testCaseApproval}
+                onChange={(event) => setTestCaseApproval(event.target.value as TestCaseApprovalFilter)}
+              >
+                <option value="all">All states</option>
+                <option value="approved">Approved only</option>
+                <option value="unapproved">Unapproved only</option>
               </select>
             </label>
             <label>
@@ -319,6 +341,9 @@ export default function SemanticSearchPage({ selectedProject }: Props) {
               <div className="detail-actions search-result-heading">
                 <div className="detail-actions">
                   <span className="status-pill">{result.entity_type.replace('_', ' ')}</span>
+                  {result.entity_type === 'test_case' && typeof result.metadata.status === 'string' ? (
+                    <span className="status-pill">{result.metadata.status.replace('_', ' ')}</span>
+                  ) : null}
                   <span className="search-method-pill">{result.search_mode}</span>
                 </div>
                 <span className="similarity-pill">

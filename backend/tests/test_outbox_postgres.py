@@ -175,7 +175,9 @@ def test_outbox_worker_indexes_and_completes_event() -> None:
                 test_case = await db.get(CaseModel, test_case_id)
                 assert event.status == "completed"
                 assert event.attempts == 1
-                assert test_case.repository_status == "indexed"
+                # Search projection indexing is independent of approval-version
+                # repository delivery state.
+                assert test_case.repository_status == "pending_index"
             assert len(indexer.artifacts) == 1
             assert indexer.artifacts[0].project_id == str(project_id)
             assert "expired password reset link" in indexer.artifacts[0].text.lower()

@@ -85,7 +85,13 @@ class FakeVectorStore:
                 id="test-case:historical-1",
                 score=0.91,
                 text="Approved reset-link expiry coverage",
-                metadata={"entity_type": "test_case"},
+                metadata={"entity_type": "test_case", "status": "approved"},
+            ),
+            RetrievedContext(
+                id="test-case:draft-1",
+                score=0.99,
+                text="Draft evidence must never enter the generation prompt",
+                metadata={"entity_type": "test_case", "status": "draft"},
             )
         ]
 
@@ -112,6 +118,7 @@ def test_generation_service_embeds_retrieves_and_generates_structured_draft() ->
     system_prompt, user_prompt = language_model.generated_prompts[0]
     assert "untrusted data" in system_prompt
     assert "Approved reset-link expiry coverage" in user_prompt
+    assert "Draft evidence must never enter the generation prompt" not in user_prompt
 
 
 def test_generated_test_case_rejects_non_contiguous_steps() -> None:

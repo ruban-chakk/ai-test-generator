@@ -127,8 +127,8 @@ def test_vector_backfill_is_project_scoped_and_idempotent() -> None:
                     project_id=project_id,
                     actor="backfill-test",
                 )
-                assert first.candidate_count == 3
-                assert first.queued_count == 3
+                assert first.candidate_count == 4
+                assert first.queued_count == 4
                 assert first.requeued_count == 0
 
             async with session_factory() as db:
@@ -137,9 +137,9 @@ def test_vector_backfill_is_project_scoped_and_idempotent() -> None:
                     project_id=project_id,
                     actor="backfill-test",
                 )
-                assert second.candidate_count == 3
+                assert second.candidate_count == 4
                 assert second.queued_count == 0
-                assert second.in_flight_count == 3
+                assert second.in_flight_count == 4
 
                 requirement = await db.get(Requirement, requirement_id)
                 other_requirement = await db.get(Requirement, other_requirement_id)
@@ -153,11 +153,13 @@ def test_vector_backfill_is_project_scoped_and_idempotent() -> None:
                 events = (
                     await db.execute(
                         select(OutboxEvent).where(
-                            OutboxEvent.aggregate_id.in_([requirement_id, version_id, feedback_id])
+                            OutboxEvent.aggregate_id.in_([
+                                requirement_id, test_case_id, version_id, feedback_id
+                            ])
                         )
                     )
                 ).scalars().all()
-                assert len(events) == 3
+                assert len(events) == 4
 
                 for event in events:
                     event.status = "completed"
@@ -170,8 +172,8 @@ def test_vector_backfill_is_project_scoped_and_idempotent() -> None:
                     include_all=True,
                     actor="backfill-test",
                 )
-                assert forced.candidate_count == 3
-                assert forced.requeued_count == 3
+                assert forced.candidate_count == 4
+                assert forced.requeued_count == 4
                 assert forced.queued_count == 0
         finally:
             if project_id is not None and other_project_id is not None:
