@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  bulkApproveTestCases,
   createFeedback,
   evaluateQuality,
   getKnowledgeDocuments,
@@ -17,6 +18,7 @@ import RequirementTestCases from './RequirementTestCases';
 
 vi.mock('../api', () => ({
   approveTestCase: vi.fn(),
+  bulkApproveTestCases: vi.fn(),
   createFeedback: vi.fn(),
   createKnowledgeDocument: vi.fn(),
   evaluateQuality: vi.fn(),
@@ -81,6 +83,10 @@ describe('RequirementTestCases', () => {
     vi.mocked(getKnowledgeDocuments).mockResolvedValue([]);
     vi.mocked(getQualityEvaluations).mockResolvedValue([]);
     vi.mocked(getTestCaseApprovalWorkflow).mockResolvedValue(null);
+    vi.mocked(bulkApproveTestCases).mockResolvedValue({
+      scope: 'requirement', requested_count: 1, processed_count: 1,
+      approved_count: 1, in_review_count: 0, blocked_count: 0, failed_count: 0, items: [],
+    });
     vi.mocked(createFeedback).mockResolvedValue({
       id: 'feedback-1', target_level: 'test_case', target_id: 'case-1', source: 'generated-test-review',
       feedback_type: 'revise', comment: 'Improve coverage.', created_by: 'admin', status: 'open', created_at: '2026-10-22T10:00:00Z',
@@ -116,6 +122,21 @@ describe('RequirementTestCases', () => {
     await user.click(screen.getByRole('button', { name: 'Feedback to LLM' }));
     expect(screen.getByRole('dialog', { name: /Feedback on Manager approval is required/ })).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: /Include DeepEval evaluation data/ })).toBeDisabled();
+  });
+
+  it('supports bulk approval for the requirement and scenario scopes', async () => {
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={['/requirements/requirement-1/test-cases']}>
+        <Routes><Route path="/requirements/:id/test-cases" element={<RequirementTestCases user={{ id: 'user-1', username: 'admin', email: 'a@example.com', role: 'admin', active: true }} />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Approve all test cases' }));
+    await waitFor(() => expect(bulkApproveTestCases).toHaveBeenCalledWith('requirement-1', expect.objectContaining({ scope: 'requirement', approved_by: 'admin' })));
+
+    await user.click(screen.getByRole('button', { name: /Approve scenario cases/ }));
+    await waitFor(() => expect(bulkApproveTestCases).toHaveBeenCalledWith('requirement-1', expect.objectContaining({ scope: 'scenario', scenario_id: 'scenario-1' })));
   });
 
   it('explains deterministic-only evaluations and can replace them with DeepEval evidence', async () => {

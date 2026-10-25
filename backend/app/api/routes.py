@@ -63,6 +63,9 @@ from app.models import (
 from app.schemas import (
     AlertSummary,
     ApprovalAction,
+    BulkApprovalItem,
+    BulkApprovalRequest,
+    BulkApprovalResult,
     ApprovalRecordSummary,
     ApprovalStageDefinition,
     ApprovalWorkflowRunSummary,
@@ -2345,6 +2348,90 @@ async def approve_test_case(
     await db.commit()
     await db.refresh(test_case)
     return test_case
+
+
+@api_router.post(
+    "/requirements/{requirement_id}/test-cases/bulk-approve",
+    response_model=BulkApprovalResult,
+    tags=["Approvals"],
+)
+async def bulk_approve_test_cases(
+    requirement_id: str,
+    payload: BulkApprovalRequest,
+    db: AsyncSession = Depends(get_db),
+) -> BulkApprovalResult:
+    """Apply the normal staged approval operation to a requirement-scoped batch.
+
+    Each successful case commits its own workflow decision and outbox intent. A
+    blocked case is rolled back independently so one missing evaluation or
+    separation-of-duties conflict does not hide the other batch results.
+    """
+    try:
+        requirement_uuid = uuid.UUID(requirement_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Requirement not found") from exc
+
+    requirement = await db.get(Requirement, requirement_uuid)
+    if not requirement:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+    await _require_project_access(db, requirement.project_id)
+
+    if payload.scope == "scenario" and payload.scenario_id is None:
+        raise HTTPException(status_code=422, detail="scenario_id is required for scenario approval")
+    if payload.scope == "test_case" and not payload.test_case_ids:
+        raise HTTPException(status_code=422, detail="test_case_ids is required for test-case approval")
+    if payload.scope == "scenario":
+        scenario_belongs = await db.scalar(
+            select(TestScenario.id).where(
+                TestScenario.id == payload.scenario_id,
+                TestScenario.requirement_id == requirement_uuid,
+            )
+        )
+        if scenario_belongs is None:
+            raise HTTPException(status_code=404, detail="Scenario not found for this requirement")
+
+    stmt = select(TestCase.id).where(TestCase.requirement_id == requirement_uuid)
+    if payload.scope == "scenario":
+        stmt = stmt.where(TestCase.scenario_id == payload.scenario_id)
+    elif payload.scope == "test_case":
+        stmt = stmt.where(TestCase.id.in_(payload.test_case_ids))
+    case_ids = [row[0] for row in (await db.execute(stmt.order_by(TestCase.created_at.asc()))).all()]
+    if payload.scope == "test_case":
+        missing = set(payload.test_case_ids) - set(case_ids)
+        if missing:
+            raise HTTPException(status_code=404, detail="One or more test cases do not belong to this requirement")
+    if not case_ids:
+        raise HTTPException(status_code=404, detail="No test cases found for this approval scope")
+
+    items: list[BulkApprovalItem] = []
+    for case_id in case_ids:
+        try:
+            result = await approve_test_case(
+                str(case_id),
+                ApprovalAction(approved_by=payload.approved_by, notes=payload.notes),
+                db,
+            )
+            status = "approved" if result.status == "approved" else "in_review"
+            items.append(BulkApprovalItem(test_case_id=case_id, status=status))
+        except HTTPException as exc:
+            await db.rollback()
+            detail = exc.detail if isinstance(exc.detail, str) else "Approval was blocked by governance validation"
+            status = "blocked" if exc.status_code in {403, 409, 422} else "failed"
+            items.append(BulkApprovalItem(test_case_id=case_id, status=status, message=detail))
+        except Exception:
+            await db.rollback()
+            items.append(BulkApprovalItem(test_case_id=case_id, status="failed", message="Approval failed unexpectedly"))
+
+    return BulkApprovalResult(
+        scope=payload.scope,
+        requested_count=len(case_ids),
+        processed_count=sum(item.status in {"approved", "in_review"} for item in items),
+        approved_count=sum(item.status == "approved" for item in items),
+        in_review_count=sum(item.status == "in_review" for item in items),
+        blocked_count=sum(item.status == "blocked" for item in items),
+        failed_count=sum(item.status == "failed" for item in items),
+        items=items,
+    )
 
 
 @api_router.get(

@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   approveTestCase,
+  bulkApproveTestCases,
   ApprovalWorkflowRun,
   AuthenticatedUser,
   createFeedback,
@@ -62,6 +63,8 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
   const [feedbackIncludeEvaluation, setFeedbackIncludeEvaluation] = useState(false);
   const [editDraft, setEditDraft] = useState<TestCaseEditDraft | null>(null);
   const [editSaving, setEditSaving] = useState(false);
+  const [selectedTestCases, setSelectedTestCases] = useState<Set<string>>(new Set());
+  const [busyBulkScope, setBusyBulkScope] = useState<string | null>(null);
 
   async function loadRequirement() {
     if (!id) return;
@@ -246,6 +249,47 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
     }
   }
 
+  function toggleSelectedTestCase(testCaseId: string) {
+    setSelectedTestCases((current) => {
+      const next = new Set(current);
+      if (next.has(testCaseId)) next.delete(testCaseId);
+      else next.add(testCaseId);
+      return next;
+    });
+  }
+
+  async function handleBulkApprove(
+    scope: 'requirement' | 'scenario' | 'test_case',
+    scenarioId?: string,
+    testCaseIds?: string[],
+  ) {
+    if (!requirement) return;
+    const busyKey = scenarioId ? `scenario:${scenarioId}` : scope;
+    try {
+      setBusyBulkScope(busyKey);
+      setError(null);
+      setNotice(null);
+      const result = await bulkApproveTestCases(requirement.id, {
+        scope,
+        scenario_id: scenarioId,
+        test_case_ids: testCaseIds,
+        approved_by: user.username,
+        notes: scope === 'requirement' ? 'Bulk approval from generated test review' : 'Bulk approval from scenario review',
+      });
+      setSelectedTestCases(new Set());
+      await loadRequirement();
+      const blocked = result.blocked_count + result.failed_count;
+      setNotice(
+        `${result.processed_count} case${result.processed_count === 1 ? '' : 's'} processed: ` +
+        `${result.approved_count} fully approved, ${result.in_review_count} in review${blocked ? `, ${blocked} blocked` : ''}.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to bulk approve test cases');
+    } finally {
+      setBusyBulkScope(null);
+    }
+  }
+
   async function handleFeedback(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!feedbackTarget) return;
@@ -309,6 +353,9 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
               <button className="primary-button" type="button" onClick={() => handleEvaluateTarget('requirement', requirement.id)} disabled={busyEvaluationTarget === `requirement:${requirement.id}`}>
                 {busyEvaluationTarget === `requirement:${requirement.id}` ? 'Evaluating suite...' : 'Run suite evaluation'}
               </button>
+              <button className="primary-button" type="button" onClick={() => handleBulkApprove('requirement')} disabled={busyBulkScope === 'requirement'}>
+                {busyBulkScope === 'requirement' ? 'Approving suite...' : 'Approve all test cases'}
+              </button>
             </>
           ) : null}
           <button className="secondary-button" type="button" onClick={() => navigate('/requirements')}>Requirements</button>
@@ -337,6 +384,10 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                       <button className="secondary-button compact-button" type="button" onClick={() => handleEvaluateTarget('scenario', scenario.id)} disabled={busyEvaluationTarget === `scenario:${scenario.id}`}>
                         {busyEvaluationTarget === `scenario:${scenario.id}` ? 'Evaluating...' : 'Run scenario evaluation'}
                       </button>
+                      <button className="primary-button compact-button" type="button" onClick={() => handleBulkApprove('scenario', scenario.id)} disabled={busyBulkScope === `scenario:${scenario.id}`}>
+                        {busyBulkScope === `scenario:${scenario.id}` ? 'Approving...' : 'Approve scenario cases'}
+                      </button>
+                      {testCases.some((item) => selectedTestCases.has(item.id)) ? <button className="secondary-button compact-button" type="button" onClick={() => handleBulkApprove('test_case', undefined, testCases.filter((item) => selectedTestCases.has(item.id)).map((item) => item.id))} disabled={busyBulkScope === 'test_case'}>Approve selected ({testCases.filter((item) => selectedTestCases.has(item.id)).length})</button> : null}
                     </div>
                   </div>
 
@@ -352,6 +403,9 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                         const currentStage = run && policy ? policy.stages[run.current_stage] : undefined;
                         return (
                           <article key={testCase.id} className="testcase-item">
+                            <label className="testcase-select">
+                              <input type="checkbox" checked={selectedTestCases.has(testCase.id)} onChange={() => toggleSelectedTestCase(testCase.id)} aria-label={`Select ${testCase.title} for bulk approval`} />
+                            </label>
                             <button className="testcase-summary" type="button" aria-expanded={isExpanded} onClick={() => toggleTestCase(testCase.id)}>
                               <span className="collapse-indicator">{isExpanded ? '-' : '+'}</span>
                               <span><span className="testcase-id">Test ID: {testCase.id}</span><strong>{testCase.title}</strong><span className="table-description">{testCase.description}</span></span>
