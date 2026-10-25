@@ -142,7 +142,7 @@ class MappedImportJobSummary(APIModel):
     original_filename: str
     sha256: str
     byte_size: int
-    status: Literal["queued", "processing", "completed", "failed", "cancelled"]
+    status: Literal["queued", "processing", "paused", "completed", "failed", "cancelled"]
     checkpoint_row: int
     source_record_count: int
     mapped_record_count: int
@@ -159,6 +159,31 @@ class MappedImportJobSummary(APIModel):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
+
+
+class BulkOperationCreateRequest(APIModel):
+    project_id: uuid.UUID
+    operation_type: Literal["generate_test_cases", "impact_analysis"]
+    requirement_ids: List[uuid.UUID] = Field(min_length=1, max_length=500)
+
+
+class BulkOperationJobSummary(APIModel):
+    id: uuid.UUID
+    project_id: uuid.UUID
+    operation_type: Literal["generate_test_cases", "impact_analysis"]
+    status: Literal["queued", "processing", "paused", "completed", "failed", "cancelled"]
+    requirement_ids: List[uuid.UUID] = Field(default_factory=list)
+    total_count: int
+    completed_count: int
+    failed_count: int
+    result: dict = Field(default_factory=dict)
+    last_error_type: Optional[str] = None
+    requested_by: str
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None
+    cancel_requested: bool = False
+    max_concurrency: int = 1
 
 
 class UnresolvedImportRecordSummary(APIModel):

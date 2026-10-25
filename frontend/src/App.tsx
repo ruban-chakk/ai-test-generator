@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { NavLink, Route, Routes, Navigate } from 'react-router-dom';
 import RequirementDashboard from './pages/RequirementDashboard';
+import BulkOperationDashboard from './pages/BulkOperationDashboard';
 import RequirementDetail from './pages/RequirementDetail';
 import RequirementTestCases from './pages/RequirementTestCases';
 import RequirementCreate from './pages/RequirementCreate';
@@ -227,6 +228,7 @@ function App() {
           <NavLink to="/requirements" end>
             Requirements
           </NavLink>
+          <NavLink to="/operations/bulk-runs">Batch runs</NavLink>
           <NavLink to="/test-cases">Test Cases</NavLink>
           <NavLink to="/requirements/new">
             New Requirement
@@ -256,6 +258,7 @@ function App() {
             path="/requirements"
             element={<RequirementDashboard selectedProject={selectedProject} />}
           />
+          <Route path="/operations/bulk-runs" element={<BulkOperationDashboard selectedProject={selectedProject} />} />
           <Route
             path="/requirements/new"
             element={<RequirementCreate selectedProject={selectedProject} />}

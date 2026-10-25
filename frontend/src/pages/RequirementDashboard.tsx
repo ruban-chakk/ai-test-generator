@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
+  createBulkOperation,
   generateRequirementDraft,
   getRequirementImpact,
   getRequirements,
@@ -119,29 +120,16 @@ export default function RequirementDashboard({ selectedProject }: Props) {
       setActiveBulkAction(action);
       setError(null);
       setActionMessage(null);
-      const results = await Promise.allSettled(
-        selectedRequirements.map((requirement) =>
-          action === 'generate'
-            ? generateRequirementDraft(requirement.id)
-            : getRequirementImpact(requirement.id),
-        ),
+      const job = await createBulkOperation(
+        selectedProject!.id,
+        action === 'generate' ? 'generate_test_cases' : 'impact_analysis',
+        selectedRequirements.map((requirement) => requirement.id),
       );
-      const successful = results.filter((result) => result.status === 'fulfilled');
-      const failed = results.length - successful.length;
-      if (action === 'generate') {
-        const generated = successful
-          .map((result) => result.status === 'fulfilled' ? result.value as RequirementSummary : null)
-          .filter((requirement): requirement is RequirementSummary => Boolean(requirement));
-        setRequirements((current) => current.map((requirement) =>
-          generated.find((updated) => updated.id === requirement.id) ?? requirement,
-        ));
-      }
       const actionLabel = action === 'generate' ? 'test-case generation' : 'impact analysis';
-      setActionMessage(
-        `${actionLabel} completed for ${successful.length} requirement${successful.length === 1 ? '' : 's'}` +
-        `${failed ? `; ${failed} failed` : '.'}`,
-      );
+      setActionMessage(`${actionLabel} queued as batch ${job.id.slice(0, 8)}. Track progress in Batch runs.`);
       setSelectedRequirementIds(new Set());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to queue bulk operation');
     } finally {
       setActiveBulkAction(null);
     }
