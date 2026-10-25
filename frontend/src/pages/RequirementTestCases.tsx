@@ -199,6 +199,17 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
     });
   }
 
+  function moveEditStep(index: number, direction: -1 | 1) {
+    setEditDraft((current) => {
+      if (!current) return current;
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= current.steps.length) return current;
+      const steps = current.steps.slice();
+      [steps[index], steps[nextIndex]] = [steps[nextIndex], steps[index]];
+      return { ...current, steps: steps.map((step, stepIndex) => ({ ...step, step_number: stepIndex + 1 })) };
+    });
+  }
+
   async function handleEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!editDraft) return;
@@ -343,6 +354,9 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
           <p className="eyebrow">Generated test review</p>
           <h1>{requirement?.title ?? 'Generated Test Cases'}</h1>
           {requirement ? <span className="header-subtitle">Requirement ID: {requirement.id}</span> : null}
+          {requirement && aggregateEvaluations[`requirement:${requirement.id}`] ? (
+            <span className="status-pill evaluation-score">Requirement evaluation: {aggregateEvaluations[`requirement:${requirement.id}`]?.score}/100 · {aggregateEvaluations[`requirement:${requirement.id}`]?.status} · coverage {String(aggregateEvaluations[`requirement:${requirement.id}`]?.metrics.coverage_score ?? '—')}/100</span>
+          ) : null}
         </div>
         <div className="header-actions">
           {requirement ? (
@@ -378,6 +392,7 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                     <button className="collapsible-header" type="button" aria-expanded={isScenarioExpanded} onClick={() => toggleScenario(scenario.id)}>
                       <span className="collapse-indicator">{isScenarioExpanded ? '-' : '+'}</span>
                       <span><strong>{scenario.title}</strong><span className="table-description">{scenario.description} · {testCases.length} test case{testCases.length === 1 ? '' : 's'}</span></span>
+                      {aggregateEvaluations[`scenario:${scenario.id}`] ? <span className="status-pill evaluation-score">Evaluation {aggregateEvaluations[`scenario:${scenario.id}`]?.score}/100 · {aggregateEvaluations[`scenario:${scenario.id}`]?.status}</span> : null}
                     </button>
                     <div className="detail-actions">
                       <button className="secondary-button compact-button" type="button" onClick={() => openFeedback({ level: 'scenario', id: scenario.id, label: scenario.title }, aggregateEvaluations[`scenario:${scenario.id}`]?.id)}>Scenario feedback</button>
@@ -509,7 +524,11 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                     <strong>Step {index + 1}</strong>
                     <label>Action<textarea rows={2} required value={step.action} onChange={(event) => setEditDraft({ ...editDraft, steps: editDraft.steps.map((item, itemIndex) => itemIndex === index ? { ...item, action: event.target.value } : item) })} /></label>
                     <label>Expected result<textarea rows={2} required value={step.expected_result} onChange={(event) => setEditDraft({ ...editDraft, steps: editDraft.steps.map((item, itemIndex) => itemIndex === index ? { ...item, expected_result: event.target.value } : item) })} /></label>
-                    <button className="secondary-button compact-button" type="button" disabled={editDraft.steps.length === 1} onClick={() => setEditDraft({ ...editDraft, steps: editDraft.steps.filter((_, itemIndex) => itemIndex !== index).map((item, itemIndex) => ({ ...item, step_number: itemIndex + 1 })) })}>Remove step</button>
+                    <div className="edit-step-actions">
+                      <button className="secondary-button compact-button" type="button" disabled={index === 0} onClick={() => moveEditStep(index, -1)}>Move up</button>
+                      <button className="secondary-button compact-button" type="button" disabled={index === editDraft.steps.length - 1} onClick={() => moveEditStep(index, 1)}>Move down</button>
+                      <button className="secondary-button compact-button" type="button" disabled={editDraft.steps.length === 1} onClick={() => setEditDraft({ ...editDraft, steps: editDraft.steps.filter((_, itemIndex) => itemIndex !== index).map((item, itemIndex) => ({ ...item, step_number: itemIndex + 1 })) })}>Remove step</button>
+                    </div>
                   </div>
                 ))}
                 <button className="secondary-button" type="button" onClick={() => setEditDraft({ ...editDraft, steps: [...editDraft.steps, { step_number: editDraft.steps.length + 1, action: '', expected_result: '' }] })}>Add step</button>

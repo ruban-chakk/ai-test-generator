@@ -107,6 +107,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .testcase-select { position: absolute; top: 17px; left: 14px; z-index: 3; display: grid; place-items: center; }
 .testcase-select input { width: 16px; height: 16px; accent-color: #155eef; }
 .testcase-item > .testcase-summary { padding-left: 44px; }
+.evaluation-score { display: inline-flex; width: fit-content; margin-top: 6px; }
+.edit-step-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .deepeval-indicator { position: absolute; top: 12px; right: 96px; display: inline-grid; grid-template-columns: auto auto; align-items: center; gap: 5px; min-height: 36px; border: 1px solid currentColor; border-radius: 18px; background: #fff; padding: 0 10px; font-weight: 800; z-index: 2; }
 .deepeval-indicator span { font-size: .86rem; }
 .deepeval-indicator small { font-size: .75rem; }

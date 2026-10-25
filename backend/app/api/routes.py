@@ -6065,13 +6065,18 @@ async def _evaluate_quality_impl(
     if target_level in {"requirement", "suite", "scenario"}:
         if target_level == "scenario":
             case_result = await db.execute(
-                select(TestCase.id).where(TestCase.scenario_id == target_uuid)
+                select(TestCase.id, TestCase.scenario_id).where(TestCase.scenario_id == target_uuid)
             )
+            scenario_ids = [target_uuid]
         else:
             case_result = await db.execute(
-                select(TestCase.id).where(TestCase.requirement_id == target_uuid)
+                select(TestCase.id, TestCase.scenario_id).where(TestCase.requirement_id == target_uuid)
             )
-        case_ids = list(case_result.scalars().all())
+            scenario_ids = list((await db.execute(
+                select(TestScenario.id).where(TestScenario.requirement_id == target_uuid)
+            )).scalars().all())
+        case_rows = case_result.all()
+        case_ids = [row[0] for row in case_rows]
         child_evaluations: list[QualityEvaluationSummary] = []
         for case_id in case_ids:
             child_evaluations.append(await _evaluate_quality_impl("test_case", str(case_id), db))
@@ -6079,6 +6084,20 @@ async def _evaluate_quality_impl(
         target_issues = await _collect_validation_issues(db, target_level, target_uuid)
         scores = [item.score for item in child_evaluations]
         aggregate_score = round(sum(scores) / len(scores)) if scores else 0
+        covered_scenarios = len({row[1] for row in case_rows})
+        scenario_coverage = covered_scenarios / len(scenario_ids) if scenario_ids else 0.0
+        requirement_coverage_scores = []
+        for item in child_evaluations:
+            deepeval_metrics = item.metrics.get("deepeval_metrics", [])
+            requirement_metric = next(
+                (metric for metric in deepeval_metrics if metric.get("name") == "requirement_coverage"),
+                None,
+            )
+            requirement_coverage_scores.append(
+                float((requirement_metric or {}).get("normalized_score", (item.metrics.get("guardrail_score") or item.score)))
+            )
+        quality_coverage = (sum(requirement_coverage_scores) / len(requirement_coverage_scores) / 100) if requirement_coverage_scores else 0.0
+        coverage_score = round((scenario_coverage * 0.6 + quality_coverage * 0.4) * 100)
         issue_payload = [
             {"target_id": str(item.target_id), **issue}
             for item in child_evaluations
@@ -6091,6 +6110,16 @@ async def _evaluate_quality_impl(
             "passed_test_case_count": sum(item.status == "passed" for item in child_evaluations),
             "failed_test_case_count": sum(item.status != "passed" for item in child_evaluations),
             "average_score": aggregate_score,
+            "coverage_score": coverage_score,
+            "requirement_coverage": coverage_score,
+            "test_coverage": {
+                "scenario_count": len(scenario_ids),
+                "covered_scenario_count": covered_scenarios,
+                "scenario_coverage_percent": round(scenario_coverage * 100),
+                "test_case_count": len(case_ids),
+                "quality_coverage_percent": round(quality_coverage * 100),
+                "definition": "Percentage of requirement scenarios represented by generated test cases, weighted with their requirement-coverage evaluation.",
+            },
             "test_case_evaluations": [
                 {
                     "id": str(item.id),

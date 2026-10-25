@@ -139,6 +139,27 @@ describe('RequirementTestCases', () => {
     await waitFor(() => expect(bulkApproveTestCases).toHaveBeenCalledWith('requirement-1', expect.objectContaining({ scope: 'scenario', scenario_id: 'scenario-1' })));
   });
 
+  it('hydrates persisted requirement and scenario evaluation scores after loading', async () => {
+    const persistedEvaluation = (targetLevel: string, targetId: string, score: number) => ({
+      id: `${targetLevel}-evaluation`, target_level: targetLevel, target_id: targetId, score,
+      status: 'passed', metrics: { coverage_score: score - 5 }, issues: [], evaluated_by: 'admin', created_at: '2026-10-25T10:00:00Z',
+    });
+    vi.mocked(getQualityEvaluations).mockImplementation(async (targetLevel, targetId) => {
+      if (targetLevel === 'requirement') return [persistedEvaluation(targetLevel, targetId ?? '', 88)];
+      if (targetLevel === 'scenario') return [persistedEvaluation(targetLevel, targetId ?? '', 82)];
+      return [];
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/requirements/requirement-1/test-cases']}>
+        <Routes><Route path="/requirements/:id/test-cases" element={<RequirementTestCases user={{ id: 'user-1', username: 'admin', email: 'a@example.com', role: 'admin', active: true }} />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText(/Requirement evaluation: 88\/100/)).toBeInTheDocument();
+    expect(screen.getByText(/Evaluation 82\/100/)).toBeInTheDocument();
+  });
+
   it('explains deterministic-only evaluations and can replace them with DeepEval evidence', async () => {
     const user = userEvent.setup();
     const deterministicEvaluation = {
