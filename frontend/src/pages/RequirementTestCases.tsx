@@ -135,6 +135,27 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
     await handleEvaluateTarget('test_case', testCaseId);
   }
 
+  function hydrateEvaluationCascade(result: QualityEvaluationSummary) {
+    const childEvaluations = Array.isArray(result.metrics.test_case_evaluations)
+      ? result.metrics.test_case_evaluations as QualityEvaluationSummary[]
+      : [];
+    if (childEvaluations.length) {
+      setEvaluations((current) => ({
+        ...current,
+        ...Object.fromEntries(childEvaluations.map((evaluation) => [evaluation.target_id, evaluation])),
+      }));
+    }
+    const scenarioEvaluations = Array.isArray(result.metrics.scenario_evaluations)
+      ? result.metrics.scenario_evaluations as QualityEvaluationSummary[]
+      : [];
+    if (scenarioEvaluations.length) {
+      setAggregateEvaluations((current) => ({
+        ...current,
+        ...Object.fromEntries(scenarioEvaluations.map((evaluation) => [`scenario:${evaluation.target_id}`, evaluation])),
+      }));
+    }
+  }
+
   async function handleEvaluateTarget(level: 'requirement' | 'scenario' | 'test_case', targetId: string) {
     const busyKey = `${level}:${targetId}`;
     try {
@@ -148,6 +169,7 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
         await refreshCaseWorkflow(targetId);
       } else {
         setAggregateEvaluations((current) => ({ ...current, [busyKey]: result }));
+        hydrateEvaluationCascade(result);
       }
       setNotice(`Evaluation ${result.status}: ${result.score}/100.`);
     } catch (err) {

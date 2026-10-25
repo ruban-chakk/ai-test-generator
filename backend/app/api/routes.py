@@ -6042,6 +6042,7 @@ async def _evaluate_quality_impl(
     db: AsyncSession,
     *,
     source_event_id: uuid.UUID | None = None,
+    child_evaluations_override: dict[uuid.UUID, QualityEvaluationSummary] | None = None,
 ) -> QualityEvaluationSummary:
     if target_level not in TARGET_LEVELS:
         raise HTTPException(status_code=422, detail="Target level must be requirement, scenario, or test_case")
@@ -6079,7 +6080,28 @@ async def _evaluate_quality_impl(
         case_ids = [row[0] for row in case_rows]
         child_evaluations: list[QualityEvaluationSummary] = []
         for case_id in case_ids:
-            child_evaluations.append(await _evaluate_quality_impl("test_case", str(case_id), db))
+            if child_evaluations_override and case_id in child_evaluations_override:
+                child_evaluations.append(child_evaluations_override[case_id])
+            else:
+                child_evaluations.append(await _evaluate_quality_impl("test_case", str(case_id), db))
+
+        # A suite evaluation is also a request to refresh every intermediate
+        # rollup.  Persist scenario evaluations after their test cases have
+        # been refreshed so the requirement page can hydrate all three levels
+        # from durable records after a reload.  The already-persisted child
+        # results are passed into the scenario rollup to avoid evaluating the
+        # same test case twice (and charging twice for an LLM judge call).
+        scenario_evaluations: list[QualityEvaluationSummary] = []
+        if target_level in {"requirement", "suite"}:
+            for scenario_id in scenario_ids:
+                scenario_evaluations.append(
+                    await _evaluate_quality_impl(
+                        "scenario",
+                        str(scenario_id),
+                        db,
+                        child_evaluations_override={item.target_id: item for item in child_evaluations},
+                    )
+                )
 
         target_issues = await _collect_validation_issues(db, target_level, target_uuid)
         scores = [item.score for item in child_evaluations]
@@ -6130,6 +6152,17 @@ async def _evaluate_quality_impl(
                     "issues": item.issues,
                 }
                 for item in child_evaluations
+            ],
+            "scenario_evaluations": [
+                {
+                    "id": str(item.id),
+                    "target_id": str(item.target_id),
+                    "score": item.score,
+                    "status": item.status,
+                    "metrics": item.metrics,
+                    "issues": item.issues,
+                }
+                for item in scenario_evaluations
             ],
         }
         evaluation = QualityEvaluation(

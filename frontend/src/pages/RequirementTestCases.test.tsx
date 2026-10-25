@@ -160,6 +160,35 @@ describe('RequirementTestCases', () => {
     expect(screen.getByText(/Evaluation 82\/100/)).toBeInTheDocument();
   });
 
+  it('hydrates child scores and feedback evidence after an aggregate evaluation', async () => {
+    const user = userEvent.setup();
+    vi.mocked(evaluateQuality).mockResolvedValue({
+      id: 'requirement-evaluation-2', target_level: 'requirement', target_id: 'requirement-1', score: 91,
+      status: 'passed', metrics: {
+        coverage_score: 94,
+        scenario_evaluations: [{
+          id: 'scenario-evaluation-2', target_level: 'scenario', target_id: 'scenario-1', score: 89,
+          status: 'passed', metrics: { coverage_score: 90 }, issues: [], evaluated_by: 'admin', created_at: '2026-10-25T10:00:00Z',
+        }],
+        test_case_evaluations: [{
+          id: 'case-evaluation-2', target_level: 'test_case', target_id: 'case-1', score: 87,
+          status: 'passed', metrics: { judge_summary: 'Covers the requirement.' }, issues: [], evaluated_by: 'admin', created_at: '2026-10-25T10:00:00Z',
+        }],
+      }, issues: [], evaluated_by: 'admin', created_at: '2026-10-25T10:00:00Z',
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/requirements/requirement-1/test-cases']}>
+        <Routes><Route path="/requirements/:id/test-cases" element={<RequirementTestCases user={{ id: 'user-1', username: 'admin', email: 'a@example.com', role: 'admin', active: true }} />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    await user.click(await screen.findByRole('button', { name: 'Run suite evaluation' }));
+    expect(await screen.findByText(/Requirement evaluation: 91\/100/)).toBeInTheDocument();
+    expect(screen.getByText(/Evaluation 89\/100/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /View DeepEval metrics for Manager approval is required: 87 out of 100/ })).toBeInTheDocument();
+  });
+
   it('explains deterministic-only evaluations and can replace them with DeepEval evidence', async () => {
     const user = userEvent.setup();
     const deterministicEvaluation = {
