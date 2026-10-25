@@ -137,9 +137,14 @@ class TestCaseEvaluationService:
         if contexts and self._config.eval_require_citations:
             valid_refs = {f"E{index}" for index in range(1, len(contexts) + 1)}
             for issue in judgment.issues:
-                if not issue.evidence_refs or not set(issue.evidence_refs).issubset(valid_refs):
+                # Evidence citations are required when an issue relies on
+                # retrieved project context, but issues can also be grounded
+                # directly in the requirement or candidate test case.  The
+                # prompt explicitly allows an empty list for those issues;
+                # reject only references that are present but invalid.
+                if issue.evidence_refs and not set(issue.evidence_refs).issubset(valid_refs):
                     raise GenerationProviderError(
-                        "LLM judge returned an issue without valid evidence citations"
+                        "LLM judge returned an issue with invalid evidence citations"
                     )
         server_status = "passed" if judgment.score >= self._config.eval_pass_score else "failed"
         judgment = judgment.model_copy(update={"status": server_status})

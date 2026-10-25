@@ -104,6 +104,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .admin-settings-view > .settings-section { max-width: 1040px; }
 .token-display { display: block; overflow-wrap: anywhere; margin: 10px 0; border: 1px solid #c7d3e1; border-radius: 4px; background: #f1f5fa; padding: 10px 12px; color: #16253a; }
 .testcase-item { position: relative; }
+.bulk-requirement-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: -12px 0 16px; padding: 12px 14px; border: 1px solid #d7e0eb; border-radius: 6px; background: #fff; }
+.select-all-control { display: inline-flex; align-items: center; gap: 9px; color: #314158; font-weight: 750; }
+.select-all-control input, .selection-column input { width: 17px; height: 17px; accent-color: #155eef; }
+.selection-column { width: 52px; text-align: center; }
 .testcase-select { position: absolute; top: 17px; left: 14px; z-index: 3; display: grid; place-items: center; }
 .testcase-select input { width: 16px; height: 16px; accent-color: #155eef; }
 .testcase-item > .testcase-summary { padding-left: 44px; }
@@ -140,6 +144,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 [data-theme="dark"] .evaluation-metric p, [data-theme="dark"] .evaluation-summary p { color: #c0ccdc; }
 [data-theme="dark"] .data-table th { background: #1a2a40; color: #c5d0df; }
 [data-theme="dark"] .data-table td { border-color: #2b3a4f; }
+[data-theme="dark"] .bulk-requirement-toolbar { border-color: #33445b; background: #131f30; }
+[data-theme="dark"] .select-all-control { color: #dce5f1; }
 [data-theme="dark"] .data-table tbody tr:hover { background: #17283e; }
 [data-theme="dark"] .settings-section { border-color: #33445b; }
 @media (prefers-color-scheme: dark) {

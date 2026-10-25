@@ -1132,7 +1132,7 @@ async def _create_generated_test_case(
                 expected_result=generated_step.expected_result,
             )
         )
-    _enqueue_test_case_post_processing(db, test_case)
+    await _enqueue_test_case_post_processing(db, test_case)
     snapshot = {
         "id": str(test_case.id),
         **generated_case.model_dump(),
@@ -1158,12 +1158,16 @@ def _enqueue_automatic_quality_evaluation(db: AsyncSession, test_case: TestCase)
     )
 
 
-def _enqueue_current_test_case_index(db: AsyncSession, test_case: TestCase) -> None:
+async def _enqueue_current_test_case_index(db: AsyncSession, test_case: TestCase) -> None:
     """Index the current case for Search independently of approved RAG versions."""
 
+    event_key = f"test_case.current_index:{test_case.id}:v{test_case.version}:{test_case.status}"
+    existing = await db.scalar(select(OutboxEvent.id).where(OutboxEvent.event_key == event_key))
+    if existing:
+        return
     enqueue_index_event(
         db,
-        event_key=f"test_case.current_index:{test_case.id}:v{test_case.version}:{test_case.status}",
+        event_key=event_key,
         event_type=TEST_CASE_INDEX_REQUESTED,
         aggregate_type="test_case",
         aggregate_id=test_case.id,
@@ -1171,9 +1175,9 @@ def _enqueue_current_test_case_index(db: AsyncSession, test_case: TestCase) -> N
     )
 
 
-def _enqueue_test_case_post_processing(db: AsyncSession, test_case: TestCase) -> None:
+async def _enqueue_test_case_post_processing(db: AsyncSession, test_case: TestCase) -> None:
     _enqueue_automatic_quality_evaluation(db, test_case)
-    _enqueue_current_test_case_index(db, test_case)
+    await _enqueue_current_test_case_index(db, test_case)
 
 
 async def _create_generated_scenario(db: AsyncSession, requirement_id: uuid.UUID, generated_scenario) -> dict:
@@ -2338,12 +2342,12 @@ async def approve_test_case(
             aggregate_id=version.id,
             payload={"test_case_id": str(test_case.id), "version": test_case.version},
         )
-        _enqueue_current_test_case_index(db, test_case)
+        await _enqueue_current_test_case_index(db, test_case)
         run.status = "approved"
         run.completed_at = datetime.utcnow()
     else:
         test_case.status = "in_review"
-        _enqueue_current_test_case_index(db, test_case)
+        await _enqueue_current_test_case_index(db, test_case)
         run.status = "in_review"
     await db.commit()
     await db.refresh(test_case)
@@ -2527,7 +2531,7 @@ async def reject_test_case(
     )
     test_case.status = "changes_requested"
     test_case.repository_status = "draft"
-    _enqueue_current_test_case_index(db, test_case)
+    await _enqueue_current_test_case_index(db, test_case)
     run.status = "rejected"
     run.completed_at = datetime.utcnow()
     await _create_approval_record(
@@ -2853,7 +2857,7 @@ async def process_feedback_revision(
                             expected_result=generated_step.expected_result,
                         )
                     )
-                _enqueue_test_case_post_processing(db, source_case)
+                await _enqueue_test_case_post_processing(db, source_case)
                 result_snapshot = {
                     "id": str(source_case.id),
                     **generated_case.model_dump(),
@@ -2874,7 +2878,7 @@ async def process_feedback_revision(
                 if not existing_case.locked and existing_case.status not in {"approved", "deprecated"}:
                     existing_case.status = "superseded"
                     existing_case.repository_status = "superseded"
-                    _enqueue_current_test_case_index(db, existing_case)
+                    await _enqueue_current_test_case_index(db, existing_case)
                     superseded_case_ids.append(str(existing_case.id))
             replacement_cases = []
             for generated_case in generated_scenario.test_cases:
@@ -2904,7 +2908,7 @@ async def process_feedback_revision(
                     for existing_case in mutable_cases:
                         existing_case.status = "superseded"
                         existing_case.repository_status = "superseded"
-                        _enqueue_current_test_case_index(db, existing_case)
+                        await _enqueue_current_test_case_index(db, existing_case)
                     if not protected_cases:
                         existing_scenario.status = "superseded"
                         superseded_scenario_ids.append(str(existing_scenario.id))
@@ -2937,7 +2941,7 @@ async def process_feedback_revision(
             source_snapshot = _test_case_snapshot(test_case)
             test_case.status = "deprecated"
             test_case.repository_status = "deprecated"
-            _enqueue_current_test_case_index(db, test_case)
+            await _enqueue_current_test_case_index(db, test_case)
             result_snapshot = _test_case_snapshot(test_case)
         elif feedback.target_level == "scenario":
             result = await db.execute(select(TestScenario).where(TestScenario.id == feedback.target_id))
@@ -3925,7 +3929,7 @@ async def deprecate_impacted_test_case(
 
     test_case.status = "deprecated"
     test_case.repository_status = "deprecated"
-    _enqueue_current_test_case_index(db, test_case)
+    await _enqueue_current_test_case_index(db, test_case)
     actor = _actor(payload)
     db.add(
         AuditLog(
@@ -6481,7 +6485,7 @@ async def create_test_case_for_scenario(
     )
     db.add(test_case)
     await db.flush()
-    _enqueue_test_case_post_processing(db, test_case)
+    await _enqueue_test_case_post_processing(db, test_case)
     await db.commit()
     
     # Refresh with eager loading of relationships
@@ -6555,7 +6559,7 @@ async def update_test_case(
                 expected_result=item.expected_result.strip(),
             )
         )
-    _enqueue_test_case_post_processing(db, test_case)
+    await _enqueue_test_case_post_processing(db, test_case)
     db.add(
         AuditLog(
             entity_type="test_case",
@@ -6748,7 +6752,7 @@ async def generate_requirement_draft(
                         expected_result=generated_step.expected_result,
                     )
                 )
-            _enqueue_test_case_post_processing(db, test_case)
+            await _enqueue_test_case_post_processing(db, test_case)
 
     requirement.status = "generated"
     requirement.vector_id = generation_result.requirement_vector_id

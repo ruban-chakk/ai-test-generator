@@ -155,3 +155,72 @@ def test_llm_judge_uses_separate_model_and_retrieved_evidence() -> None:
         assert "knowledge_document:doc-1" in model.user_prompt
 
     asyncio.run(scenario())
+
+
+def test_llm_judge_allows_requirement_grounded_issue_without_retrieved_citation() -> None:
+    class RequirementGroundedIssueModel(FakeLanguageModel):
+        async def generate_structured(self, system_prompt, user_prompt, response_model, **kwargs):
+            return response_model.model_validate(
+                {
+                    "score": 72,
+                    "status": "failed",
+                    "scores": {
+                        criterion: 72
+                        for criterion in (
+                            "requirement_coverage",
+                            "grounding",
+                            "correctness",
+                            "completeness",
+                            "relevance",
+                            "hallucination_rate",
+                            "executability",
+                            "boundary_and_negative_coverage",
+                            "traceability",
+                        )
+                    },
+                    "justifications": {
+                        criterion: "The requirement directly supports this assessment."
+                        for criterion in (
+                            "requirement_coverage",
+                            "grounding",
+                            "correctness",
+                            "completeness",
+                            "relevance",
+                            "hallucination_rate",
+                            "executability",
+                            "boundary_and_negative_coverage",
+                            "traceability",
+                        )
+                    },
+                    "issues": [{
+                        "criterion": "completeness",
+                        "severity": "warning",
+                        "message": "The candidate does not cover the required recovery path.",
+                        "evidence_refs": [],
+                    }],
+                    "summary": "The candidate is missing a requirement-defined path.",
+                }
+            )
+
+    async def scenario() -> None:
+        config = Settings(
+            _env_file=None,
+            llm_api_key="test-key",
+            llm_model="generation-model",
+            eval_llm_model="judge-model",
+            eval_pass_score=80,
+            eval_require_citations=True,
+        )
+        result = await TestCaseEvaluationService(
+            config=config,
+            language_model=RequirementGroundedIssueModel(),
+            vector_store=FakeVectorStore(),
+        ).evaluate(
+            project_id="project-1",
+            requirement_text="The workflow must support recovery after a failed approval.",
+            scenario_text="Approval recovery",
+            test_case_text="Submit a refund and verify approval.",
+        )
+        assert result.judgment.issues[0].evidence_refs == []
+
+    asyncio.run(scenario())
