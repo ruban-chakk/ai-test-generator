@@ -27,6 +27,8 @@ export default function RequirementDashboard({ selectedProject }: Props) {
   const [search, setSearch] = useState('');
   const [status, setStatus] = useState<string | undefined>(undefined);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [selectedRequirementIds, setSelectedRequirementIds] = useState<Set<string>>(new Set());
+  const [activeBulkAction, setActiveBulkAction] = useState<'generate' | 'impact' | null>(null);
 
   useEffect(() => {
     async function fetchRequirements() {
@@ -41,6 +43,10 @@ export default function RequirementDashboard({ selectedProject }: Props) {
         setError(null);
         const data = await getRequirements(search, status, selectedProject.id);
         setRequirements(data);
+        setSelectedRequirementIds((current) => {
+          const visibleIds = new Set(data.map((item) => item.id));
+          return new Set([...current].filter((requirementId) => visibleIds.has(requirementId)));
+        });
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unknown error');
       } finally {
@@ -50,6 +56,27 @@ export default function RequirementDashboard({ selectedProject }: Props) {
 
     fetchRequirements();
   }, [search, status, selectedProject, refreshTick]);
+
+  const selectedRequirements = requirements.filter((requirement) => selectedRequirementIds.has(requirement.id));
+  const allVisibleSelected = requirements.length > 0 && selectedRequirements.length === requirements.length;
+
+  const toggleRequirementSelection = (requirementId: string) => {
+    setSelectedRequirementIds((current) => {
+      const next = new Set(current);
+      if (next.has(requirementId)) next.delete(requirementId);
+      else next.add(requirementId);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    setSelectedRequirementIds((current) => {
+      if (requirements.length > 0 && requirements.every((requirement) => current.has(requirement.id))) {
+        return new Set();
+      }
+      return new Set(requirements.map((requirement) => requirement.id));
+    });
+  };
 
   const handleGenerateTestCases = async (requirement: RequirementSummary) => {
     try {
@@ -83,6 +110,40 @@ export default function RequirementDashboard({ selectedProject }: Props) {
       setError(err instanceof Error ? err.message : 'Unable to run impact analysis');
     } finally {
       setActiveRowAction(null);
+    }
+  };
+
+  const handleBulkAction = async (action: 'generate' | 'impact') => {
+    if (!selectedRequirements.length) return;
+    try {
+      setActiveBulkAction(action);
+      setError(null);
+      setActionMessage(null);
+      const results = await Promise.allSettled(
+        selectedRequirements.map((requirement) =>
+          action === 'generate'
+            ? generateRequirementDraft(requirement.id)
+            : getRequirementImpact(requirement.id),
+        ),
+      );
+      const successful = results.filter((result) => result.status === 'fulfilled');
+      const failed = results.length - successful.length;
+      if (action === 'generate') {
+        const generated = successful
+          .map((result) => result.status === 'fulfilled' ? result.value as RequirementSummary : null)
+          .filter((requirement): requirement is RequirementSummary => Boolean(requirement));
+        setRequirements((current) => current.map((requirement) =>
+          generated.find((updated) => updated.id === requirement.id) ?? requirement,
+        ));
+      }
+      const actionLabel = action === 'generate' ? 'test-case generation' : 'impact analysis';
+      setActionMessage(
+        `${actionLabel} completed for ${successful.length} requirement${successful.length === 1 ? '' : 's'}` +
+        `${failed ? `; ${failed} failed` : '.'}`,
+      );
+      setSelectedRequirementIds(new Set());
+    } finally {
+      setActiveBulkAction(null);
     }
   };
 
@@ -156,6 +217,43 @@ export default function RequirementDashboard({ selectedProject }: Props) {
         </div>
       </section>
 
+      {requirements.length > 0 ? (
+        <section className="bulk-requirement-toolbar" aria-label="Bulk requirement actions">
+          <label className="select-all-control">
+            <input
+              type="checkbox"
+              checked={allVisibleSelected}
+              onChange={toggleSelectAll}
+              aria-label="Select all visible requirements"
+            />
+            <span>{selectedRequirements.length} selected</span>
+          </label>
+          <button className="secondary-button compact-button" type="button" onClick={toggleSelectAll}>
+            {allVisibleSelected ? 'Clear selection' : 'Select all'}
+          </button>
+          {selectedRequirements.length > 0 ? (
+            <>
+              <button
+                className="primary-button compact-button"
+                type="button"
+                onClick={() => handleBulkAction('generate')}
+                disabled={activeBulkAction !== null}
+              >
+                {activeBulkAction === 'generate' ? 'Generating selected...' : `Generate test cases (${selectedRequirements.length})`}
+              </button>
+              <button
+                className="secondary-button compact-button"
+                type="button"
+                onClick={() => handleBulkAction('impact')}
+                disabled={activeBulkAction !== null}
+              >
+                {activeBulkAction === 'impact' ? 'Analyzing selected...' : `Run impact analysis (${selectedRequirements.length})`}
+              </button>
+            </>
+          ) : null}
+        </section>
+      ) : null}
+
       {loading ? (
         <div className="status-message">Loading requirements...</div>
       ) : error ? (
@@ -170,6 +268,14 @@ export default function RequirementDashboard({ selectedProject }: Props) {
               <table className="data-table requirements-table">
                 <thead>
                   <tr>
+                    <th scope="col" className="selection-column">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={toggleSelectAll}
+                        aria-label="Select all visible requirements"
+                      />
+                    </th>
                     <th scope="col" className="requirement-column">
                       Requirement
                     </th>
@@ -193,6 +299,14 @@ export default function RequirementDashboard({ selectedProject }: Props) {
                 <tbody>
                   {requirements.map((requirement) => (
                     <tr key={requirement.id}>
+                      <td className="selection-column">
+                        <input
+                          type="checkbox"
+                          checked={selectedRequirementIds.has(requirement.id)}
+                          onChange={() => toggleRequirementSelection(requirement.id)}
+                          aria-label={`Select ${requirement.title}`}
+                        />
+                      </td>
                       <td>
                         <strong>{requirement.title}</strong>
                         {requirement.description ? (
