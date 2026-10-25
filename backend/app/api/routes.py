@@ -63,6 +63,9 @@ from app.models import (
 from app.schemas import (
     AlertSummary,
     ApprovalAction,
+    BulkApprovalItem,
+    BulkApprovalRequest,
+    BulkApprovalResult,
     ApprovalRecordSummary,
     ApprovalStageDefinition,
     ApprovalWorkflowRunSummary,
@@ -2345,6 +2348,90 @@ async def approve_test_case(
     await db.commit()
     await db.refresh(test_case)
     return test_case
+
+
+@api_router.post(
+    "/requirements/{requirement_id}/test-cases/bulk-approve",
+    response_model=BulkApprovalResult,
+    tags=["Approvals"],
+)
+async def bulk_approve_test_cases(
+    requirement_id: str,
+    payload: BulkApprovalRequest,
+    db: AsyncSession = Depends(get_db),
+) -> BulkApprovalResult:
+    """Apply the normal staged approval operation to a requirement-scoped batch.
+
+    Each successful case commits its own workflow decision and outbox intent. A
+    blocked case is rolled back independently so one missing evaluation or
+    separation-of-duties conflict does not hide the other batch results.
+    """
+    try:
+        requirement_uuid = uuid.UUID(requirement_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Requirement not found") from exc
+
+    requirement = await db.get(Requirement, requirement_uuid)
+    if not requirement:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+    await _require_project_access(db, requirement.project_id)
+
+    if payload.scope == "scenario" and payload.scenario_id is None:
+        raise HTTPException(status_code=422, detail="scenario_id is required for scenario approval")
+    if payload.scope == "test_case" and not payload.test_case_ids:
+        raise HTTPException(status_code=422, detail="test_case_ids is required for test-case approval")
+    if payload.scope == "scenario":
+        scenario_belongs = await db.scalar(
+            select(TestScenario.id).where(
+                TestScenario.id == payload.scenario_id,
+                TestScenario.requirement_id == requirement_uuid,
+            )
+        )
+        if scenario_belongs is None:
+            raise HTTPException(status_code=404, detail="Scenario not found for this requirement")
+
+    stmt = select(TestCase.id).where(TestCase.requirement_id == requirement_uuid)
+    if payload.scope == "scenario":
+        stmt = stmt.where(TestCase.scenario_id == payload.scenario_id)
+    elif payload.scope == "test_case":
+        stmt = stmt.where(TestCase.id.in_(payload.test_case_ids))
+    case_ids = [row[0] for row in (await db.execute(stmt.order_by(TestCase.created_at.asc()))).all()]
+    if payload.scope == "test_case":
+        missing = set(payload.test_case_ids) - set(case_ids)
+        if missing:
+            raise HTTPException(status_code=404, detail="One or more test cases do not belong to this requirement")
+    if not case_ids:
+        raise HTTPException(status_code=404, detail="No test cases found for this approval scope")
+
+    items: list[BulkApprovalItem] = []
+    for case_id in case_ids:
+        try:
+            result = await approve_test_case(
+                str(case_id),
+                ApprovalAction(approved_by=payload.approved_by, notes=payload.notes),
+                db,
+            )
+            status = "approved" if result.status == "approved" else "in_review"
+            items.append(BulkApprovalItem(test_case_id=case_id, status=status))
+        except HTTPException as exc:
+            await db.rollback()
+            detail = exc.detail if isinstance(exc.detail, str) else "Approval was blocked by governance validation"
+            status = "blocked" if exc.status_code in {403, 409, 422} else "failed"
+            items.append(BulkApprovalItem(test_case_id=case_id, status=status, message=detail))
+        except Exception:
+            await db.rollback()
+            items.append(BulkApprovalItem(test_case_id=case_id, status="failed", message="Approval failed unexpectedly"))
+
+    return BulkApprovalResult(
+        scope=payload.scope,
+        requested_count=len(case_ids),
+        processed_count=sum(item.status in {"approved", "in_review"} for item in items),
+        approved_count=sum(item.status == "approved" for item in items),
+        in_review_count=sum(item.status == "in_review" for item in items),
+        blocked_count=sum(item.status == "blocked" for item in items),
+        failed_count=sum(item.status == "failed" for item in items),
+        items=items,
+    )
 
 
 @api_router.get(
@@ -5955,6 +6042,7 @@ async def _evaluate_quality_impl(
     db: AsyncSession,
     *,
     source_event_id: uuid.UUID | None = None,
+    child_evaluations_override: dict[uuid.UUID, QualityEvaluationSummary] | None = None,
 ) -> QualityEvaluationSummary:
     if target_level not in TARGET_LEVELS:
         raise HTTPException(status_code=422, detail="Target level must be requirement, scenario, or test_case")
@@ -5978,20 +6066,60 @@ async def _evaluate_quality_impl(
     if target_level in {"requirement", "suite", "scenario"}:
         if target_level == "scenario":
             case_result = await db.execute(
-                select(TestCase.id).where(TestCase.scenario_id == target_uuid)
+                select(TestCase.id, TestCase.scenario_id).where(TestCase.scenario_id == target_uuid)
             )
+            scenario_ids = [target_uuid]
         else:
             case_result = await db.execute(
-                select(TestCase.id).where(TestCase.requirement_id == target_uuid)
+                select(TestCase.id, TestCase.scenario_id).where(TestCase.requirement_id == target_uuid)
             )
-        case_ids = list(case_result.scalars().all())
+            scenario_ids = list((await db.execute(
+                select(TestScenario.id).where(TestScenario.requirement_id == target_uuid)
+            )).scalars().all())
+        case_rows = case_result.all()
+        case_ids = [row[0] for row in case_rows]
         child_evaluations: list[QualityEvaluationSummary] = []
         for case_id in case_ids:
-            child_evaluations.append(await _evaluate_quality_impl("test_case", str(case_id), db))
+            if child_evaluations_override and case_id in child_evaluations_override:
+                child_evaluations.append(child_evaluations_override[case_id])
+            else:
+                child_evaluations.append(await _evaluate_quality_impl("test_case", str(case_id), db))
+
+        # A suite evaluation is also a request to refresh every intermediate
+        # rollup.  Persist scenario evaluations after their test cases have
+        # been refreshed so the requirement page can hydrate all three levels
+        # from durable records after a reload.  The already-persisted child
+        # results are passed into the scenario rollup to avoid evaluating the
+        # same test case twice (and charging twice for an LLM judge call).
+        scenario_evaluations: list[QualityEvaluationSummary] = []
+        if target_level in {"requirement", "suite"}:
+            for scenario_id in scenario_ids:
+                scenario_evaluations.append(
+                    await _evaluate_quality_impl(
+                        "scenario",
+                        str(scenario_id),
+                        db,
+                        child_evaluations_override={item.target_id: item for item in child_evaluations},
+                    )
+                )
 
         target_issues = await _collect_validation_issues(db, target_level, target_uuid)
         scores = [item.score for item in child_evaluations]
         aggregate_score = round(sum(scores) / len(scores)) if scores else 0
+        covered_scenarios = len({row[1] for row in case_rows})
+        scenario_coverage = covered_scenarios / len(scenario_ids) if scenario_ids else 0.0
+        requirement_coverage_scores = []
+        for item in child_evaluations:
+            deepeval_metrics = item.metrics.get("deepeval_metrics", [])
+            requirement_metric = next(
+                (metric for metric in deepeval_metrics if metric.get("name") == "requirement_coverage"),
+                None,
+            )
+            requirement_coverage_scores.append(
+                float((requirement_metric or {}).get("normalized_score", (item.metrics.get("guardrail_score") or item.score)))
+            )
+        quality_coverage = (sum(requirement_coverage_scores) / len(requirement_coverage_scores) / 100) if requirement_coverage_scores else 0.0
+        coverage_score = round((scenario_coverage * 0.6 + quality_coverage * 0.4) * 100)
         issue_payload = [
             {"target_id": str(item.target_id), **issue}
             for item in child_evaluations
@@ -6004,6 +6132,16 @@ async def _evaluate_quality_impl(
             "passed_test_case_count": sum(item.status == "passed" for item in child_evaluations),
             "failed_test_case_count": sum(item.status != "passed" for item in child_evaluations),
             "average_score": aggregate_score,
+            "coverage_score": coverage_score,
+            "requirement_coverage": coverage_score,
+            "test_coverage": {
+                "scenario_count": len(scenario_ids),
+                "covered_scenario_count": covered_scenarios,
+                "scenario_coverage_percent": round(scenario_coverage * 100),
+                "test_case_count": len(case_ids),
+                "quality_coverage_percent": round(quality_coverage * 100),
+                "definition": "Percentage of requirement scenarios represented by generated test cases, weighted with their requirement-coverage evaluation.",
+            },
             "test_case_evaluations": [
                 {
                     "id": str(item.id),
@@ -6014,6 +6152,17 @@ async def _evaluate_quality_impl(
                     "issues": item.issues,
                 }
                 for item in child_evaluations
+            ],
+            "scenario_evaluations": [
+                {
+                    "id": str(item.id),
+                    "target_id": str(item.target_id),
+                    "score": item.score,
+                    "status": item.status,
+                    "metrics": item.metrics,
+                    "issues": item.issues,
+                }
+                for item in scenario_evaluations
             ],
         }
         evaluation = QualityEvaluation(

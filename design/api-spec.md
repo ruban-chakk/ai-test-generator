@@ -46,6 +46,9 @@ Base URL: `/api/v1`. JSON responses are returned directly rather than inside a r
 - `POST /requirements/{id}/approve|reject`
 - `POST /scenarios/{id}/approve|reject`
 - `POST /test_cases/{id}/approve|reject`
+- `POST /requirements/{id}/test-cases/bulk-approve` — apply the same staged approval operation to all cases in a
+  requirement, one scenario, or an explicit `test_case_ids` selection. Returns per-case `approved`, `in_review`,
+  `blocked`, or `failed` outcomes; evaluation gates and separation-of-duties rules remain enforced per case.
 - `GET /test_cases/{id}/versions`
 - `POST /feedback`, `GET /feedback?target_level=&target_id=`
 - `POST /feedback` accepts an optional `quality_evaluation_id`; the evaluation must belong to the same target.

@@ -184,6 +184,31 @@ class ApprovalAction(APIModel):
     notes: Optional[str] = None
 
 
+class BulkApprovalRequest(APIModel):
+    scope: Literal["requirement", "scenario", "test_case"]
+    scenario_id: Optional[uuid.UUID] = None
+    test_case_ids: List[uuid.UUID] = Field(default_factory=list, max_length=500)
+    approved_by: Optional[str] = "system"
+    notes: Optional[str] = None
+
+
+class BulkApprovalItem(APIModel):
+    test_case_id: uuid.UUID
+    status: Literal["approved", "in_review", "blocked", "failed"]
+    message: Optional[str] = None
+
+
+class BulkApprovalResult(APIModel):
+    scope: Literal["requirement", "scenario", "test_case"]
+    requested_count: int
+    processed_count: int
+    approved_count: int
+    in_review_count: int
+    blocked_count: int
+    failed_count: int
+    items: List[BulkApprovalItem] = Field(default_factory=list)
+
+
 class ApprovalStageDefinition(APIModel):
     name: str = Field(min_length=1, max_length=255)
     required_roles: List[str] = Field(min_length=1)

@@ -270,6 +270,17 @@ export type ApprovalActionPayload = {
   notes?: string;
 };
 
+export type BulkApprovalResult = {
+  scope: 'requirement' | 'scenario' | 'test_case';
+  requested_count: number;
+  processed_count: number;
+  approved_count: number;
+  in_review_count: number;
+  blocked_count: number;
+  failed_count: number;
+  items: { test_case_id: string; status: 'approved' | 'in_review' | 'blocked' | 'failed'; message?: string }[];
+};
+
 export type ApprovalStageDefinition = {
   name: string;
   required_roles: string[];
@@ -1230,6 +1241,23 @@ export async function approveTestCase(
     body: JSON.stringify(payload),
   });
   return handleResponse<TestCaseSummary>(response);
+}
+
+export async function bulkApproveTestCases(
+  requirementId: string,
+  payload: {
+    scope: 'requirement' | 'scenario' | 'test_case';
+    scenario_id?: string;
+    test_case_ids?: string[];
+    approved_by?: string;
+    notes?: string;
+  },
+): Promise<BulkApprovalResult> {
+  return request<BulkApprovalResult>(`${API_BASE_URL}/requirements/${requirementId}/test-cases/bulk-approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function rejectTestCase(

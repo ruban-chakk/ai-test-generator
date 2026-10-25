@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   approveTestCase,
+  bulkApproveTestCases,
   ApprovalWorkflowRun,
   AuthenticatedUser,
   createFeedback,
@@ -62,6 +63,8 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
   const [feedbackIncludeEvaluation, setFeedbackIncludeEvaluation] = useState(false);
   const [editDraft, setEditDraft] = useState<TestCaseEditDraft | null>(null);
   const [editSaving, setEditSaving] = useState(false);
+  const [selectedTestCases, setSelectedTestCases] = useState<Set<string>>(new Set());
+  const [busyBulkScope, setBusyBulkScope] = useState<string | null>(null);
 
   async function loadRequirement() {
     if (!id) return;
@@ -132,6 +135,27 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
     await handleEvaluateTarget('test_case', testCaseId);
   }
 
+  function hydrateEvaluationCascade(result: QualityEvaluationSummary) {
+    const childEvaluations = Array.isArray(result.metrics.test_case_evaluations)
+      ? result.metrics.test_case_evaluations as QualityEvaluationSummary[]
+      : [];
+    if (childEvaluations.length) {
+      setEvaluations((current) => ({
+        ...current,
+        ...Object.fromEntries(childEvaluations.map((evaluation) => [evaluation.target_id, evaluation])),
+      }));
+    }
+    const scenarioEvaluations = Array.isArray(result.metrics.scenario_evaluations)
+      ? result.metrics.scenario_evaluations as QualityEvaluationSummary[]
+      : [];
+    if (scenarioEvaluations.length) {
+      setAggregateEvaluations((current) => ({
+        ...current,
+        ...Object.fromEntries(scenarioEvaluations.map((evaluation) => [`scenario:${evaluation.target_id}`, evaluation])),
+      }));
+    }
+  }
+
   async function handleEvaluateTarget(level: 'requirement' | 'scenario' | 'test_case', targetId: string) {
     const busyKey = `${level}:${targetId}`;
     try {
@@ -145,6 +169,7 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
         await refreshCaseWorkflow(targetId);
       } else {
         setAggregateEvaluations((current) => ({ ...current, [busyKey]: result }));
+        hydrateEvaluationCascade(result);
       }
       setNotice(`Evaluation ${result.status}: ${result.score}/100.`);
     } catch (err) {
@@ -196,6 +221,17 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
     });
   }
 
+  function moveEditStep(index: number, direction: -1 | 1) {
+    setEditDraft((current) => {
+      if (!current) return current;
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= current.steps.length) return current;
+      const steps = current.steps.slice();
+      [steps[index], steps[nextIndex]] = [steps[nextIndex], steps[index]];
+      return { ...current, steps: steps.map((step, stepIndex) => ({ ...step, step_number: stepIndex + 1 })) };
+    });
+  }
+
   async function handleEdit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!editDraft) return;
@@ -243,6 +279,47 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
       setError(err instanceof Error ? err.message : 'Unable to record approval decision');
     } finally {
       setBusyCase(null);
+    }
+  }
+
+  function toggleSelectedTestCase(testCaseId: string) {
+    setSelectedTestCases((current) => {
+      const next = new Set(current);
+      if (next.has(testCaseId)) next.delete(testCaseId);
+      else next.add(testCaseId);
+      return next;
+    });
+  }
+
+  async function handleBulkApprove(
+    scope: 'requirement' | 'scenario' | 'test_case',
+    scenarioId?: string,
+    testCaseIds?: string[],
+  ) {
+    if (!requirement) return;
+    const busyKey = scenarioId ? `scenario:${scenarioId}` : scope;
+    try {
+      setBusyBulkScope(busyKey);
+      setError(null);
+      setNotice(null);
+      const result = await bulkApproveTestCases(requirement.id, {
+        scope,
+        scenario_id: scenarioId,
+        test_case_ids: testCaseIds,
+        approved_by: user.username,
+        notes: scope === 'requirement' ? 'Bulk approval from generated test review' : 'Bulk approval from scenario review',
+      });
+      setSelectedTestCases(new Set());
+      await loadRequirement();
+      const blocked = result.blocked_count + result.failed_count;
+      setNotice(
+        `${result.processed_count} case${result.processed_count === 1 ? '' : 's'} processed: ` +
+        `${result.approved_count} fully approved, ${result.in_review_count} in review${blocked ? `, ${blocked} blocked` : ''}.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to bulk approve test cases');
+    } finally {
+      setBusyBulkScope(null);
     }
   }
 
@@ -299,6 +376,9 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
           <p className="eyebrow">Generated test review</p>
           <h1>{requirement?.title ?? 'Generated Test Cases'}</h1>
           {requirement ? <span className="header-subtitle">Requirement ID: {requirement.id}</span> : null}
+          {requirement && aggregateEvaluations[`requirement:${requirement.id}`] ? (
+            <span className="status-pill evaluation-score">Requirement evaluation: {aggregateEvaluations[`requirement:${requirement.id}`]?.score}/100 · {aggregateEvaluations[`requirement:${requirement.id}`]?.status} · coverage {String(aggregateEvaluations[`requirement:${requirement.id}`]?.metrics.coverage_score ?? '—')}/100</span>
+          ) : null}
         </div>
         <div className="header-actions">
           {requirement ? (
@@ -308,6 +388,9 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
               </button>
               <button className="primary-button" type="button" onClick={() => handleEvaluateTarget('requirement', requirement.id)} disabled={busyEvaluationTarget === `requirement:${requirement.id}`}>
                 {busyEvaluationTarget === `requirement:${requirement.id}` ? 'Evaluating suite...' : 'Run suite evaluation'}
+              </button>
+              <button className="primary-button" type="button" onClick={() => handleBulkApprove('requirement')} disabled={busyBulkScope === 'requirement'}>
+                {busyBulkScope === 'requirement' ? 'Approving suite...' : 'Approve all test cases'}
               </button>
             </>
           ) : null}
@@ -331,12 +414,17 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                     <button className="collapsible-header" type="button" aria-expanded={isScenarioExpanded} onClick={() => toggleScenario(scenario.id)}>
                       <span className="collapse-indicator">{isScenarioExpanded ? '-' : '+'}</span>
                       <span><strong>{scenario.title}</strong><span className="table-description">{scenario.description} · {testCases.length} test case{testCases.length === 1 ? '' : 's'}</span></span>
+                      {aggregateEvaluations[`scenario:${scenario.id}`] ? <span className="status-pill evaluation-score">Evaluation {aggregateEvaluations[`scenario:${scenario.id}`]?.score}/100 · {aggregateEvaluations[`scenario:${scenario.id}`]?.status}</span> : null}
                     </button>
                     <div className="detail-actions">
                       <button className="secondary-button compact-button" type="button" onClick={() => openFeedback({ level: 'scenario', id: scenario.id, label: scenario.title }, aggregateEvaluations[`scenario:${scenario.id}`]?.id)}>Scenario feedback</button>
                       <button className="secondary-button compact-button" type="button" onClick={() => handleEvaluateTarget('scenario', scenario.id)} disabled={busyEvaluationTarget === `scenario:${scenario.id}`}>
                         {busyEvaluationTarget === `scenario:${scenario.id}` ? 'Evaluating...' : 'Run scenario evaluation'}
                       </button>
+                      <button className="primary-button compact-button" type="button" onClick={() => handleBulkApprove('scenario', scenario.id)} disabled={busyBulkScope === `scenario:${scenario.id}`}>
+                        {busyBulkScope === `scenario:${scenario.id}` ? 'Approving...' : 'Approve scenario cases'}
+                      </button>
+                      {testCases.some((item) => selectedTestCases.has(item.id)) ? <button className="secondary-button compact-button" type="button" onClick={() => handleBulkApprove('test_case', undefined, testCases.filter((item) => selectedTestCases.has(item.id)).map((item) => item.id))} disabled={busyBulkScope === 'test_case'}>Approve selected ({testCases.filter((item) => selectedTestCases.has(item.id)).length})</button> : null}
                     </div>
                   </div>
 
@@ -352,6 +440,9 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                         const currentStage = run && policy ? policy.stages[run.current_stage] : undefined;
                         return (
                           <article key={testCase.id} className="testcase-item">
+                            <label className="testcase-select">
+                              <input type="checkbox" checked={selectedTestCases.has(testCase.id)} onChange={() => toggleSelectedTestCase(testCase.id)} aria-label={`Select ${testCase.title} for bulk approval`} />
+                            </label>
                             <button className="testcase-summary" type="button" aria-expanded={isExpanded} onClick={() => toggleTestCase(testCase.id)}>
                               <span className="collapse-indicator">{isExpanded ? '-' : '+'}</span>
                               <span><span className="testcase-id">Test ID: {testCase.id}</span><strong>{testCase.title}</strong><span className="table-description">{testCase.description}</span></span>
@@ -455,7 +546,11 @@ export default function RequirementTestCases({ user }: { user: AuthenticatedUser
                     <strong>Step {index + 1}</strong>
                     <label>Action<textarea rows={2} required value={step.action} onChange={(event) => setEditDraft({ ...editDraft, steps: editDraft.steps.map((item, itemIndex) => itemIndex === index ? { ...item, action: event.target.value } : item) })} /></label>
                     <label>Expected result<textarea rows={2} required value={step.expected_result} onChange={(event) => setEditDraft({ ...editDraft, steps: editDraft.steps.map((item, itemIndex) => itemIndex === index ? { ...item, expected_result: event.target.value } : item) })} /></label>
-                    <button className="secondary-button compact-button" type="button" disabled={editDraft.steps.length === 1} onClick={() => setEditDraft({ ...editDraft, steps: editDraft.steps.filter((_, itemIndex) => itemIndex !== index).map((item, itemIndex) => ({ ...item, step_number: itemIndex + 1 })) })}>Remove step</button>
+                    <div className="edit-step-actions">
+                      <button className="secondary-button compact-button" type="button" disabled={index === 0} onClick={() => moveEditStep(index, -1)}>Move up</button>
+                      <button className="secondary-button compact-button" type="button" disabled={index === editDraft.steps.length - 1} onClick={() => moveEditStep(index, 1)}>Move down</button>
+                      <button className="secondary-button compact-button" type="button" disabled={editDraft.steps.length === 1} onClick={() => setEditDraft({ ...editDraft, steps: editDraft.steps.filter((_, itemIndex) => itemIndex !== index).map((item, itemIndex) => ({ ...item, step_number: itemIndex + 1 })) })}>Remove step</button>
+                    </div>
                   </div>
                 ))}
                 <button className="secondary-button" type="button" onClick={() => setEditDraft({ ...editDraft, steps: [...editDraft.steps, { step_number: editDraft.steps.length + 1, action: '', expected_result: '' }] })}>Add step</button>
