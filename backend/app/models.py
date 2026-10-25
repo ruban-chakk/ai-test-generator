@@ -277,6 +277,29 @@ class MappedImportJob(Base):
     completed_at = Column(DateTime, nullable=True)
 
 
+class BulkOperationJob(Base):
+    """Durable queue entry for multi-requirement generation/impact work."""
+
+    __tablename__ = "bulk_operation_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    operation_type = Column(String(64), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="queued", index=True)
+    requirement_ids = Column(JSON, nullable=False, default=list)
+    total_count = Column(Integer, nullable=False, default=0)
+    completed_count = Column(Integer, nullable=False, default=0)
+    failed_count = Column(Integer, nullable=False, default=0)
+    result = Column(JSON, nullable=False, default=dict)
+    last_error_type = Column(String(255), nullable=True)
+    requested_by = Column(String(255), nullable=False)
+    locked_at = Column(DateTime, nullable=True)
+    locked_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+
 class UnresolvedImportRecord(Base):
     __tablename__ = "unresolved_import_records"
     __table_args__ = (UniqueConstraint("dedupe_sha256", name="uq_unresolved_import_dedupe"),)

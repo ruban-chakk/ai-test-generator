@@ -35,6 +35,7 @@ from app.models import (
     IntegrationSchedule,
     ImportMappingProfile,
     MappedImportJob,
+    BulkOperationJob,
     KnowledgeDocument,
     OperationalMetric,
     Organization,
@@ -95,6 +96,8 @@ from app.schemas import (
     ImportMappingProfileSummary,
     MappedImportPreview,
     MappedImportJobSummary,
+    BulkOperationCreateRequest,
+    BulkOperationJobSummary,
     UnresolvedImportRecordSummary,
     JiraImportRequest,
     KnowledgeDocumentCreate,
@@ -1308,6 +1311,93 @@ async def _search_tuning(db: AsyncSession, project_id: uuid.UUID, query: str) ->
     except (TypeError, ValueError):
         rank_constant = 60
     return list(dict.fromkeys(aliases))[:20], min(200, max(1, rank_constant))
+
+
+@api_router.post(
+    "/requirements/bulk-operations",
+    response_model=BulkOperationJobSummary,
+    status_code=202,
+    tags=["Requirements"],
+)
+async def create_bulk_requirement_operation(
+    payload: BulkOperationCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> BulkOperationJob:
+    await _require_project_access(db, payload.project_id)
+    requirement_ids = list(dict.fromkeys(payload.requirement_ids))
+    result = await db.execute(
+        select(Requirement.id).where(
+            Requirement.project_id == payload.project_id,
+            Requirement.id.in_(requirement_ids),
+        )
+    )
+    existing_ids = set(result.scalars().all())
+    if len(existing_ids) != len(requirement_ids):
+        raise HTTPException(status_code=422, detail="All selected requirements must belong to the selected project")
+    actor = current_principal().username
+    items = [{"requirement_id": str(requirement_id), "status": "queued", "message": None} for requirement_id in requirement_ids]
+    job_id = uuid.uuid4()
+    job = BulkOperationJob(
+        id=job_id,
+        project_id=payload.project_id,
+        operation_type=payload.operation_type,
+        requirement_ids=[str(requirement_id) for requirement_id in requirement_ids],
+        total_count=len(requirement_ids),
+        result={"items": items},
+        requested_by=actor,
+    )
+    db.add(job)
+    db.add(
+        AuditLog(
+            entity_type="bulk_operation",
+            entity_id=job_id,
+            action="bulk_operation_queued",
+            actor=actor,
+            details={
+                "operation_type": payload.operation_type,
+                "project_id": str(payload.project_id),
+                "requirement_count": len(requirement_ids),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@api_router.get(
+    "/requirements/bulk-operations",
+    response_model=list[BulkOperationJobSummary],
+    tags=["Requirements"],
+)
+async def list_bulk_requirement_operations(
+    project_id: uuid.UUID = Query(...),
+    db: AsyncSession = Depends(get_db),
+) -> list[BulkOperationJob]:
+    await _require_project_access(db, project_id)
+    result = await db.execute(
+        select(BulkOperationJob)
+        .where(BulkOperationJob.project_id == project_id)
+        .order_by(BulkOperationJob.created_at.desc())
+        .limit(100)
+    )
+    return list(result.scalars().all())
+
+
+@api_router.get(
+    "/requirements/bulk-operations/{job_id}",
+    response_model=BulkOperationJobSummary,
+    tags=["Requirements"],
+)
+async def get_bulk_requirement_operation(
+    job_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> BulkOperationJob:
+    job = await db.get(BulkOperationJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk operation not found")
+    await _require_project_access(db, job.project_id)
+    return job
 
 
 @api_router.get(

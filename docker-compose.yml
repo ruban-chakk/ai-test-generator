@@ -222,6 +222,22 @@ services:
     volumes:
       - import_spool:/var/lib/ai-test-generator/imports
 
+  bulk-worker:
+    build:
+      context: ./backend
+    container_name: ai-testgen-bulk-worker
+    command: ["python", "scripts/process_bulk_operations.py"]
+    profiles: ["workers"]
+    env_file:
+      - ./backend/.env
+    environment:
+      - POSTGRES_DSN=postgresql+asyncpg://ai_test_gen:ai_test_gen_pass@postgres:5432/ai_test_gen
+      - OUTBOX_LOCK_TIMEOUT_SECONDS=${OUTBOX_LOCK_TIMEOUT_SECONDS:-300}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: on-failure
+
   vector-maintenance:
     build:
       context: ./backend

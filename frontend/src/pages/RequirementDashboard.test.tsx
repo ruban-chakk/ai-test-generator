@@ -3,13 +3,13 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  generateRequirementDraft,
-  getRequirementImpact,
+  createBulkOperation,
   getRequirements,
 } from '../api';
 import RequirementDashboard from './RequirementDashboard';
 
 vi.mock('../api', () => ({
+  createBulkOperation: vi.fn(),
   generateRequirementDraft: vi.fn(),
   getRequirementImpact: vi.fn(),
   getRequirements: vi.fn(),
@@ -24,11 +24,10 @@ const requirements = [
 describe('RequirementDashboard bulk actions', () => {
   beforeEach(() => {
     vi.mocked(getRequirements).mockResolvedValue(requirements);
-    vi.mocked(generateRequirementDraft).mockImplementation(async (id) => ({ ...requirements.find((item) => item.id === id)!, status: 'generated' }));
-    vi.mocked(getRequirementImpact).mockImplementation(async (id) => ({
-      id: `impact-${id}`, target_level: 'requirement', target_id: id, requirement_id: id,
-      source_text: 'requirement', similarity_threshold: 80, duplicates: [], deprecations: [], updates: [],
-      risk_score: 10, coverage_score: 90, summary: {}, created_by: 'admin', created_at: '2026-10-25T10:00:00Z',
+    vi.mocked(createBulkOperation).mockImplementation(async (_projectId, operationType, requirementIds) => ({
+      id: 'batch-12345678', project_id: 'project-1', operation_type: operationType, status: 'queued',
+      requirement_ids: requirementIds, total_count: requirementIds.length, completed_count: 0, failed_count: 0,
+      result: { items: [] }, requested_by: 'admin', created_at: '2026-10-25T10:00:00Z', updated_at: '2026-10-25T10:00:00Z',
     }));
   });
 
@@ -50,9 +49,9 @@ describe('RequirementDashboard bulk actions', () => {
     await user.click(screen.getByRole('button', { name: 'Generate test cases (2)' }));
 
     await waitFor(() => {
-      expect(generateRequirementDraft).toHaveBeenCalledTimes(2);
+      expect(createBulkOperation).toHaveBeenCalledWith('project-1', 'generate_test_cases', ['requirement-1', 'requirement-2']);
     });
-    expect(await screen.findByText(/test-case generation completed for 2 requirements/)).toBeInTheDocument();
+    expect(await screen.findByText(/test-case generation queued as batch/)).toBeInTheDocument();
   });
 
   it('runs impact analysis for selected requirements and supports clearing selection', async () => {
@@ -65,9 +64,9 @@ describe('RequirementDashboard bulk actions', () => {
     await user.click(screen.getByRole('button', { name: 'Run impact analysis (2)' }));
 
     await waitFor(() => {
-      expect(getRequirementImpact).toHaveBeenCalledTimes(2);
+      expect(createBulkOperation).toHaveBeenCalledWith('project-1', 'impact_analysis', ['requirement-1', 'requirement-2']);
     });
-    expect(await screen.findByText(/impact analysis completed for 2 requirements/)).toBeInTheDocument();
+    expect(await screen.findByText(/impact analysis queued as batch/)).toBeInTheDocument();
     expect(screen.getByText('0 selected')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Select all' }));
     await user.click(screen.getByRole('button', { name: 'Clear selection' }));

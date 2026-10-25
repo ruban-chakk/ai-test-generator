@@ -75,6 +75,31 @@ export type ProjectSummary = {
   updated_at?: string;
 };
 
+export type BulkOperationType = 'generate_test_cases' | 'impact_analysis';
+
+export type BulkOperationItem = {
+  requirement_id: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  message?: string | null;
+};
+
+export type BulkOperationJob = {
+  id: string;
+  project_id: string;
+  operation_type: BulkOperationType;
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  requirement_ids: string[];
+  total_count: number;
+  completed_count: number;
+  failed_count: number;
+  result: { items?: BulkOperationItem[] };
+  last_error_type?: string | null;
+  requested_by: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+};
+
 export type ProjectCreatePayload = {
   name: string;
   description?: string;
@@ -1117,6 +1142,32 @@ export async function generateRequirementDraft(id: string): Promise<RequirementD
     headers: {
       'Content-Type': 'application/json',
     },
+  });
+}
+
+export async function createBulkOperation(
+  projectId: string,
+  operationType: BulkOperationType,
+  requirementIds: string[],
+): Promise<BulkOperationJob> {
+  const response = await fetch(`${API_BASE_URL}/requirements/bulk-operations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, operation_type: operationType, requirement_ids: requirementIds }),
+  });
+  return handleResponse<BulkOperationJob>(response);
+}
+
+export async function getBulkOperations(projectId: string): Promise<BulkOperationJob[]> {
+  const params = new URLSearchParams({ project_id: projectId });
+  return request<BulkOperationJob[]>(`${API_BASE_URL}/requirements/bulk-operations?${params.toString()}`, {
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export async function getBulkOperation(jobId: string): Promise<BulkOperationJob> {
+  return request<BulkOperationJob>(`${API_BASE_URL}/requirements/bulk-operations/${jobId}`, {
+    headers: { 'Content-Type': 'application/json' },
   });
 }
 

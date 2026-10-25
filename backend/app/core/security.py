@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -128,6 +129,16 @@ def current_principal() -> Principal:
     if principal is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     return principal
+
+
+@contextmanager
+def principal_context(principal: Principal):
+    """Temporarily establish an authenticated principal for internal workers."""
+    token = _principal_context.set(principal)
+    try:
+        yield principal
+    finally:
+        _principal_context.reset(token)
 
 
 def require_global_role(*allowed_roles: str) -> Principal:
