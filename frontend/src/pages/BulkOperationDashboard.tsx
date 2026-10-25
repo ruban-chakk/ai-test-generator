@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { BulkOperationJob, ProjectSummary, getBulkOperations } from '../api';
+import { BulkOperationJob, ProjectSummary, bulkOperationAction, getBulkOperations } from '../api';
 
 interface Props { selectedProject: ProjectSummary | null; }
 
@@ -13,6 +13,13 @@ export default function BulkOperationDashboard({ selectedProject }: Props) {
   const [jobs, setJobs] = useState<BulkOperationJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const act = async (job: BulkOperationJob, action: 'cancel' | 'pause' | 'resume' | 'retry-failed') => {
+    setBusy(`${job.id}:${action}`);
+    try { await bulkOperationAction(job.id, action); setJobs(await getBulkOperations(selectedProject!.id)); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Unable to update batch'); }
+    finally { setBusy(null); }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -46,9 +53,9 @@ export default function BulkOperationDashboard({ selectedProject }: Props) {
         <>
           <section className="table-panel" aria-label="Bulk operation runs">
             {jobs.length === 0 ? <div className="status-message">No batch runs yet.</div> : (
-              <div className="table-scroll"><table className="data-table"><thead><tr><th>Operation</th><th>Status</th><th>Progress</th><th>Requested by</th><th>Created</th><th>Run ID</th></tr></thead><tbody>
+              <div className="table-scroll"><table className="data-table"><thead><tr><th>Operation</th><th>Status</th><th>Progress</th><th>Requested by</th><th>Created</th><th>Run ID</th><th>Controls</th></tr></thead><tbody>
                 {jobs.map((job) => { const progress = job.total_count ? Math.round(((job.completed_count + job.failed_count) / job.total_count) * 100) : 0; return (
-                  <tr key={job.id}><td>{operationLabels[job.operation_type]}</td><td><span className={`status-badge status-${job.status}`}>{job.status}</span></td><td>{progress}% ({job.completed_count + job.failed_count}/{job.total_count}){job.failed_count ? ` · ${job.failed_count} failed` : ''}</td><td>{job.requested_by}</td><td>{new Date(job.created_at).toLocaleString()}</td><td><code>{job.id.slice(0, 8)}</code></td></tr>
+                  <tr key={job.id}><td>{operationLabels[job.operation_type]}</td><td><span className={`status-badge status-${job.status}`}>{job.status}</span></td><td>{progress}% ({job.completed_count + job.failed_count}/{job.total_count}){job.failed_count ? ` · ${job.failed_count} failed` : ''}</td><td>{job.requested_by}</td><td>{new Date(job.created_at).toLocaleString()}</td><td><code>{job.id.slice(0, 8)}</code></td><td className="table-actions">{['queued','processing'].includes(job.status) ? <button className="secondary-button" disabled={busy !== null} onClick={() => void act(job, 'cancel')}>Cancel</button> : null}{job.status === 'queued' ? <button className="secondary-button" disabled={busy !== null} onClick={() => void act(job, 'pause')}>Pause</button> : null}{job.status === 'paused' ? <button className="secondary-button" disabled={busy !== null} onClick={() => void act(job, 'resume')}>Resume</button> : null}{job.failed_count > 0 ? <button className="secondary-button" disabled={busy !== null} onClick={() => void act(job, 'retry-failed')}>Retry failed</button> : null}</td></tr>
                 ); })}
               </tbody></table></div>
             )}

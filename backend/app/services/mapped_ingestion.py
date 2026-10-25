@@ -75,6 +75,13 @@ def validate_mapping_configuration(entity_type: str, configuration: dict[str, An
             raise MappedIngestionError(f"Custom field {name} uses an unsupported type")
         if "allowed_values" in rule and not isinstance(rule["allowed_values"], list):
             raise MappedIngestionError(f"Custom field {name} allowed_values must be an array")
+        if "default" in rule and isinstance(rule.get("default"), (dict, list)) and rule.get("type") not in {"json", "list"}:
+            raise MappedIngestionError(f"Custom field {name} default must match its scalar type")
+        for bound in ("min_length", "max_length"):
+            if bound in rule and (not isinstance(rule[bound], int) or rule[bound] < 0):
+                raise MappedIngestionError(f"Custom field {name} {bound} must be a non-negative integer")
+        if "min_length" in rule and "max_length" in rule and rule["min_length"] > rule["max_length"]:
+            raise MappedIngestionError(f"Custom field {name} min_length cannot exceed max_length")
         if "semantic_weight" in rule and rule["semantic_weight"] not in {0, 1, 2, 3}:
             raise MappedIngestionError(f"Custom field {name} semantic_weight must be 0, 1, 2, or 3")
         if "pattern" in rule:

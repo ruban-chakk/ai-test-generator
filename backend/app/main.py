@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,8 +52,14 @@ async def liveness_check() -> dict[str, str]:
 
 @app.get("/health/ready", tags=["Health"])
 async def readiness_check(db: AsyncSession = Depends(get_db)):
-    try:
-        await db.execute(text("SELECT 1"))
-    except Exception:
-        return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable"})
-    return {"status": "ready", "database": "healthy"}
+    attempts = max(1, settings.database_health_attempts)
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            await db.execute(text("SELECT 1"))
+            return {"status": "ready", "database": "healthy"}
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(max(0, settings.database_health_backoff_seconds))
+    return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable", "retryable": True})

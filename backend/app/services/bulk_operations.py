@@ -46,8 +46,14 @@ class BulkOperationProcessor:
             # conclude that the JSON value did not change.
             items = copy.deepcopy((job.result or {}).get("items", []))
             next_item = next((item for item in items if item.get("status") in {"queued", "processing"}), None)
-            if next_item is None:
+            if next_item is None or job.cancel_requested:
+                if job.cancel_requested:
+                    for item in items:
+                        if item.get("status") in {"queued", "processing"}:
+                            item["status"] = "cancelled"
                 self._finish(job, items)
+                if job.cancel_requested:
+                    job.status = "cancelled"
                 await db.commit()
                 return job_id
 

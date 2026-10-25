@@ -103,19 +103,21 @@ class SemanticSearchService:
         return matches[offset : offset + limit]
 
 
-def _search_vector(*fields):
+def _search_vector(*fields, language: str = settings.search_language):
     empty = literal_column("''")
     separator = literal_column("' '")
     document = func.coalesce(fields[0], empty)
     for field in fields[1:]:
         document = document + separator + func.coalesce(field, empty)
-    return func.to_tsvector(literal_column("'english'::regconfig"), document)
+    safe_language = re.sub(r"[^a-zA-Z0-9_]+", "", language) or "simple"
+    return func.to_tsvector(literal_column(f"'{safe_language}'::regconfig"), document)
 
 
-def _query_expression(query: str, aliases: Iterable[str] = ()):
+def _query_expression(query: str, aliases: Iterable[str] = (), language: str = settings.search_language):
     terms = [query, *(item for item in aliases if item.strip())]
     expression = " OR ".join(f'"{item.replace(chr(34), " ")}"' for item in terms)
-    return func.websearch_to_tsquery(literal_column("'english'::regconfig"), expression)
+    safe_language = re.sub(r"[^a-zA-Z0-9_]+", "", language) or "simple"
+    return func.websearch_to_tsquery(literal_column(f"'{safe_language}'::regconfig"), expression)
 
 
 def _fuzzy_score(query: str, *fields):

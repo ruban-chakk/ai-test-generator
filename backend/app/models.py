@@ -298,6 +298,8 @@ class BulkOperationJob(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, default=False)
+    max_concurrency = Column(Integer, nullable=False, default=1)
 
 
 class UnresolvedImportRecord(Base):

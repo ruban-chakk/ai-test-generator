@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     rag_semantic_weight: float = 0.65
     rag_keyword_weight: float = 0.25
     rag_source_weight: float = 0.10
+    search_language: str = "english"
     jira_base_url: str = ""
     jira_email: str = ""
     jira_api_token: str = Field(default="", repr=False)
@@ -95,6 +96,8 @@ class Settings(BaseSettings):
     mapped_job_batch_size: int = 250
     mapped_import_spool_dir: str = "/tmp/ai-test-generator-imports"
     health_probe_timeout_seconds: float = 5.0
+    database_health_attempts: int = 3
+    database_health_backoff_seconds: float = 0.2
     oidc_enabled: bool = False
     oidc_issuer: str = ""
     oidc_client_id: str = ""

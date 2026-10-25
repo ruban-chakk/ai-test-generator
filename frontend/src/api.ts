@@ -79,7 +79,7 @@ export type BulkOperationType = 'generate_test_cases' | 'impact_analysis';
 
 export type BulkOperationItem = {
   requirement_id: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed';
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
   message?: string | null;
 };
 
@@ -87,7 +87,7 @@ export type BulkOperationJob = {
   id: string;
   project_id: string;
   operation_type: BulkOperationType;
-  status: 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'processing' | 'paused' | 'completed' | 'failed' | 'cancelled';
   requirement_ids: string[];
   total_count: number;
   completed_count: number;
@@ -98,6 +98,8 @@ export type BulkOperationJob = {
   created_at: string;
   updated_at: string;
   completed_at?: string | null;
+  cancel_requested?: boolean;
+  max_concurrency?: number;
 };
 
 export type ProjectCreatePayload = {
@@ -1169,6 +1171,10 @@ export async function getBulkOperation(jobId: string): Promise<BulkOperationJob>
   return request<BulkOperationJob>(`${API_BASE_URL}/requirements/bulk-operations/${jobId}`, {
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+export async function bulkOperationAction(jobId: string, action: 'cancel' | 'pause' | 'resume' | 'retry-failed'): Promise<BulkOperationJob> {
+  return request<BulkOperationJob>(`${API_BASE_URL}/requirements/bulk-operations/${jobId}/${action}`, { method: 'POST' });
 }
 
 export async function createScenarioForRequirement(

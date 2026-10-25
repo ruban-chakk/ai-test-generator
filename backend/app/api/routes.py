@@ -15,6 +15,7 @@ from fastapi.encoders import jsonable_encoder
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.db import get_db
 from app.core.config import Settings, settings
@@ -1398,6 +1399,55 @@ async def get_bulk_requirement_operation(
         raise HTTPException(status_code=404, detail="Bulk operation not found")
     await _require_project_access(db, job.project_id)
     return job
+
+
+async def _bulk_job_action(job_id: uuid.UUID, action: str, db: AsyncSession) -> BulkOperationJob:
+    job = await db.get(BulkOperationJob, job_id, with_for_update=True)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk operation not found")
+    await _require_project_access(db, job.project_id)
+    if action == "cancel":
+        if job.status in {"completed", "failed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="Completed batch runs cannot be cancelled")
+        job.cancel_requested = True
+        if job.status in {"queued", "paused"}:
+            job.status = "cancelled"
+            job.completed_at = datetime.utcnow()
+        items = (job.result or {}).get("items", [])
+        for item in items:
+            if item.get("status") in {"queued", "processing"}:
+                item["status"] = "cancelled"
+        job.result = {"items": items}
+        flag_modified(job, "result")
+    elif action == "pause":
+        if job.status != "queued":
+            raise HTTPException(status_code=409, detail="Only queued batches can be paused")
+        job.status = "paused"
+    elif action == "resume":
+        if job.status != "paused":
+            raise HTTPException(status_code=409, detail="Only paused batches can be resumed")
+        job.status, job.cancel_requested = "queued", False
+    elif action == "retry-failed":
+        if job.status not in {"failed", "completed", "cancelled"} or not job.failed_count:
+            raise HTTPException(status_code=409, detail="This batch has no failed items to retry")
+        items = (job.result or {}).get("items", [])
+        for item in items:
+            if item.get("status") == "failed":
+                item["status"], item["message"] = "queued", None
+        job.failed_count, job.cancel_requested = 0, False
+        job.completed_at, job.last_error_type, job.status = None, None, "queued"
+        job.result = {"items": items}
+        flag_modified(job, "result")
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@api_router.post("/requirements/bulk-operations/{job_id}/{action}", response_model=BulkOperationJobSummary, tags=["Requirements"])
+async def bulk_operation_action(job_id: uuid.UUID, action: str, db: AsyncSession = Depends(get_db)) -> BulkOperationJob:
+    if action not in {"cancel", "pause", "resume", "retry-failed"}:
+        raise HTTPException(status_code=404, detail="Unsupported bulk operation action")
+    return await _bulk_job_action(job_id, action, db)
 
 
 @api_router.get(
