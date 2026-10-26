@@ -163,7 +163,7 @@ export type AIModelConfiguration = {
   vector_host?: string;
   credential_reference?: string;
   evaluation_weights: Record<string, number>;
-  pricing: Record<string, number>;
+  pricing: Record<string, unknown>;
   updated_by?: string;
   updated_at?: string;
 };
