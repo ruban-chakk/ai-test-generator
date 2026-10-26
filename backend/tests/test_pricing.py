@@ -21,3 +21,15 @@ def test_scoped_pricing_overrides_catalog_and_unknown_models_are_unpriced() -> N
     assert calculate_cost_micros(1_000, 500, custom) == 4_250
     assert unknown.source == "unpriced"
     assert calculate_cost_micros(1_000, 500, unknown) == 0
+
+
+def test_model_specific_scoped_pricing_is_selected_automatically() -> None:
+    pricing = resolve_model_pricing("GPT-5.4", {"gpt-5.4": {"input_per_million": 3, "output_per_million": 12}})
+    assert pricing.input_per_million == 3
+    assert pricing.output_per_million == 12
+    assert pricing.source == "scoped_configuration"
+
+
+def test_built_in_catalog_covers_judge_and_embedding_models() -> None:
+    assert resolve_model_pricing("gpt-5.4").input_per_million == 2.5
+    assert resolve_model_pricing("text-embedding-3-small").output_per_million == 0

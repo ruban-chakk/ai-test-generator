@@ -880,7 +880,7 @@ class AIModelConfigurationUpdate(APIModel):
     vector_host: Optional[str] = Field(default=None, max_length=500)
     credential_reference: Optional[str] = Field(default=None, max_length=255)
     evaluation_weights: dict[str, float] = Field(default_factory=dict)
-    pricing: dict[str, float] = Field(default_factory=dict)
+    pricing: dict[str, Any] = Field(default_factory=dict)
 
 
 class AIModelConfigurationSummary(AIModelConfigurationUpdate):
